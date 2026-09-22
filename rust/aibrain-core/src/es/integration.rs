@@ -187,10 +187,13 @@ async fn five_edits_before_the_worker_runs_are_one_row() {
     assert_eq!(row.get::<i64, _>("note_id"), 9);
     assert_eq!(row.get::<i32, _>("attempts"), 0, "a fresh edit clears the backoff");
 
-    // A claimed row is leased, so a second worker passes it by.
-    let claimed = db::claim_queue(&pool, 10, 120).await.unwrap();
+    // A claimed row is leased, so a second worker passes it by. The queue is
+    // global and oldest-first, so on a shared test database other rows can sit
+    // ahead of ours; claim enough to reach it rather than a fixed ten.
+    let depth = db::queue_stats(&pool).await.unwrap().pending.max(1);
+    let claimed = db::claim_queue(&pool, depth, 120).await.unwrap();
     assert!(claimed.iter().any(|i| i.brain_id == brain_id));
-    let again = db::claim_queue(&pool, 10, 120).await.unwrap();
+    let again = db::claim_queue(&pool, depth, 120).await.unwrap();
     assert!(!again.iter().any(|i| i.brain_id == brain_id), "already leased");
 
     sqlx::query("DELETE FROM search_queue WHERE brain_id = $1")
