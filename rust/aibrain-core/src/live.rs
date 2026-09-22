@@ -8,8 +8,12 @@
 //!   AIBRAIN_TEST_DATABASE_URL=postgres://aibrain:aibrain@127.0.0.1:5433/aibrain_events \
 //!     cargo test live::
 //!
-//! Every brain it creates is named after the process, and is deleted at the
-//! end, so it can share a database with anything else.
+//! Each test gets a database of its own, created and dropped around it. That
+//! is heavier than sharing one, but `reindex` forgets every brain that is not
+//! in the config it was handed, and the fingerprints it compares are corpus
+//! wide — so two of these sharing a database would delete each other's vaults
+//! and disagree about what changed. The URL above names the database the
+//! others are created next to, and is not itself written to.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -32,6 +36,8 @@ struct Harness {
     cfg: Config,
     dir: PathBuf,
     base: String,
+    admin: sqlx::PgPool,
+    database: String,
 }
 
 impl Harness {
@@ -44,18 +50,24 @@ impl Harness {
     }
 
     async fn teardown(self) {
-        sqlx::query("DELETE FROM brain WHERE id = $1")
-            .bind(self.brain_id())
-            .execute(&self.ctx.pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM search_queue WHERE brain_id = $1")
-            .bind(self.brain_id())
-            .execute(&self.ctx.pool)
-            .await
-            .ok();
+        self.ctx.pool.close().await;
+        drop_database(&self.admin, &self.database).await;
         std::fs::remove_dir_all(&self.dir).ok();
     }
+}
+
+/// Databases are named `aibrain_live_<tag>_<pid>`, from a fixed alphabet, so
+/// nothing a test controls reaches this string.
+fn database_name(tag: &str, pid: u32) -> String {
+    format!("aibrain_live_{tag}_{pid}")
+}
+
+async fn drop_database(admin: &sqlx::PgPool, name: &str) {
+    // FORCE because a pool that is still closing would otherwise hold it.
+    sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .execute(admin)
+        .await
+        .ok();
 }
 
 /// `None` with a printed reason when the test cannot run here.
@@ -68,15 +80,62 @@ async fn setup(tag: &str) -> Option<Harness> {
         eprintln!("skipping live integration: AIBRAIN_TEST_DATABASE_URL is unset");
         return None;
     };
-    let pool = match db::connect(&url).await {
+
+    // The named database is only somewhere to stand while creating ours.
+    let admin = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&url)
+        .await
+    {
         Ok(pool) => pool,
         Err(err) => {
-            eprintln!("skipping live integration: {err:#}");
+            eprintln!("skipping live integration: {err}");
             return None;
         }
     };
 
-    let unique = format!("{tag}-{}", std::process::id());
+    let pid = std::process::id();
+    // Sweep up after a run that panicked before its teardown — but only other
+    // processes', so two of these racing cannot drop each other's.
+    let stale: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM pg_database
+          WHERE datname LIKE 'aibrain\\_live\\_%' AND datname NOT LIKE $1",
+    )
+    .bind(format!("%\\_{pid}"))
+    .fetch_all(&admin)
+    .await
+    .unwrap_or_default();
+    for name in stale {
+        drop_database(&admin, &name).await;
+    }
+
+    let database = database_name(tag, pid);
+    drop_database(&admin, &database).await;
+    if let Err(err) = sqlx::query(&format!("CREATE DATABASE \"{database}\""))
+        .execute(&admin)
+        .await
+    {
+        eprintln!("skipping live integration: cannot create a test database ({err})");
+        return None;
+    }
+    let own_url = match url.rfind('/') {
+        Some(cut) => format!("{}/{database}", &url[..cut]),
+        None => {
+            eprintln!("skipping live integration: {} has no database name", db::redact(&url));
+            return None;
+        }
+    };
+    let pool = match db::connect(&own_url).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("skipping live integration: {err:#}");
+            drop_database(&admin, &database).await;
+            return None;
+        }
+    };
+
+    let unique = format!("{tag}-{pid}");
     let dir = std::env::temp_dir().join(format!("aibrain-live-{unique}"));
     std::fs::remove_dir_all(&dir).ok();
     let vault = dir.join("vault").join("Notes");
@@ -102,12 +161,6 @@ async fn setup(tag: &str) -> Option<Harness> {
     )
     .unwrap();
 
-    sqlx::query("DELETE FROM brain WHERE id = $1")
-        .bind(format!("live-{unique}"))
-        .execute(&pool)
-        .await
-        .ok();
-
     let cfg = crate::config::load(&config_path).unwrap();
     let ctx = Arc::new(Ctx {
         pool,
@@ -124,7 +177,7 @@ async fn setup(tag: &str) -> Option<Harness> {
         axum::serve(listener, router).await.ok();
     });
 
-    Some(Harness { ctx, cfg, dir, base })
+    Some(Harness { ctx, cfg, dir, base, admin, database })
 }
 
 /// Read from an open SSE body until a whole frame has arrived, or give up.
