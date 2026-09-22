@@ -10,6 +10,7 @@
 // and the cross-galaxy arcs are links that actually cross vaults.
 
 import * as THREE from './vendor/three.module.js';
+import { edgeBrightness, easeMix, freezeEase } from './edges.js';
 
 function rng(seed) {
   let s = seed >>> 0;
@@ -85,6 +86,35 @@ void main(){
   gl_FragColor = vec4(vColor * (1.0 + lift * 1.6),
                       core * clamp(vBright, 0.0, 1.0) * depthFade * mix(0.55, 1.0, uGain));
 }`;
+// Edges used to be shaded on the CPU: a loop over every edge, every frame,
+// writing six floats each. At fifteen thousand links that loop was the frame
+// budget, not the draw call. Brightness is a vertex attribute now — two
+// snapshots and a mix uniform — so the CPU only touches it when the selection
+// changes, and the depth fade is recomputed here instead of uploaded.
+const EDGE_VERT = `
+uniform float uR; uniform float uMix;
+attribute vec3 aBase; attribute float aFrom; attribute float aTo;
+varying vec3 vCol;
+void main(){
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  vec4 c = viewMatrix * modelMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+  float d = clamp((mv.z - c.z) / uR, -1.0, 1.0);
+  float depth = 0.22 + 0.78 * clamp((d + 0.8) / 1.4, 0.0, 1.0);
+  float f = mix(aFrom, aTo, uMix);
+  vCol = aBase * (f * (f > 1.0 ? 1.0 : depth));
+  gl_Position = projectionMatrix * mv;
+}`;
+// The chunks keep this identical to the LineBasicMaterial it replaces, which
+// converts to the output colour space on the way out.
+const EDGE_FRAG = `
+uniform float uOpacity;
+varying vec3 vCol;
+void main(){
+  gl_FragColor = vec4(vCol, uOpacity);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
 const FRAG_GLOW = `
 uniform float uGain;
 varying vec3 vColor; varying float vBright; varying float vDepth;
@@ -227,9 +257,11 @@ export function createUniverse(container, cfg) {
       blending: THREE.AdditiveBlending, opacity: glowGain,
     })), points);
 
-    const epos = new Float32Array(E * 6), ecol = new Float32Array(E * 6);
-    const ebase = new Float32Array(E * 6);
-    const ebri = new Float32Array(E).fill(1), ebriT = new Float32Array(E).fill(1);
+    const epos = new Float32Array(E * 6), ebase = new Float32Array(E * 6);
+    // Two brightness snapshots per vertex — where the last ease had got to and
+    // where it is heading. The shader mixes between them.
+    const eFrom = new Float32Array(E * 2).fill(1);
+    const eTo = new Float32Array(E * 2).fill(1);
     edges.forEach(([a, c], i) => {
       epos.set(pos.subarray(a * 3, a * 3 + 3), i * 6);
       epos.set(pos.subarray(c * 3, c * 3 + 3), i * 6 + 3);
@@ -241,15 +273,23 @@ export function createUniverse(container, cfg) {
     });
     const egeo = new THREE.BufferGeometry();
     egeo.setAttribute('position', new THREE.BufferAttribute(epos, 3));
-    const ecolAttr = new THREE.BufferAttribute(ecol, 3);
-    egeo.setAttribute('color', ecolAttr);
+    egeo.setAttribute('aBase', new THREE.BufferAttribute(ebase, 3));
+    const eFromAttr = new THREE.BufferAttribute(eFrom, 1);
+    const eToAttr = new THREE.BufferAttribute(eTo, 1);
+    egeo.setAttribute('aFrom', eFromAttr);
+    egeo.setAttribute('aTo', eToAttr);
     // Chords cut through the middle of the shell, so a well-linked vault piles
     // thousands of them into the same few pixels and the core burns out. Thin
     // the lines as their count grows; the structure survives, the smear does not.
     const linkGain = clamp(Math.sqrt(1200 / Math.max(1, E)), 0.2, 1.0);
-    const emat = new THREE.LineBasicMaterial({
-      vertexColors: true, transparent: true, opacity: opt.linkOpacity * linkGain,
-      blending: THREE.AdditiveBlending, depthWrite: false,
+    const eMix = { value: 1 };
+    const emat = new THREE.ShaderMaterial({
+      uniforms: {
+        uR: { value: R }, uMix: eMix,
+        uOpacity: { value: opt.linkOpacity * linkGain },
+      },
+      vertexShader: EDGE_VERT, fragmentShader: EDGE_FRAG,
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
     });
     emat.userData.gain = linkGain;
     group.add(new THREE.LineSegments(egeo, emat));
@@ -315,9 +355,9 @@ export function createUniverse(container, cfg) {
 
     return {
       cfg: b, bi, R, offset, n, local, edges, E, group, points, pos, col, bri, briT,
-      briAttr, epos, ecol, ecolAttr, ebase, ebri, ebriT, emat, setHighlight, ripple,
-      ripples, core, coreOpacity: core.material.opacity,
-      depthN: new Float32Array(n), labelIds,
+      briAttr, epos, ebase, eFrom, eTo, eFromAttr, eToAttr, eMix, eT: 0,
+      emat, setHighlight, ripple,
+      ripples, core, coreOpacity: core.material.opacity, labelIds,
       spin: 0.7 + rand() * 0.6, hubs: hubs.length ? hubs : local.slice(0, 4).map(x => offset + x.li),
     };
   }
@@ -454,14 +494,16 @@ export function createUniverse(container, cfg) {
         const g = b.offset + i;
         b.briT[i] = (!active ? 1 : strong.has(g) ? 1.7 : active.has(g) ? 1.1 : 0.1) * dimB;
       }
+      // Fold however far the running ease got into the "from" snapshot, then
+      // aim at the new one. This is the only pass over a brain's edges, and it
+      // happens when the selection changes, not when a frame is drawn.
       const hl = [];
-      for (let i = 0; i < b.E; i++) {
-        const [a, c] = b.edges[i], ga = b.offset + a, gc = b.offset + c;
-        if (!active) { b.ebriT[i] = dimB; continue; }
-        const both = active.has(ga) && active.has(gc);
-        b.ebriT[i] = (both ? 1.5 : 0.06) * dimB;
-        if (both && (strong.has(ga) || strong.has(gc)) && active.size < 240) hl.push(i);
-      }
+      freezeEase(b.eFrom, b.eTo, b.eMix.value);
+      edgeBrightness(b.edges, b.offset, active, strong, dimB, b.eTo, hl);
+      b.eFromAttr.needsUpdate = true;
+      b.eToAttr.needsUpdate = true;
+      b.eT = 0;
+      b.eMix.value = 0;
       b.setHighlight(hl);
     }
     cross.forEach(([a, c], i) => {
@@ -758,7 +800,6 @@ export function createUniverse(container, cfg) {
   // ---------- loop
   const clock = new THREE.Clock();
   let time = 0, raf = 0;
-  const mvm = new THREE.Matrix4(), cv = new THREE.Vector3();
 
   function tick() {
     raf = requestAnimationFrame(tick);
@@ -780,24 +821,12 @@ export function createUniverse(container, cfg) {
       }
       if (dirty) b.briAttr.needsUpdate = true;
 
-      mvm.copy(camera.matrixWorldInverse).multiply(b.group.matrixWorld);
-      const m = mvm.elements;
-      cv.copy(b.group.position).applyMatrix4(camera.matrixWorldInverse);
-      for (let i = 0; i < b.n; i++) {
-        const z = m[2] * b.pos[i * 3] + m[6] * b.pos[i * 3 + 1] + m[10] * b.pos[i * 3 + 2]
-          + m[14] - cv.z;
-        b.depthN[i] = 0.22 + 0.78 * clamp((z + b.R * 0.8) / (b.R * 1.4), 0, 1);
+      // All a frame owes the edges is how far along the ease is; the shader
+      // does the shading and the depth fade.
+      if (b.eMix.value < 1) {
+        b.eT += dt;
+        b.eMix.value = easeMix(b.eT);
       }
-      for (let i = 0; i < b.E; i++) {
-        b.ebri[i] += (b.ebriT[i] - b.ebri[i]) * 0.1;
-        const f = b.ebri[i], [a, c] = b.edges[i];
-        const fa = f * (f > 1 ? 1 : b.depthN[a]), fc = f * (f > 1 ? 1 : b.depthN[c]);
-        for (let k = 0; k < 3; k++) {
-          b.ecol[i * 6 + k] = b.ebase[i * 6 + k] * fa;
-          b.ecol[i * 6 + 3 + k] = b.ebase[i * 6 + 3 + k] * fc;
-        }
-      }
-      b.ecolAttr.needsUpdate = true;
       b.core.material.opacity = b.coreOpacity * (0.85 + 0.17 * Math.sin(time * 0.7 + b.bi));
 
       for (let i = b.ripples.length - 1; i >= 0; i--) {
@@ -983,7 +1012,8 @@ export function createUniverse(container, cfg) {
     setOptions(o) {
       Object.assign(opt, o);
       brains.forEach(b => {
-        b.emat.opacity = opt.linkOpacity * (b.emat.userData.gain ?? 1);
+        b.emat.uniforms.uOpacity.value =
+          opt.linkOpacity * (b.emat.userData.gain ?? 1);
       });
       recomputeTargets();
     },
