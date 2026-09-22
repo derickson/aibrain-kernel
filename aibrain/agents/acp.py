@@ -282,14 +282,20 @@ class ACPConnection:
     def _read_file(self, params: dict) -> str:
         path = self._confine(params["path"])
         text = path.read_text(encoding="utf-8", errors="replace")
-        self.opened.add(str(path))
+        # `opened` became a dict of path -> (tier, why) when the second tier
+        # was added; this line was still calling `.add`, so every fs/read_text
+        # request came back to the agent as an error instead of a file.
+        self._record(str(path), "read", "we served this file to the agent")
         line = params.get("line")
         limit = params.get("limit")
         if line is None and limit is None:
             return text
         lines = text.splitlines(keepends=True)
-        start = max(0, int(line or 1) - 1)
-        end = start + int(limit) if limit else len(lines)
+        try:
+            start = max(0, int(line or 1) - 1)
+            end = start + max(0, int(limit)) if limit is not None else len(lines)
+        except (TypeError, ValueError):
+            raise ACPError("line and limit must be numbers")
         return "".join(lines[start:end])
 
     def _write_file(self, params: dict) -> None:

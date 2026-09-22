@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import mimetypes
 import re
 import threading
@@ -34,6 +35,44 @@ WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("font/woff2", ".woff2")
+
+# This server binds to loopback and has no authentication, because the only
+# person it answers to is the one sitting at the machine. Two things break
+# that assumption, and both come from a web page the user did not write:
+#
+#   DNS rebinding  evil.com resolves to 127.0.0.1, so the browser treats
+#                  http://evil.com:8760 as same-origin with the page and can
+#                  read every note. The `Host` header still says evil.com,
+#                  which is how we catch it.
+#   CSRF           a cross-site form post reaches /api/agent/<id> and edits the
+#                  command an ACP agent runs. `Origin` and `Sec-Fetch-Site`
+#                  say where it came from, which is how we catch that.
+#
+# Neither header can be forged by a page, and neither is sent by a non-browser
+# client such as curl or urllib, so the checks cost the CLI nothing.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+# Nothing this API accepts is large: the biggest body is a to-do with a handful
+# of note references. A cap stops an unbounded read into memory.
+MAX_BODY_BYTES = 1 << 20
+MAX_TODO_BODY = 4000
+
+
+def _hostname(netloc: str) -> str:
+    """The host out of `host:port`, with IPv6 brackets stripped.
+
+    Fussier than it looks: only a port may follow a `]`, or `[::1].evil.com`
+    reads as the loopback address, and a bare `::1` has no port to strip.
+    """
+    netloc = netloc.strip().lower()
+    if netloc.startswith("["):
+        inner, sep, tail = netloc[1:].partition("]")
+        if not sep or (tail and not (tail[0] == ":" and tail[1:].isdigit())):
+            return ""
+        return inner
+    if netloc.count(":") > 1:
+        return netloc
+    return netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
 
 
 class State:
@@ -228,6 +267,10 @@ def agent_slots(count: int, placed: list[dict]) -> list[list[float]]:
 # request plumbing
 # ---------------------------------------------------------------------------
 
+class BadRequest(ValueError):
+    """Something the caller sent is wrong, phrased for whoever sent it."""
+
+
 class Router:
     def __init__(self) -> None:
         self.routes: list[tuple[str, re.Pattern, Callable]] = []
@@ -303,18 +346,72 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise BadRequest("Content-Length is not a number")
+        if length < 0 or length > MAX_BODY_BYTES:
+            # Refused without reading it, so the bytes are still in the socket;
+            # the connection has to go with them or the next request on it
+            # would start mid-body.
+            self.close_connection = True
+            raise BadRequest("request body is too large")
         if not length:
             return {}
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
+        # Every caller indexes into this; a bare list or string would be an
+        # AttributeError deep inside a handler rather than a 400 here.
+        return parsed if isinstance(parsed, dict) else {}
 
     def query(self) -> dict[str, str]:
         parsed = urllib.parse.urlparse(self.path)
         return {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+
+    def int_query(self, name: str, default: int, low: int, high: int) -> int:
+        """A bounded integer from the query string, or a 400 if it is not one.
+
+        Unbounded and unchecked were both real: `limit=abc` was a traceback and
+        `limit=-1` travelled all the way to Postgres.
+        """
+        raw = self.query().get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise BadRequest(f"{name} must be a whole number")
+        return max(low, min(high, value))
+
+    # ---- who is asking ---------------------------------------------------
+    def host_is_local(self) -> bool:
+        """Reject a `Host` this server was never reached at — DNS rebinding."""
+        host = self.headers.get("Host")
+        if host is None:      # HTTP/1.0; no browser sends a request without one
+            return True
+        return _hostname(host) in LOOPBACK_HOSTS
+
+    def origin_is_same(self) -> bool:
+        """Same-origin, for anything that changes state or starts work.
+
+        `Sec-Fetch-Site` is set by every browser on every request and cannot be
+        set by script; `none` is the user typing the URL. `Origin` is the
+        fallback for the one case that predates it, a cross-site form post.
+        """
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None and site not in ("same-origin", "none"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True       # curl, urllib, the MCP server — not a browser
+        if origin == "null":
+            return False
+        parsed = urllib.parse.urlparse(origin)
+        host = (self.headers.get("Host") or "").lower()
+        return bool(parsed.netloc) and parsed.netloc.lower() == host
 
     def sse(self, events: Iterator[dict]) -> None:
         """Stream JSON events. Each chunk is one SSE `data:` frame."""
@@ -352,6 +449,12 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("PATCH")
 
     def _dispatch(self, method: str) -> None:
+        if not self.host_is_local():
+            self.fail("this server only answers on localhost", 403)
+            return
+        if not self.origin_is_same():
+            self.fail("cross-origin requests are not accepted", 403)
+            return
         path = urllib.parse.urlparse(self.path).path
         fn, params = self.router.match(method, path)
         if fn is not None:
@@ -359,9 +462,17 @@ class Handler(BaseHTTPRequestHandler):
                 fn(self, **params)
             except BrokenPipeError:
                 pass
-            except Exception as exc:
+            except (BadRequest, CorpusError) as exc:
+                # Both carry text written for a person to read, so both are
+                # safe to hand back.
+                self.fail(str(exc), 400 if isinstance(exc, BadRequest) else 502)
+            except Exception:
+                # Anything else is a bug, and its message tends to carry
+                # absolute paths or query text. The traceback goes to the
+                # console the user started the server in; the browser gets
+                # nothing it could leak onward.
                 traceback.print_exc()
-                self.fail(f"{type(exc).__name__}: {exc}", 500)
+                self.fail("internal error — see the server log", 500)
             return
         if method == "GET":
             self._static(path)
@@ -371,8 +482,18 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path: str) -> None:
         if path == "/":
             path = "/index.html"
-        target = (WEB_ROOT / path.lstrip("/")).resolve()
-        if WEB_ROOT.resolve() not in target.parents or not target.is_file():
+        # Percent escapes are decoded first: without this `%2e%2e` never became
+        # `..`, but nor did `%20` ever become a space, and a future file with
+        # one in its name would have been unreachable for the wrong reason.
+        decoded = urllib.parse.unquote(path)
+        if "\x00" in decoded:
+            self.fail("not found", 404)
+            return
+        target = (WEB_ROOT / decoded.lstrip("/")).resolve()
+        root = WEB_ROOT.resolve()
+        # `resolve()` has already collapsed `..` and followed any symlink, so
+        # this one check covers traversal and a link pointing out of web/.
+        if root not in target.parents or not target.is_file():
             self.fail("not found", 404)
             return
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
@@ -383,6 +504,36 @@ class Handler(BaseHTTPRequestHandler):
         cache = "public, max-age=86400" if target.suffix in (".woff2", ".js") \
             and "vendor" in target.parts else "no-store"
         self._send(200, data, ctype, {"Cache-Control": cache})
+
+
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+
+
+def _is_hex_color(value: Any) -> bool:
+    return isinstance(value, str) and bool(_HEX_COLOR.match(value))
+
+
+def link_name(raw: str) -> str | None:
+    """One safe filename for the symlink, or None if it cannot be one.
+
+    Deliberately strict rather than sanitising: silently turning `../evil` into
+    `evil` links a vault under a name nobody asked for, and the person typing
+    it is standing at the machine and can retype it.
+    """
+    name = str(raw).strip()
+    if not name or name in (".", "..") or len(name) > 128:
+        return None
+    if name.startswith(".") or any(c in name for c in "/\\\x00") or "\n" in name:
+        return None
+    return name
+
+
+def _int_id(raw: str, what: str) -> int:
+    """A path segment that has to be an id. The router only promised `[^/]+`."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise BadRequest(f"{what} must be a whole number")
 
 
 def _jsonable(obj: Any) -> Any:
@@ -479,9 +630,9 @@ def build_router(state: State) -> Router:
     # ---- search & notes --------------------------------------------------
     def search(h: Handler) -> None:
         q = h.query()
-        text = q.get("q", "")
-        limit = min(int(q.get("limit", 60)), 200)
-        brain_ids = [b for b in q.get("brains", "").split(",") if b]
+        text = q.get("q", "")[:2000]
+        limit = h.int_query("limit", 60, 1, 200)
+        brain_ids = [b for b in q.get("brains", "").split(",") if b][:32]
         results = state.corpus.search_raw(text, limit=limit,
                                           brain_ids=brain_ids or None)
         h.json({
@@ -491,7 +642,7 @@ def build_router(state: State) -> Router:
         })
 
     def note(h: Handler, nid: str) -> None:
-        page = state.corpus.note(int(nid))
+        page = state.corpus.note(_int_id(nid, "note id"))
         if page is None:
             h.fail("no such note", 404)
             return
@@ -505,14 +656,14 @@ def build_router(state: State) -> Router:
 
     def node(h: Handler, gid: str) -> None:
         """Universe node id → note id, so a click in 3D opens the right note."""
-        note_id = state.note_id_for_gid(int(gid))
+        note_id = state.note_id_for_gid(_int_id(gid, "node id"))
         if note_id is None:
             h.fail("no such node", 404)
             return
         h.json({"nid": note_id})
 
     def recent(h: Handler) -> None:
-        rows = state.corpus.recent(limit=int(h.query().get("limit", 24)))
+        rows = state.corpus.recent(limit=h.int_query("limit", 24, 1, 200))
         h.json({"results": [state.decorate(row) for row in rows]})
 
     # ---- the day's list --------------------------------------------------
@@ -524,7 +675,7 @@ def build_router(state: State) -> Router:
 
     def todo_add(h: Handler) -> None:
         payload = h.body()
-        body = str(payload.get("body", "")).strip()
+        body = str(payload.get("body", "")).strip()[:MAX_TODO_BODY]
         if not body:
             h.fail("a to-do needs some text")
             return
@@ -539,15 +690,16 @@ def build_router(state: State) -> Router:
         def run(h: Handler, tid: str) -> None:
             now = h.query().get("now")
             payload = h.body()
+            todo_id = _int_id(tid, "to-do id")
             if action == "reschedule":
                 result = state.corpus.reschedule_todo(
-                    int(tid), str(payload.get("to_day", "tomorrow")), now=now)
+                    todo_id, str(payload.get("to_day", "tomorrow"))[:32], now=now)
             elif action == "link":
                 result = state.corpus.link_todo(
-                    int(tid), str(payload.get("brain_id", "")),
-                    str(payload.get("rel_path", "")), now=now)
+                    todo_id, str(payload.get("brain_id", ""))[:200],
+                    str(payload.get("rel_path", ""))[:1024], now=now)
             else:
-                result = getattr(state.corpus, f"{action}_todo")(int(tid), now=now)
+                result = getattr(state.corpus, f"{action}_todo")(todo_id, now=now)
             if not result:
                 h.fail("no such to-do", 404)
                 return
@@ -557,7 +709,7 @@ def build_router(state: State) -> Router:
     def todo_patch(h: Handler, tid: str) -> None:
         payload = h.body()
         result = state.corpus.update_todo(
-            int(tid),
+            _int_id(tid, "to-do id"),
             body=payload.get("body"),
             sort_order=payload.get("sort_order"),
             now=h.query().get("now"),
@@ -569,8 +721,8 @@ def build_router(state: State) -> Router:
 
     def todo_history(h: Handler) -> None:
         q = h.query()
-        h.json(state.corpus.todo_history(q.get("q", ""),
-                                         limit=min(int(q.get("limit", 50)), 200)))
+        h.json(state.corpus.todo_history(q.get("q", "")[:2000],
+                                         limit=h.int_query("limit", 50, 1, 200)))
 
     # ---- chat ------------------------------------------------------------
     def chat(h: Handler) -> None:
@@ -636,10 +788,20 @@ def build_router(state: State) -> Router:
             h.fail("unknown script", 404)
             return
         payload = h.body()
+        # Only the toggles this script declares. The route used to append a
+        # free-form `args` list from the request body straight onto the
+        # command line: no shell was involved, but "which flags does the
+        # exporter run with" is not the browser's decision to make, and the UI
+        # never sent one. Options are looked up by name in the script's own
+        # table, so the request can only choose between arguments the config
+        # already contains.
+        names = payload.get("options", [])
+        if not isinstance(names, list):
+            h.fail("options must be a list of names")
+            return
         extra: list[str] = []
-        for name in payload.get("options", []):
-            extra.extend(script.options.get(name, []))
-        extra.extend(str(a) for a in payload.get("args", []))
+        for name in names[:16]:
+            extra.extend(script.options.get(str(name), []))
         existing = state.jobs.running(script.name)
         if existing:
             h.json({"job": existing.to_dict(), "alreadyRunning": True})
@@ -701,12 +863,21 @@ def build_router(state: State) -> Router:
     def save_view(h: Handler) -> None:
         payload = h.body()
         view = state.cfg.view
-        for key, attr in (("rotationSpeed", "rotation_speed"),
-                          ("linkOpacity", "link_opacity"),
-                          ("showAllLabels", "show_all_labels"),
-                          ("ribbonTwist", "ribbon_twist")):
+        # Coerced rather than stored as sent: these end up in config.json and
+        # then back in the browser, and a string where a number belongs is a
+        # bug that only shows up in the renderer.
+        for key, attr, cast in (("rotationSpeed", "rotation_speed", float),
+                                ("linkOpacity", "link_opacity", float),
+                                ("showAllLabels", "show_all_labels", bool),
+                                ("ribbonTwist", "ribbon_twist", float)):
             if key in payload:
-                setattr(view, attr, payload[key])
+                try:
+                    value = cast(payload[key])
+                except (TypeError, ValueError):
+                    raise BadRequest(f"{key} is not a {cast.__name__}")
+                if cast is float:
+                    value = max(0.0, min(4.0, value))
+                setattr(view, attr, value)
         state.cfg.save()
         h.json({"ok": True, "view": asdict(view)})
 
@@ -725,7 +896,7 @@ def build_router(state: State) -> Router:
     def add_brain(h: Handler) -> None:
         """Link a vault into `obsidian_vaults/`, which is what makes it a brain."""
         payload = h.body()
-        raw = payload.get("path", "").strip()
+        raw = str(payload.get("path", "")).strip()
         path = Path(raw).expanduser()
         if not path.is_dir():
             h.fail(f"{path} is not a directory")
@@ -737,8 +908,18 @@ def build_router(state: State) -> Router:
                 h.fail(f"{target.name} is already linked as {existing.name}")
                 return
 
+        # The name becomes a filename inside obsidian_vaults/. Unchecked it was
+        # also a path: `{"name": "../../.ssh/authorized_keys"}` put the symlink
+        # anywhere the user could write.
+        name = link_name(payload.get("name") or target.name)
+        if name is None:
+            h.fail("that name cannot be used as a folder name")
+            return
         VAULT_LINK_DIR.mkdir(parents=True, exist_ok=True)
-        link = VAULT_LINK_DIR / (payload.get("name") or target.name)
+        link = VAULT_LINK_DIR / name
+        if link.parent.resolve() != VAULT_LINK_DIR.resolve():
+            h.fail("that name cannot be used as a folder name")
+            return
         if link.exists() or link.is_symlink():
             h.fail(f"{link.name} already exists in obsidian_vaults/")
             return
@@ -837,7 +1018,12 @@ def build_router(state: State) -> Router:
             return
         pos = payload.get("pos")
         if isinstance(pos, list) and len(pos) == 3:
-            agent.pos = [round(float(v), 3) for v in pos]
+            try:
+                agent.pos = [round(float(v), 3) for v in pos]
+            except (TypeError, ValueError):
+                raise BadRequest("pos must be three numbers")
+            if any(not math.isfinite(v) for v in agent.pos):
+                raise BadRequest("pos must be three numbers")
             state.cfg.save()
         h.json({"ok": True})
 
@@ -887,7 +1073,15 @@ def _apply_agent(agent: AgentConfig, payload: dict) -> None:
     }
     for camel, attr in simple.items():
         if camel in payload:
-            setattr(agent, attr, payload[camel])
+            value = payload[camel]
+            if attr == "color" and not _is_hex_color(value):
+                # This ends up inside a `style="…"` on a label in the
+                # universe; anything but a hex colour belongs somewhere else.
+                raise BadRequest("color must be a hex value like #b48cff")
+            if attr in ("name", "kind", "protocol", "intro", "url", "cwd") \
+                    and not isinstance(value, str):
+                raise BadRequest(f"{camel} must be text")
+            setattr(agent, attr, value)
     if "command" in payload:
         raw = payload["command"]
         agent.command = raw if isinstance(raw, list) else shlex.split(raw or "")
@@ -900,7 +1094,10 @@ def _apply_agent(agent: AgentConfig, payload: dict) -> None:
     if "brains" in payload and isinstance(payload["brains"], list):
         agent.brains = payload["brains"]
     if "contextNotes" in payload:
-        agent.context_notes = max(1, min(24, int(payload["contextNotes"])))
+        try:
+            agent.context_notes = max(1, min(24, int(payload["contextNotes"])))
+        except (TypeError, ValueError):
+            raise BadRequest("contextNotes is not a number")
     if not agent.protocol:
         agent.protocol = agent.label()
 

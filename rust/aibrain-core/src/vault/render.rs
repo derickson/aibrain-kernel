@@ -5,10 +5,69 @@
 //! a link the UI can act on, and the ids come from the link table the ingest
 //! already built.
 
-use pulldown_cmark::{html, Event, Options, Parser};
+use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+/// Schemes a link or image in a note may point at.
+///
+/// pulldown-cmark escapes a destination but does not judge it, so
+/// `[click](javascript:…)` became a live `href` in the reader, and the reader
+/// puts that HTML straight into the app's own DOM. A note is untrusted input —
+/// it can be anything you pasted — so anything outside this list is dropped.
+const SAFE_SCHEMES: [&str; 6] = ["http:", "https:", "mailto:", "ftp:", "tel:", "obsidian:"];
+
+/// A link destination, or `#` when it is one we will not follow.
+///
+/// Relative destinations (`./notes/a.md`, `#heading`) carry no scheme and are
+/// kept; a scheme we do not know is not.
+fn safe_url(raw: &str) -> String {
+    // Control characters and whitespace are stripped first: `java\nscript:` is
+    // one scheme to a browser and two strings to a naive check.
+    let folded: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect::<String>()
+        .to_lowercase();
+    let scheme_end = match folded.find(':') {
+        None => return raw.to_string(), // relative, or a fragment
+        Some(i) => i,
+    };
+    // A colon after a slash or a question mark is part of a path, not a
+    // scheme: `foo/bar:baz` is relative.
+    if folded[..scheme_end].contains(['/', '?', '#']) {
+        return raw.to_string();
+    }
+    if SAFE_SCHEMES.iter().any(|s| folded.starts_with(s)) {
+        raw.to_string()
+    } else {
+        "#".to_string()
+    }
+}
+
+/// Rewrite a link or image destination, leaving every other event alone.
+fn guard_destination(event: Event<'_>) -> Event<'_> {
+    match event {
+        Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url: CowStr::from(safe_url(&dest_url)),
+                title,
+                id,
+            })
+        }
+        Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url: CowStr::from(safe_url(&dest_url)),
+                title,
+                id,
+            })
+        }
+        other => other,
+    }
+}
 
 fn wikilink_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -62,11 +121,13 @@ pub fn to_html_with(body: &str, resolved: &HashMap<String, i64>) -> String {
     // pulldown-cmark passes raw HTML through untouched. A note is not a
     // trusted document — it can be anything you pasted — so HTML in the source
     // is shown as text rather than rendered into the app's own DOM.
-    let events = Parser::new_ext(&staged, options).map(|event| match event {
-        Event::Html(raw) => Event::Text(raw),
-        Event::InlineHtml(raw) => Event::Text(raw),
-        other => other,
-    });
+    let events = Parser::new_ext(&staged, options)
+        .map(|event| match event {
+            Event::Html(raw) => Event::Text(raw),
+            Event::InlineHtml(raw) => Event::Text(raw),
+            other => other,
+        })
+        .map(guard_destination);
 
     let mut out = String::with_capacity(staged.len() * 2);
     html::push_html(&mut out, events);
@@ -160,6 +221,38 @@ mod tests {
                 assert!(!html.contains(tag), "{source} produced a live {tag}: {html}");
             }
             assert!(html.contains("&lt;"), "{source} was not escaped: {html}");
+        }
+    }
+
+    #[test]
+    fn a_script_url_in_a_markdown_link_is_defused() {
+        for source in [
+            "[click](javascript:alert(1))",
+            "[click](JaVaScRiPt:alert(1))",
+            "[click](java\tscript:alert(1))",
+            "[click](data:text/html;base64,PHNjcmlwdD4=)",
+            "[click](vbscript:msgbox)",
+            "![shot](javascript:alert(1))",
+        ] {
+            let html = to_html(source, "b");
+            assert!(!html.to_lowercase().contains("javascript:"), "{source}: {html}");
+            assert!(!html.to_lowercase().contains("vbscript:"), "{source}: {html}");
+            assert!(!html.to_lowercase().contains("data:text/html"), "{source}: {html}");
+        }
+    }
+
+    #[test]
+    fn ordinary_links_are_left_alone() {
+        for (source, want) in [
+            ("[a](https://example.com/x?y=1)", "https://example.com/x?y=1"),
+            ("[a](http://example.com)", "http://example.com"),
+            ("[a](./Recipes/Ramen.md)", "./Recipes/Ramen.md"),
+            ("[a](#heading)", "#heading"),
+            ("[a](notes/a:b.md)", "notes/a:b.md"),
+            ("[a](mailto:someone@example.com)", "mailto:someone@example.com"),
+        ] {
+            let html = to_html(source, "b");
+            assert!(html.contains(want), "{source} lost its destination: {html}");
         }
     }
 

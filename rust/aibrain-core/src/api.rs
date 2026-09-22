@@ -53,6 +53,12 @@ impl Ctx {
 type Shared = Arc<Ctx>;
 
 /// Anything that goes wrong becomes JSON, never an empty 500.
+///
+/// The text is deliberately not the error's own. An `anyhow` chain here
+/// carries absolute vault paths, the failing SQL, and whatever Elasticsearch
+/// said about a request built from user input — none of which the caller
+/// needs and all of which travels on to a browser. The detail goes to the log
+/// the user can read; the response says only that it failed.
 pub struct ApiError(anyhow::Error);
 
 impl IntoResponse for ApiError {
@@ -60,7 +66,7 @@ impl IntoResponse for ApiError {
         tracing::error!("{:#}", self.0);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{:#}", self.0) })),
+            Json(json!({ "error": "internal error — see the aibrain-core log" })),
         )
             .into_response()
     }
@@ -73,6 +79,55 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+/// Hosts this service will answer to.
+///
+/// It binds to loopback and has no authentication, so the only way a web page
+/// reaches it is DNS rebinding: a name the attacker controls resolving to
+/// 127.0.0.1, which makes the browser treat their page as same-origin with
+/// this one and hand them every note. The `Host` header still carries the name
+/// that was typed, and no page can change it, so checking it closes the hole.
+/// Non-browser clients (Python's urllib, curl) send the address they dialled,
+/// which passes.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // `[::1]:8781`. Only a port may follow the bracket, or
+        // `[::1].evil.com` would read as the loopback address.
+        match rest.split_once(']') {
+            Some((inner, tail)) if tail.is_empty() => inner.to_string(),
+            Some((inner, tail))
+                if tail.starts_with(':') && tail[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                inner.to_string()
+            }
+            _ => return false,
+        }
+    } else if host.matches(':').count() > 1 {
+        // A bare IPv6 literal: without brackets no port can follow it, so
+        // splitting on the colon would throw the address away.
+        host.clone()
+    } else {
+        host.split(':').next().unwrap_or("").to_string()
+    };
+    matches!(name.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
+}
+
+async fn guard_host(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let ok = match request.headers().get(header::HOST) {
+        // HTTP/1.0 clients may omit it; no browser does.
+        None => true,
+        Some(value) => value.to_str().map(host_is_loopback).unwrap_or(false),
+    };
+    if !ok {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this service only answers on localhost" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
 
 pub fn router(ctx: Shared) -> Router {
     Router::new()
@@ -89,6 +144,10 @@ pub fn router(ctx: Shared) -> Router {
         // The day's list keeps its own module; merged before the state so it
         // shares this one Ctx.
         .merge(crate::todo::routes())
+        .layer(axum::middleware::from_fn(guard_host))
+        // A JSON body here is a to-do or a reindex flag. axum defaults to 2 MB;
+        // say the smaller number rather than inherit one chosen for uploads.
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(ctx)
 }
 
@@ -197,12 +256,16 @@ async fn search(
     State(ctx): State<Shared>,
     Query(params): Query<SearchParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let query = params.q.unwrap_or_default();
+    // Bounded before it reaches either engine: `to_tsquery` builds one term
+    // per word and Elasticsearch parses the whole string, so an unbounded
+    // query is an unbounded amount of work for one GET.
+    let query: String = params.q.unwrap_or_default().chars().take(2000).collect();
     let brains: Vec<String> = params
         .brains
         .unwrap_or_default()
         .split(',')
         .filter(|s| !s.is_empty())
+        .take(64)
         .map(str::to_string)
         .collect();
     let limit = params.limit.unwrap_or(60).clamp(1, 500);
@@ -346,4 +409,46 @@ async fn reindex(
             .map(|(id, rev)| json!({ "brain_id": id, "revision": rev }))
             .collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_addresses_this_service_was_reached_at_are_accepted() {
+        for host in [
+            "127.0.0.1:8781",
+            "127.0.0.1",
+            "localhost:8781",
+            "LOCALHOST:8781",
+            "[::1]:8781",
+            "::1",
+            "0.0.0.0:8781",
+        ] {
+            assert!(host_is_loopback(host), "{host} should be allowed");
+        }
+    }
+
+    #[test]
+    fn a_rebound_name_is_refused_however_it_is_spelled() {
+        for host in [
+            "evil.com",
+            "evil.com:8781",
+            "127.0.0.1.evil.com:8781",
+            "localhost.evil.com",
+            "[::1].evil.com",
+            "",
+            "notlocalhost",
+        ] {
+            assert!(!host_is_loopback(host), "{host} should be refused");
+        }
+    }
+
+    #[test]
+    fn an_internal_error_never_carries_the_detail_to_the_caller() {
+        let leaky = anyhow::anyhow!("cannot read /Users/dave/Vaults/Private/a.md");
+        let response = ApiError(leaky).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
