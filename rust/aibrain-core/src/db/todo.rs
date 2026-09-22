@@ -48,10 +48,22 @@ pub struct Todo {
     pub refs: Vec<TodoRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<TodoEvent>,
+    /// Set once an item has been filed into a folder — see todo_folder.rs
+    /// doc-comment on the migration for what that exempts it from.
+    pub folder_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TodoFolder {
+    pub id: i64,
+    pub name: String,
+    pub collapsed: bool,
+    pub sort_order: f64,
+    pub todos: Vec<Todo>,
 }
 
 const COLUMNS: &str = "id, body, created_at, first_scheduled_on, scheduled_on, \
-                       completed_at, cancelled_at, sort_order";
+                       completed_at, cancelled_at, sort_order, folder_id";
 
 fn epoch(at: DateTime<Utc>) -> f64 {
     at.timestamp() as f64 + at.timestamp_subsec_micros() as f64 / 1_000_000.0
@@ -76,6 +88,7 @@ fn row_to_todo(row: &sqlx::postgres::PgRow) -> Todo {
         },
         refs: Vec::new(),
         events: Vec::new(),
+        folder_id: row.get("folder_id"),
     }
 }
 
@@ -113,6 +126,7 @@ pub async fn roll_over(pool: &PgPool, day: NaiveDate, at: DateTime<Utc>) -> Resu
     let stale = sqlx::query(
         "SELECT id, scheduled_on FROM todo
           WHERE scheduled_on < $1 AND completed_at IS NULL AND cancelled_at IS NULL
+            AND folder_id IS NULL
           ORDER BY id
             FOR UPDATE",
     )
@@ -145,9 +159,11 @@ pub async fn for_day(
 ) -> Result<Vec<Todo>> {
     let rows = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM todo
-          WHERE (completed_at IS NULL AND cancelled_at IS NULL AND scheduled_on = $1)
+          WHERE folder_id IS NULL AND (
+                (completed_at IS NULL AND cancelled_at IS NULL AND scheduled_on = $1)
              OR (completed_at >= $2 AND completed_at < $3)
              OR (cancelled_at >= $2 AND cancelled_at < $3)
+          )
           ORDER BY sort_order, id"
     ))
     .bind(day)
@@ -424,6 +440,144 @@ pub async fn patch(
         return Ok(false);
     }
     log_event(&mut tx, id, at, "edited", None, None).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// folders — a persistent backlog, exempt from for_day and roll_over above
+// ---------------------------------------------------------------------------
+
+/// Every folder, each with its member todos attached, ordered the way the
+/// shelf renders them.
+pub async fn list_folders(pool: &PgPool) -> Result<Vec<TodoFolder>> {
+    let folder_rows = sqlx::query(
+        "SELECT id, name, collapsed, sort_order FROM todo_folder ORDER BY sort_order, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut folders: Vec<TodoFolder> = folder_rows
+        .iter()
+        .map(|row| TodoFolder {
+            id: row.get("id"),
+            name: row.get("name"),
+            collapsed: row.get("collapsed"),
+            sort_order: row.get("sort_order"),
+            todos: Vec::new(),
+        })
+        .collect();
+    if folders.is_empty() {
+        return Ok(folders);
+    }
+
+    let rows = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM todo WHERE folder_id IS NOT NULL ORDER BY folder_id, sort_order, id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    let mut todos: Vec<Todo> = rows.iter().map(row_to_todo).collect();
+    attach_refs(pool, &mut todos).await?;
+    for todo in todos {
+        if let Some(folder) = folders.iter_mut().find(|f| Some(f.id) == todo.folder_id) {
+            folder.todos.push(todo);
+        }
+    }
+    Ok(folders)
+}
+
+pub async fn create_folder(pool: &PgPool, name: &str) -> Result<i64> {
+    let id: i64 = sqlx::query(
+        "INSERT INTO todo_folder (name, sort_order)
+         VALUES ($1, COALESCE((SELECT MAX(sort_order) FROM todo_folder), 0) + 1)
+         RETURNING id",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await?
+    .get("id");
+    Ok(id)
+}
+
+/// Edit a folder's name, its collapsed state, or its position among the
+/// other folders. `None` leaves a field as it was.
+pub async fn update_folder(
+    pool: &PgPool,
+    id: i64,
+    name: Option<&str>,
+    collapsed: Option<bool>,
+    sort_order: Option<f64>,
+) -> Result<bool> {
+    let changed = sqlx::query(
+        "UPDATE todo_folder
+            SET name = COALESCE($2::text, name),
+                collapsed = COALESCE($3::boolean, collapsed),
+                sort_order = COALESCE($4::double precision, sort_order)
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(collapsed)
+    .bind(sort_order)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(changed > 0)
+}
+
+/// Un-files every member (ON DELETE SET NULL) and drops the folder. A member
+/// with a stale scheduled_on reappears on today's list via the next
+/// roll_over — nothing here needs to touch todo rows itself.
+pub async fn delete_folder(pool: &PgPool, id: i64) -> Result<bool> {
+    let changed = sqlx::query("DELETE FROM todo_folder WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(changed > 0)
+}
+
+/// File an item into a folder, or (`folder_id: None`) take it back out.
+/// Unfiling deliberately leaves `scheduled_on` alone — see the migration's
+/// doc-comment for why that is enough to put it back in the daily rotation.
+pub async fn file_todo(
+    pool: &PgPool,
+    id: i64,
+    folder_id: Option<i64>,
+    at: DateTime<Utc>,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let sort_order: f64 = match folder_id {
+        Some(fid) => {
+            sqlx::query(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM todo WHERE folder_id = $1",
+            )
+            .bind(fid)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n")
+        }
+        None => 0.0,
+    };
+    let changed = if folder_id.is_some() {
+        sqlx::query("UPDATE todo SET folder_id = $2, sort_order = $3 WHERE id = $1")
+            .bind(id)
+            .bind(folder_id)
+            .bind(sort_order)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+    } else {
+        sqlx::query("UPDATE todo SET folder_id = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+    };
+    if changed == 0 {
+        return Ok(false);
+    }
+    let kind = if folder_id.is_some() { "filed" } else { "unfiled" };
+    log_event(&mut tx, id, at, kind, None, None).await?;
     tx.commit().await?;
     Ok(true)
 }
