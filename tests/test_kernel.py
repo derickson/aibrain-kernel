@@ -489,6 +489,14 @@ class LiveUpdateTests(unittest.TestCase):
         self.assertIsNone(payload)
         self.assertEqual(again, etag)
 
+    def test_status_reports_a_revision_per_brain(self):
+        with urllib.request.urlopen(self.base + "/api/status", timeout=30) as r:
+            status = json.loads(r.read().decode())
+        brain = status["brains"][0]
+        self.assertGreater(brain["revision"], 0, "ingest set it")
+        _, _, universe = self.universe()
+        self.assertEqual(universe["brains"][0]["revision"], brain["revision"])
+
     def test_a_tag_we_never_issued_is_not_honoured(self):
         status, _, payload = self.universe(if_none_match='"not-a-real-tag"')
         self.assertEqual(status, 200)

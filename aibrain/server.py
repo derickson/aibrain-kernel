@@ -450,6 +450,8 @@ def build_router(state: State) -> Router:
                     "id": b.id, "name": b.name, "path": str(b.resolved_path()),
                     "enabled": b.enabled, "exists": b.resolved_path().is_dir(),
                     "notes": rows.get(b.id, {}).get("note_count", 0),
+                    # What the layout cache and the change feed both key off.
+                    "revision": rows.get(b.id, {}).get("revision", 0),
                 }
                 for b in state.cfg.brains
             ],
