@@ -41,28 +41,36 @@ Flow:
   6. Close the DB, report whether any DB file changed (none should), then
      relaunch MacWhisper if it was running before.
 
-Tailing: the output folder is the source of truth for what has been
-exported. The newest timestamp found in existing filenames
-("YYYY-MM-DD HH-MM-SS ...md") is the high-water mark. Sessions are walked
-newest-first; each one newer than the mark is written, and the walk stops at
-the first session that is not newer. If the newest session is already
-exported the run is a no-op (apart from the quit/relaunch).
+Staging folder, not source of truth: the target folder (default:
+raw_transcripts/ in this repo) is a staging area. Files written here are
+expected to get moved ("absorbed") into the right vault by a later,
+separate step, so the folder's contents cannot be trusted to say what has
+already been pulled from MacWhisper — a session's file may simply no longer
+be there. Instead scripts/macwhisper/export_state.sqlite3 (local to this
+folder, gitignored, independent of --out-dir) records every session this
+script has ever written, keyed by macwhisper_session_id. The newest
+recorded_at in that db is the high-water mark. Sessions are walked
+newest-first; each one newer than the mark AND not already in the db is
+written, and the walk stops at the first session that is not newer. If the
+newest session is already recorded the run is a no-op (apart from the
+quit/relaunch).
 
-An empty output folder exports everything.
+An empty db (e.g. first run, or a fresh checkout) exports everything.
 
 Refresh (change data capture): transcripts can be edited inside MacWhisper
 after the fact, and the most common edit, renaming a speaker, leaves no
 timestamp anywhere in the database (verified empirically; text edits do bump
 session.dateUpdated, speaker renames do not). So after the tail, every
 session whose recording time falls inside --lookback-days (default 14) is
-re-rendered and compared byte-for-byte with its existing file, matched by
-the macwhisper_session_id in its frontmatter (falling back to the
-"YYYY-MM-DD HH-MM-SS" filename prefix for files written before frontmatter
-existed). If the title changed the file is renamed;
-if the content changed the file is rewritten. Files below the high-water
-mark that are missing are NOT recreated (a deliberate deletion stays
-deleted). NOTE: hand edits to files inside the window will be overwritten;
-the target folder is treated as a raw mirror of MacWhisper.
+looked up in the state db; if its file is still sitting in the staging
+folder (not yet absorbed elsewhere), it is re-rendered and compared
+byte-for-byte with that file. If the title changed the file is renamed; if
+the content changed the file is rewritten; the state db is updated to match
+either way. A session whose file is no longer in the staging folder is
+assumed already absorbed and is left alone — the script does not go looking
+for it elsewhere. NOTE: hand edits to a file still sitting in the staging
+folder, inside the window, will be overwritten; until absorbed, the folder
+is treated as a raw mirror of MacWhisper.
 
 Drift detection:
   MacWhisper's developer can change the database at any release without
@@ -89,7 +97,7 @@ Drift detection:
   accept the new shape with:  macwhisper_export.py --write-baseline
 
 Usage:
-  macwhisper_export.py                       # tail into the default vault folder
+  macwhisper_export.py                       # tail into the default staging folder
   macwhisper_export.py TARGET_FOLDER         # tail into TARGET_FOLDER
   macwhisper_export.py TARGET_FOLDER --dry-run
   macwhisper_export.py --lookback-days 30    # widen the refresh window (0 disables)
@@ -98,12 +106,15 @@ Usage:
   macwhisper_export.py --db /path/to/main.sqlite TARGET_FOLDER
 
 Examples:
-  python3 scripts/macwhisper/macwhisper_export.py ~/Documents/ObsidianVaults/AgenticTest/raw_transcript
+  python3 scripts/macwhisper/macwhisper_export.py
   python3 scripts/macwhisper/macwhisper_export.py ~/Notes/meetings --dry-run
   MACWHISPER_EXPORT_DIR=~/Notes/meetings python3 scripts/macwhisper/macwhisper_export.py
 
 The target folder is resolved in this order: positional argument,
---out-dir, $MACWHISPER_EXPORT_DIR, then the built-in default.
+--out-dir, $MACWHISPER_EXPORT_DIR, then the built-in default (raw_transcripts/
+at the repo root). The state db tracking what has been pulled lives at
+--state-db (default: scripts/macwhisper/export_state.sqlite3) regardless of
+which target folder is used.
 
 Exit codes: 0 ok, 1 error, 2 refused (MacWhisper running), 3 validation failed.
 """
@@ -111,6 +122,7 @@ Exit codes: 0 ok, 1 error, 2 refused (MacWhisper running), 3 validation failed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import plistlib
@@ -126,11 +138,12 @@ from pathlib import Path
 APP_NAME = "MacWhisper"
 APP_BUNDLE = Path("/Applications/MacWhisper.app")
 DEFAULT_DB = Path.home() / "Library/Application Support/MacWhisper/Database/main.sqlite"
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_OUT = Path(
-    os.environ.get("MACWHISPER_EXPORT_DIR")
-    or Path.home() / "Documents/ObsidianVaults/AgenticTest/raw_transcript"
+    os.environ.get("MACWHISPER_EXPORT_DIR") or (REPO_ROOT / "raw_transcripts")
 ).expanduser()
 BASELINE_PATH = Path(__file__).with_name("macwhisper_schema_baseline.json")
+STATE_DB_PATH = Path(__file__).with_name("export_state.sqlite3")
 QUIT_TIMEOUT_S = 30
 
 EXIT_OK, EXIT_ERROR, EXIT_REFUSED, EXIT_VALIDATION = 0, 1, 2, 3
@@ -232,23 +245,7 @@ def fmt_timestamp(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-FILENAME_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}) .*\.md$")
 FILENAME_TS_FMT = "%Y-%m-%d %H-%M-%S"
-
-
-def latest_exported(out_dir: Path) -> datetime | None:
-    """Newest recording timestamp already present in out_dir, from filenames."""
-    latest = None
-    if not out_dir.is_dir():
-        return None
-    for f in out_dir.iterdir():
-        m = FILENAME_TS_RE.match(f.name)
-        if not m:
-            continue
-        ts = datetime.strptime(m.group(1), FILENAME_TS_FMT).astimezone()
-        if latest is None or ts > latest:
-            latest = ts
-    return latest
 
 
 def blob_uuid(b: bytes | None) -> str | None:
@@ -260,31 +257,58 @@ def yaml_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-FRONTMATTER_ID_RE = re.compile(r"^macwhisper_session_id:\s*([0-9A-Fa-f-]{36})\s*$", re.M)
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def index_by_session_id(out_dir: Path) -> dict[str, list[Path]]:
-    """Map session UUID -> files whose frontmatter carries it (reads only the head of each file)."""
-    idx: dict[str, list[Path]] = {}
-    if not out_dir.is_dir():
-        return idx
-    for f in out_dir.glob("*.md"):
-        try:
-            with f.open("r", encoding="utf-8") as fh:
-                head = fh.read(2048)
-        except OSError:
-            continue
-        if not head.startswith("---"):
-            continue
-        m = FRONTMATTER_ID_RE.search(head.split("\n---", 1)[0])
-        if m:
-            idx.setdefault(m.group(1).upper(), []).append(f)
-    return idx
+def open_state_db(path: Path) -> sqlite3.Connection:
+    """The local ledger of sessions this script has ever pulled, independent of
+    where --out-dir points or whether the file is still there (it may have
+    been absorbed into a vault since)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS exported_sessions (
+            session_id        TEXT PRIMARY KEY,
+            meeting_id        TEXT,
+            recorded_at       TEXT NOT NULL,
+            title             TEXT NOT NULL,
+            filename          TEXT NOT NULL,
+            content_hash      TEXT NOT NULL,
+            first_exported_at TEXT NOT NULL,
+            last_exported_at  TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
 
 
-def files_with_stamp(out_dir: Path, stamp: str) -> list[Path]:
-    """Existing exports for a recording, matched by timestamp prefix only."""
-    return sorted(f for f in out_dir.glob(f"{stamp} *.md") if f.is_file())
+def state_high_water_mark(conn: sqlite3.Connection) -> datetime | None:
+    (v,) = conn.execute("SELECT max(recorded_at) FROM exported_sessions").fetchone()
+    return datetime.fromisoformat(v) if v else None
+
+
+def state_get(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM exported_sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+
+
+def state_record(conn: sqlite3.Connection, *, session_id: str, meeting_id: str | None,
+                  recorded_at: str, title: str, filename: str, text: str) -> None:
+    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
+    conn.execute("""
+        INSERT INTO exported_sessions
+            (session_id, meeting_id, recorded_at, title, filename, content_hash,
+             first_exported_at, last_exported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            meeting_id=excluded.meeting_id, recorded_at=excluded.recorded_at,
+            title=excluded.title, filename=excluded.filename,
+            content_hash=excluded.content_hash, last_exported_at=excluded.last_exported_at
+    """, (session_id, meeting_id, recorded_at, title, filename, content_hash(text), now, now))
+    conn.commit()
 
 
 def safe_filename(s: str) -> str:
@@ -626,6 +650,8 @@ def main() -> int:
     ap.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"path to main.sqlite (default: {DEFAULT_DB})")
     ap.add_argument("--baseline", type=Path, default=BASELINE_PATH,
                     help=f"schema baseline JSON (default: {BASELINE_PATH})")
+    ap.add_argument("--state-db", type=Path, default=STATE_DB_PATH,
+                    help=f"ledger of sessions already pulled (default: {STATE_DB_PATH})")
     ap.add_argument("--lookback-days", type=float, default=14,
                     help="re-render sessions recorded within this many days and update changed files (0 disables)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be written without writing")
@@ -680,104 +706,113 @@ def main() -> int:
             if args.validate_only:
                 return EXIT_OK
 
-            mark = latest_exported(args.out_dir)
-            print(f"high-water mark: {mark.strftime(FILENAME_TS_FMT) if mark else 'none (empty folder)'}")
+            state_conn = open_state_db(args.state_db)
+            try:
+                mark = state_high_water_mark(state_conn)
+                print(f"high-water mark: {mark.strftime(FILENAME_TS_FMT) if mark else 'none (empty state db)'}")
 
-            # Build (recording_time, row) and walk newest-first by recording time.
-            rows = []
-            for sid, created, user_title, ai_title, orig_name, meeting_date, meeting_id, app_name \
-                    in conn.execute(SESSIONS_SQL):
-                # Truncate to whole seconds so it compares cleanly with filename stamps.
-                when = parse_db_datetime(meeting_date or created).replace(microsecond=0)
-                title = user_title or ai_title or orig_name or "Transcript"
-                meta = {
-                    "session_id": blob_uuid(sid),
-                    "meeting_id": blob_uuid(meeting_id),
-                    "recorded_at": when.isoformat(),
-                    "source_app": app_name,
-                    "title": title,
-                }
-                rows.append((when, sid, title, meta))
-            rows.sort(key=lambda r: r[0], reverse=True)
-            by_id = index_by_session_id(args.out_dir)
+                # Build (recording_time, row) and walk newest-first by recording time.
+                rows = []
+                for sid, created, user_title, ai_title, orig_name, meeting_date, meeting_id, app_name \
+                        in conn.execute(SESSIONS_SQL):
+                    # Truncate to whole seconds so it compares cleanly with filename stamps.
+                    when = parse_db_datetime(meeting_date or created).replace(microsecond=0)
+                    title = user_title or ai_title or orig_name or "Transcript"
+                    meta = {
+                        "session_id": blob_uuid(sid),
+                        "meeting_id": blob_uuid(meeting_id),
+                        "recorded_at": when.isoformat(),
+                        "source_app": app_name,
+                        "title": title,
+                    }
+                    rows.append((when, sid, title, meta))
+                rows.sort(key=lambda r: r[0], reverse=True)
 
-            if not rows:
-                print("no transcripts in database.")
-            args.out_dir.mkdir(parents=True, exist_ok=True)
+                if not rows:
+                    print("no transcripts in database.")
+                args.out_dir.mkdir(parents=True, exist_ok=True)
 
-            # ---- pass 1: tail. Newest-first; stop at the first already-exported session.
-            for when, sid, title, meta in rows:
-                stamp = when.strftime(FILENAME_TS_FMT)
-                if mark is not None and when <= mark:
-                    print(f"reached already-exported session {stamp}; stopping tail.")
-                    break
-                if meta["session_id"] in by_id:
-                    print(f"skip (session already exported as {by_id[meta['session_id']][0].name})")
-                    continue
-                path = args.out_dir / f"{stamp} {safe_filename(title)}.md"
-                lines = conn.execute(LINES_SQL, (sid,)).fetchall()
-                if not lines:
-                    print(f"skip (no transcript lines): {stamp} {title}")
-                    continue
-                if args.dry_run:
-                    print(f"would write: {path}  ({len(lines)} lines)")
-                    written += 1
-                    continue
-                path.write_text(render_markdown(meta, lines), encoding="utf-8")
-                written += 1
-                print(f"wrote: {path}  ({len(lines)} lines)")
-
-            # ---- pass 2: refresh. Re-render already-exported sessions inside the lookback
-            # window and reconcile filename (title) and content (text/speaker edits).
-            if mark is not None and args.lookback_days > 0:
-                cutoff = datetime.now().astimezone() - timedelta(days=args.lookback_days)
-                print(f"refresh window: sessions since {cutoff.strftime(FILENAME_TS_FMT)} "
-                      f"({args.lookback_days:g} days)")
+                # ---- pass 1: tail. Newest-first; stop at the first already-pulled session.
                 for when, sid, title, meta in rows:
-                    if when > mark or when < cutoff:
-                        continue
                     stamp = when.strftime(FILENAME_TS_FMT)
-                    # Match by session id in frontmatter first; legacy files by filename stamp.
-                    existing = by_id.get(meta["session_id"]) or files_with_stamp(args.out_dir, stamp)
-                    expected = args.out_dir / f"{stamp} {safe_filename(title)}.md"
-                    if not existing:
-                        print(f"refresh: {stamp} has no file (deleted?); not recreated")
+                    if mark is not None and when <= mark:
+                        print(f"reached already-pulled session {stamp}; stopping tail.")
+                        break
+                    existing = state_get(state_conn, meta["session_id"])
+                    if existing:
+                        print(f"skip (session already pulled as {existing['filename']})")
                         continue
-                    if len(existing) > 1:
-                        print(f"refresh: {stamp} matches {len(existing)} files; ambiguous, skipped: "
-                              f"{[f.name for f in existing]}")
-                        continue
-                    current = existing[0]
+                    path = args.out_dir / f"{stamp} {safe_filename(title)}.md"
                     lines = conn.execute(LINES_SQL, (sid,)).fetchall()
                     if not lines:
-                        print(f"refresh: {stamp} now has no transcript lines in DB; file left as is")
+                        print(f"skip (no transcript lines): {stamp} {title}")
                         continue
-                    new_text = render_markdown(meta, lines)
-                    old_text = current.read_text(encoding="utf-8")
-                    rename = current != expected
-                    # Compare with the volatile line removed; a file that lacks it entirely
-                    # (written by an older version of this script) is rewritten once to gain it.
-                    rewrite = (strip_volatile(old_text) != strip_volatile(new_text)
-                               or not VOLATILE_FM_RE.search(old_text))
-                    if not (rename or rewrite):
-                        continue
-                    what = " + ".join(w for w, on in (("rename", rename), ("content", rewrite)) if on)
+                    text = render_markdown(meta, lines)
                     if args.dry_run:
-                        print(f"would update ({what}): {current.name}"
-                              + (f" -> {expected.name}" if rename else ""))
-                        updated += 1
+                        print(f"would write: {path}  ({len(lines)} lines)")
+                        written += 1
                         continue
-                    if rename:
-                        if expected.exists():
-                            print(f"refresh: cannot rename {current.name} -> {expected.name}: target exists; "
-                                  f"updating content in place")
-                            expected = current
-                        else:
-                            current.rename(expected)
-                    if rewrite or rename:
-                        expected.write_text(new_text, encoding="utf-8")
-                    updated += 1
-                    print(f"updated ({what}): {expected.name}")
+                    path.write_text(text, encoding="utf-8")
+                    state_record(state_conn, session_id=meta["session_id"], meeting_id=meta["meeting_id"],
+                                 recorded_at=meta["recorded_at"], title=title, filename=path.name,
+                                 text=strip_volatile(text))
+                    written += 1
+                    print(f"wrote: {path}  ({len(lines)} lines)")
+
+                # ---- pass 2: refresh. Re-render already-pulled sessions inside the lookback
+                # window whose file is still sitting in the staging folder (not yet absorbed
+                # elsewhere), and reconcile filename (title) and content (text/speaker edits).
+                if mark is not None and args.lookback_days > 0:
+                    cutoff = datetime.now().astimezone() - timedelta(days=args.lookback_days)
+                    print(f"refresh window: sessions since {cutoff.strftime(FILENAME_TS_FMT)} "
+                          f"({args.lookback_days:g} days)")
+                    for when, sid, title, meta in rows:
+                        if when > mark or when < cutoff:
+                            continue
+                        stamp = when.strftime(FILENAME_TS_FMT)
+                        row = state_get(state_conn, meta["session_id"])
+                        if row is None:
+                            continue
+                        current = args.out_dir / row["filename"]
+                        if not current.exists():
+                            print(f"refresh: {stamp} no longer in staging (absorbed); skipping")
+                            continue
+                        expected = args.out_dir / f"{stamp} {safe_filename(title)}.md"
+                        lines = conn.execute(LINES_SQL, (sid,)).fetchall()
+                        if not lines:
+                            print(f"refresh: {stamp} now has no transcript lines in DB; file left as is")
+                            continue
+                        new_text = render_markdown(meta, lines)
+                        old_text = current.read_text(encoding="utf-8")
+                        rename = current != expected
+                        # Compare with the volatile line removed; a file that lacks it entirely
+                        # (written by an older version of this script) is rewritten once to gain it.
+                        rewrite = (strip_volatile(old_text) != strip_volatile(new_text)
+                                   or not VOLATILE_FM_RE.search(old_text))
+                        if not (rename or rewrite):
+                            continue
+                        what = " + ".join(w for w, on in (("rename", rename), ("content", rewrite)) if on)
+                        if args.dry_run:
+                            print(f"would update ({what}): {current.name}"
+                                  + (f" -> {expected.name}" if rename else ""))
+                            updated += 1
+                            continue
+                        if rename:
+                            if expected.exists():
+                                print(f"refresh: cannot rename {current.name} -> {expected.name}: target exists; "
+                                      f"updating content in place")
+                                expected = current
+                            else:
+                                current.rename(expected)
+                        if rewrite or rename:
+                            expected.write_text(new_text, encoding="utf-8")
+                        state_record(state_conn, session_id=meta["session_id"], meeting_id=meta["meeting_id"],
+                                     recorded_at=meta["recorded_at"], title=title, filename=expected.name,
+                                     text=strip_volatile(new_text))
+                        updated += 1
+                        print(f"updated ({what}): {expected.name}")
+            finally:
+                state_conn.close()
         finally:
             try:
                 conn.execute("ROLLBACK")

@@ -319,7 +319,13 @@ def reconcile_brains(cfg: "Config") -> bool:
 # out of reach because this file says so. A static list stops protecting a
 # vault the moment one is linked, and keeps denying one that was unlinked, so
 # it is regenerated from the symlinks every time they are reconciled.
-SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
+#
+# settings.local.json, not settings.json: the rules bake in this machine's
+# absolute vault paths (obsidian_vaults/ is itself local and gitignored), so
+# they belong in Claude Code's untracked local-overrides file. Writing them
+# into the committed settings.json would make every checkout's commits fight
+# over each other's paths.
+SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.local.json"
 
 # Not vaults, and nothing to do with which brains exist — these stay whatever
 # the vault list does.
@@ -354,7 +360,7 @@ def deny_rules(vaults: list[Path]) -> list[str]:
 
 
 def write_deny_rules(vaults: list[Path]) -> bool:
-    """Add the Read denials to `.claude/settings.json`. Returns if changed.
+    """Add the Read denials to `.claude/settings.local.json`. Returns if changed.
 
     Everything else in the file is left alone, and so is every rule that is
     already there: this only ever adds. See the note where `wanted` is built
@@ -362,9 +368,9 @@ def write_deny_rules(vaults: list[Path]) -> bool:
     """
     path = SETTINGS_PATH
     # Loading the config is what triggers this, and plenty of things load the
-    # config without meaning to touch a file that is committed and shared —
-    # a test, a script, an editor plugin. The escape hatch is an env var so
-    # those can say so without the app losing the behaviour it wants.
+    # config without meaning to touch a machine-local file that stays out of
+    # git — a test, a script, an editor plugin. The escape hatch is an env
+    # var so those can say so without the app losing the behaviour it wants.
     if os.environ.get("AIBRAIN_MANAGE_DENY_RULES", "1") in ("0", "no", "false"):
         return False
     if not path.parent.is_dir():
@@ -372,7 +378,7 @@ def write_deny_rules(vaults: list[Path]) -> bool:
     # An empty `obsidian_vaults/` means the user unlinked everything, and the
     # rules should go with them. A *missing* one means this checkout has never
     # had links at all — a fresh clone, or a worktree — and we know nothing
-    # about which vaults exist, so rewriting a shared committed file to drop
+    # about which vaults exist, so rewriting the local settings file to drop
     # every vault rule would take protection away rather than keep it current.
     if not VAULT_LINK_DIR.is_dir():
         return False
@@ -507,13 +513,16 @@ def default_scripts() -> list[ScriptConfig]:
             id="macwhisper",
             name="MacWhisper transcripts",
             description=(
-                "Tail MacWhisper's database and mirror new transcripts into the "
-                "vault's raw_transcript/ folder. Quits and relaunches MacWhisper."
+                "Tail MacWhisper's database and mirror new transcripts into "
+                "raw_transcripts/, a staging folder for absorbing into a vault. "
+                "Quits and relaunches MacWhisper."
             ),
             command=["python3", str(REPO_ROOT / "scripts/macwhisper/macwhisper_export.py")],
             cwd=str(REPO_ROOT),
             options={"Dry run": ["--dry-run"], "Verbose": ["--verbose"]},
-            reindex_after=True,
+            # Writes to the raw_transcripts/ staging folder, not a linked vault,
+            # so there is nothing new for the corpus to index yet.
+            reindex_after=False,
         ),
     ]
 

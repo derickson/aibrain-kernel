@@ -91,6 +91,40 @@ tab creates and removes these links for you, and reports any that do not
 resolve. Removing a brain removes only the link; the vault itself is never
 touched.
 
+### Running on more than one machine
+
+Everything that differs between machines — which vaults exist, where they
+live, secrets — is meant to live outside git, so two checkouts never fight
+over each other's local paths in a commit:
+
+| What | Where | Committed? |
+|---|---|---|
+| Which vaults are linked, and to where | `obsidian_vaults/<name>` symlinks | No — gitignored |
+| Read-deny rules derived from those vaults | `.claude/settings.local.json` | No — gitignored; regenerated automatically on every `Config.load()`, never hand-edit it |
+| Brain list, agents, scripts, UI layout | `$AIBRAIN_HOME/config.json` (default `~/.aibrain/config.json`) | No — lives outside the repo entirely |
+| Secrets and endpoints (Elasticsearch, etc.) | `.env` | No — gitignored; copy from `.env.example` |
+| MacWhisper staging + pull ledger (macOS only) | `raw_transcripts/`, `scripts/macwhisper/export_state.sqlite3` | No — gitignored |
+
+`.claude/settings.json` (no `.local`) is the one file in this list that
+*is* committed — it is meant only for rules you want every checkout to
+share, never for anything derived from a specific machine's vaults. See
+[the note in `SECURITY.md`](SECURITY.md) about why the deny rules moved out
+of it.
+
+Setting up an additional machine is then just:
+
+```sh
+git clone <this repo>   # or open the same checkout from another OS/user
+cd aibrain-kernel
+ln -s /path/to/this/machines/vault obsidian_vaults/Home
+cp .env.example .env && $EDITOR .env   # only if you want Elasticsearch here too
+./dev.sh
+```
+
+The first `Config.load()` on that machine discovers `obsidian_vaults/`,
+creates `~/.aibrain/config.json` and `.claude/settings.local.json` for it,
+and none of that touches what any other machine has configured.
+
 ## Environment variables
 
 Rust reads these directly from the environment or from a `.env` file (see
@@ -281,8 +315,10 @@ vault you have backed up.
 
 The **Tools** tab runs the scripts in `scripts/`, streaming stdout and
 stderr into the panel. The MacWhisper exporter is wired up with its
-`--dry-run` and `--verbose` flags as toggles; when it finishes, `POST
-/reindex` is called and the universe rebuilds. See
+`--dry-run` and `--verbose` flags as toggles; it writes into
+`raw_transcripts/` at the repo root, a staging folder outside any vault, so
+it does not trigger a reindex on its own — a transcript only becomes part of
+a brain once it is moved into a linked vault. See
 [`scripts/macwhisper/README.md`](scripts/macwhisper/README.md) for what it
 does to the MacWhisper database.
 
@@ -424,7 +460,7 @@ at the end naming every stage that passed, failed or was skipped (and why):
    reason when no credentials are found.
 
 The script exits non-zero if any stage that ran failed. It never rewrites
-`.claude/settings.json`: every corpus-backed test class points
+`.claude/settings.local.json`: every corpus-backed test class points
 `aibrain.config` at a private temp file, and the one path that does not (the
 `StartupTests` subprocess, which runs the real `python3 -m aibrain` entry
 point) sets `AIBRAIN_MANAGE_DENY_RULES=0` in its own environment rather than

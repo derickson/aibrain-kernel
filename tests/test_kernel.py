@@ -826,7 +826,7 @@ class StartupTests(unittest.TestCase):
                    # obsidian_vaults/ this checkout has, which — unlike the
                    # rest of this file — this subprocess never gets a chance
                    # to patch away. Left on, a run against a checkout with
-                   # linked vaults would rewrite its real .claude/settings.json.
+                   # linked vaults would rewrite its real .claude/settings.local.json.
                    "AIBRAIN_MANAGE_DENY_RULES": "0"}
             result = subprocess.run(
                 [sys.executable, "-m", "aibrain", "--config", str(config),

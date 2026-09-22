@@ -126,7 +126,7 @@ Fixed in both: the detail goes to the log the user started the server in, and
 the response says only that it failed. `CorpusError` and the new `BadRequest`
 still carry their text, because both are written for a person to read.
 
-### Medium — `.claude/settings.json` rewritten in a way that removed rules
+### Medium — `.claude/settings.local.json` rewritten in a way that removed rules
 
 `write_deny_rules` rebuilt the whole `Read(` block from the current symlinks,
 so any `Read(...)` denial someone had written by hand disappeared on the next
@@ -135,9 +135,16 @@ so any `Read(...)` denial someone had written by hand disappeared on the next
 Fixed: the function now only ever **adds**. A rule that outlives its vault
 costs nothing; a rule that vanishes costs the protection it was there for. It
 also honours `AIBRAIN_MANAGE_DENY_RULES=0`, so a test or a script can load a
-config without editing a committed, shared file. The existing guard — a
-missing `obsidian_vaults/` means a fresh clone or a worktree, and nothing is
-written — is unchanged.
+config without editing the file. The existing guard — a missing
+`obsidian_vaults/` means a fresh clone or a worktree, and nothing is written
+— is unchanged.
+
+Separately, the rules were originally written into `.claude/settings.json`,
+which is committed — baking each checkout's absolute vault paths into shared
+git history and making every machine's commits fight over the same file.
+Moved to `.claude/settings.local.json`, Claude Code's untracked
+local-overrides file (now gitignored), so each checkout's paths stay local to
+it.
 
 The trade-off: unlinking a vault now leaves its deny rule behind. That is the
 fail-safe direction, and removing it is a one-line edit the user can make.

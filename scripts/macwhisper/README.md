@@ -7,12 +7,17 @@ any process still has the database open, reads the live SQLite files in
 read-only mode, writes new files, verifies the database files are unchanged,
 and relaunches MacWhisper.
 
+By default it writes into `raw_transcripts/` at the repo root — a staging
+folder, not a vault. Files land there and are expected to get moved
+("absorbed") into the right spot in an actual Obsidian vault by a later,
+separate step; this script's job ends at getting them out of MacWhisper.
+
 ```sh
-# Tail into the default vault folder
+# Tail into the default staging folder (raw_transcripts/ at the repo root)
 python3 scripts/macwhisper/macwhisper_export.py
 
-# Tail into a specific target folder
-python3 scripts/macwhisper/macwhisper_export.py ~/Documents/ObsidianVaults/AgenticTest/raw_transcript
+# Tail into a specific target folder instead
+python3 scripts/macwhisper/macwhisper_export.py ~/Notes/meetings
 
 # See what would be written without writing anything
 python3 scripts/macwhisper/macwhisper_export.py ~/Notes/meetings --dry-run
@@ -26,8 +31,19 @@ python3 scripts/macwhisper/macwhisper_export.py --db /path/to/main.sqlite ~/Note
 ```
 
 Files are named `YYYY-MM-DD HH-MM-SS <title>.md` using the recording's local
-start time. The newest such stamp in the target folder is the high-water mark;
-only newer sessions are written, and a run is a no-op when nothing is new.
+start time.
+
+## Tracking what has already been pulled
+
+The staging folder's contents are not trusted as a record of what has been
+exported — once a transcript is absorbed into a vault it leaves the folder,
+so a missing file doesn't mean "not yet exported." Instead
+`scripts/macwhisper/export_state.sqlite3` (local to this folder, gitignored,
+independent of the target folder) records every session this script has
+ever pulled, keyed by its stable `macwhisper_session_id`. The newest
+recorded session time in that db is the high-water mark; only sessions newer
+than the mark and not already recorded are written, and a run is a no-op
+when nothing is new. Point at a different ledger with `--state-db`.
 
 Each file starts with YAML frontmatter carrying MacWhisper's stable ids, and
 the body below it is byte-identical to MacWhisper's own Markdown export:
@@ -48,16 +64,17 @@ script_exported_at: 2026-09-21T20:15:03-04:00                 # last time this s
 Transcripts can be edited inside MacWhisper after the fact. Text edits bump
 `session.dateUpdated`, but renaming a speaker, the most common edit, leaves no
 timestamp anywhere in the database. So the script does not trust timestamps:
-after the tail it re-renders every session recorded within the last
-`--lookback-days` (default 14, `0` disables), finds its file by the
-`macwhisper_session_id` in its frontmatter (falling back to the filename stamp
-for files written before frontmatter existed), renames it if the title changed,
-and rewrites it if the content differs byte-for-byte, ignoring only the
-`script_exported_at` line. Files below the high-water mark that are
-missing are not recreated, so a deliberate deletion sticks.
+after the tail it looks up every session recorded within the last
+`--lookback-days` (default 14, `0` disables) in the state db and, if its file
+is still sitting in the staging folder, re-renders it, renaming it if the
+title changed and rewriting it if the content differs byte-for-byte
+(ignoring only the `script_exported_at` line). A session whose file is no
+longer in the staging folder is assumed already absorbed into a vault and is
+left alone — the script does not go looking for it elsewhere.
 
-The target folder is treated as a raw mirror of MacWhisper: hand edits to a
-file inside the window will be overwritten on the next run.
+Until absorbed, the staging folder is treated as a raw mirror of MacWhisper:
+hand edits to a file still there, inside the window, will be overwritten on
+the next run.
 
 ```sh
 python3 scripts/macwhisper/macwhisper_export.py --lookback-days 30   # widen the window

@@ -1,13 +1,1 @@
-{
-  "permissions": {
-    "deny": [
-      "Read(//Users/dave/Documents/ObsidianVaults/AgenticTest/**)",
-      "Read(//Users/dave/Documents/ObsidianVaults/grognard_backup/**)",
-      "Read(//Users/dave/.ssh/**)",
-      "Read(//Users/dave/.aws/**)",
-      "Read(//Users/dave/.gnupg/**)",
-      "Read(//Users/dave/.config/gh/**)",
-      "Read(//Users/dave/Library/Keychains/**)"
-    ]
-  }
-}
+{}

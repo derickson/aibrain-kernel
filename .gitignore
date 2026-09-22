@@ -2,8 +2,12 @@ __pycache__/
 *.pyc
 
 obsidian_vaults
+raw_transcripts
 graft
 .DS_Store
+
+# per-machine Claude Code overrides (bakes in this checkout's absolute vault paths)
+.claude/settings.local.json
 
 # rust build output
 rust/target/
