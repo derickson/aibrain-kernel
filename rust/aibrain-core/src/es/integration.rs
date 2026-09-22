@@ -219,6 +219,67 @@ async fn a_vault_is_indexed_searched_and_kept_in_step() {
     outcome.expect("the test body panicked").unwrap();
 }
 
+/// The queue-side coalescing in `five_edits_before_the_worker_runs_are_one_row`
+/// is exercised there against raw `enqueue_note` calls, which proves the SQL.
+/// This drives it through real file edits and `ingest_one` — the path the
+/// watcher actually takes — and follows it all the way to Elasticsearch, so a
+/// note rewritten three times before the worker wakes up lands as one document,
+/// not three.
+#[tokio::test]
+async fn three_rapid_edits_coalesce_into_one_document() {
+    let Some(h) = setup().await else { return };
+    let h = Arc::new(h);
+    let outcome = tokio::spawn({
+        let h = h.clone();
+        async move { run_coalesce(&h).await }
+    })
+    .await;
+    teardown(&h).await;
+    outcome.expect("the test body panicked").unwrap();
+}
+
+async fn run_coalesce(h: &Harness) -> anyhow::Result<()> {
+    db::upsert_brain(&h.pool, &h.brain.id, &h.brain.name, &h.brain.root, h.brain.seed).await?;
+    ingest::ingest_brain(&h.pool, &h.brain, true, &mut |_: &str| {}).await?;
+    db::rebuild_links(&h.pool).await?;
+    drain_all(h).await;
+    h.es.refresh(&h.index()).await?;
+    assert_eq!(h.es.count(&h.index()).await?, NOTES.len() as i64);
+
+    // Edit the same note three times in a row, before the worker gets a
+    // chance to drain any of them — the way three fast saves in Obsidian
+    // would arrive at the watcher.
+    for body in [
+        "# Garden\n\nFirst rewrite: courgettes everywhere.\n",
+        "# Garden\n\nSecond rewrite: tomatoes ripening fast.\n",
+        "# Garden\n\nThird rewrite: the zucchini glut wins.\n",
+    ] {
+        std::fs::write(h.dir.join("Notes").join("Garden.md"), body)?;
+        assert!(ingest::ingest_one(&h.pool, &h.brain, "Notes/Garden.md").await?.is_some());
+    }
+    assert_eq!(
+        db::queue_depth_for_brain(&h.pool, &h.brain.id).await?,
+        1,
+        "three edits to the same note must coalesce into one queue row"
+    );
+
+    drain_all(h).await;
+    h.es.refresh(&h.index()).await?;
+    assert_eq!(
+        h.es.count(&h.index()).await?,
+        NOTES.len() as i64,
+        "still one document per note, not one per edit"
+    );
+    let found = titles(h, "zucchini glut wins").await;
+    assert_eq!(
+        found.first().map(String::as_str),
+        Some("Garden"),
+        "the surviving document is the last edit, not an earlier one: {found:?}"
+    );
+
+    Ok(())
+}
+
 async fn run(h: &Harness) -> anyhow::Result<()> {
     db::upsert_brain(&h.pool, &h.brain.id, &h.brain.name, &h.brain.root, h.brain.seed).await?;
     let stats = ingest::ingest_brain(&h.pool, &h.brain, true, &mut |_: &str| {}).await?;
