@@ -337,6 +337,9 @@ class ServerTests(unittest.TestCase):
     def test_search_then_open_a_note(self):
         found = self.get("/api/search?q=protocols")
         self.assertTrue(found["results"])
+        # Which engine answered travels through the proxy; the fixture runs
+        # without Elasticsearch, so this is the lexical one.
+        self.assertEqual(found["engine"], "postgres")
         top = found["results"][0]
         self.assertEqual(top["brain"], "Test")
         self.assertEqual(top["brainId"], self.fixture.brain_id)

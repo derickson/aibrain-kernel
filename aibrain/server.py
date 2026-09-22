@@ -633,11 +633,13 @@ def build_router(state: State) -> Router:
         text = q.get("q", "")[:2000]
         limit = h.int_query("limit", 60, 1, 200)
         brain_ids = [b for b in q.get("brains", "").split(",") if b][:32]
-        results = state.corpus.search_raw(text, limit=limit,
-                                          brain_ids=brain_ids or None)
+        page = state.corpus.search_page(text, limit=limit,
+                                        brain_ids=brain_ids or None)
+        results = page.get("results", [])
         h.json({
             "query": text,
             "count": len(results),
+            "engine": page.get("engine", ""),
             "results": [state.decorate(row) for row in results],
         })
 

@@ -193,23 +193,28 @@ class Corpus:
         finally:
             response.close()
 
-    def search_raw(self, query: str, limit: int = 60,
-                   brain_ids: list[str] | None = None,
-                   any_terms: bool = False) -> list[dict]:
-        """Results exactly as the service sent them.
+    def search_page(self, query: str, limit: int = 60,
+                    brain_ids: list[str] | None = None,
+                    any_terms: bool = False) -> dict:
+        """The whole `/search` answer: `results` plus `engine` and `count`.
 
         The browser route wants every field, including ones added after this
         client was written; the agents want the `Hit` shape they already use.
         """
         if not query.strip():
-            return []
-        payload = self._request("/search", params={
+            return {"results": [], "count": 0, "engine": ""}
+        return self._request("/search", params={
             "q": query,
             "limit": limit,
             "brains": ",".join(brain_ids) if brain_ids else None,
             "any": "1" if any_terms else None,
-        }) or {}
-        return payload.get("results", [])
+        }) or {"results": []}
+
+    def search_raw(self, query: str, limit: int = 60,
+                   brain_ids: list[str] | None = None,
+                   any_terms: bool = False) -> list[dict]:
+        """Result rows exactly as the service sent them."""
+        return self.search_page(query, limit, brain_ids, any_terms).get("results", [])
 
     def search(self, query: str, limit: int = 60,
                brain_ids: list[str] | None = None,
