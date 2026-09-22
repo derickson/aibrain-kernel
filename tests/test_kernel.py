@@ -155,6 +155,12 @@ class CorpusFixture:
             "AIBRAIN_BIND": f"127.0.0.1:{self.port}",
             "AIBRAIN_LOG": "aibrain_core=warn",
         }
+        # The binary loads the repo `.env`, which carries live Elasticsearch
+        # credentials. A test must never index a throwaway vault into the real
+        # cluster, so Elasticsearch is switched off unless a run opts in.
+        if not os.environ.get("AIBRAIN_TEST_ELASTICSEARCH"):
+            env["ELASTICSEARCH_URL"] = ""
+            env["ELASTICSEARCH_API_KEY"] = ""
         self.proc = subprocess.Popen(
             [str(binary), "serve"], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

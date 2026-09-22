@@ -103,6 +103,16 @@ pub fn target_indices(es: &Es, brains: &[String], known: &[(String, String)]) ->
 }
 
 /// Run the query and hand back summaries in Elasticsearch's order.
+/// Hits scoring below this fraction of the best hit are dropped.
+pub const MIN_SCORE_FRACTION: f32 = 0.05;
+
+/// Drop the noise tail: anything scoring under `MIN_SCORE_FRACTION` of the
+/// best hit. Ranking order is preserved.
+pub fn apply_score_floor<T>(hits: &mut Vec<(String, String, T, f32)>) {
+    let top = hits.iter().map(|h| h.3).fold(0.0f32, f32::max);
+    hits.retain(|h| h.3 >= top * MIN_SCORE_FRACTION);
+}
+
 pub async fn run(
     pool: &PgPool,
     es: &Es,
@@ -149,6 +159,11 @@ pub async fn run(
         ));
     }
 
+    // The semantic leg gives every note a score, so the tail of the list is
+    // noise at 1e-45 rather than an absence. Cut relative to the top hit so a
+    // search for something the vault does not contain reads as "nothing".
+    apply_score_floor(&mut ordered);
+
     let brain_ids: Vec<String> = ordered.iter().map(|(b, _, _, _)| b.clone()).collect();
     let rel_paths: Vec<String> = ordered.iter().map(|(_, p, _, _)| p.clone()).collect();
     let current = db::summaries_by_path(pool, &brain_ids, &rel_paths).await?;
@@ -188,6 +203,18 @@ fn snippet_for(hit: &Value, source: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_noise_tail_is_cut_relative_to_the_top_hit() {
+        let mk = |s: f32| ("b".to_string(), format!("{s}"), (), s);
+        let mut hits = vec![mk(2.5), mk(0.9), mk(0.13), mk(1e-45), mk(0.0)];
+        super::apply_score_floor(&mut hits);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].3, 2.5);
+        let mut empty: Vec<(String, String, (), f32)> = vec![];
+        super::apply_score_floor(&mut empty);
+        assert!(empty.is_empty());
+    }
+
     use super::*;
     use crate::es::{EsConfig, Es};
 
