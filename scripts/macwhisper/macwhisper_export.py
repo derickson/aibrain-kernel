@@ -327,6 +327,7 @@ SELECT s.id,
 FROM session s
 LEFT JOIN recordedmeeting m ON m.id = s.recordedMeetingID
 WHERE s.dateDeleted IS NULL
+  AND (m.id IS NULL OR m.dateDeleted IS NULL)
   AND s.isTransient = 0
   AND s.transcriptionDidSucceed = 1
 ORDER BY s.dateCreated DESC
@@ -409,7 +410,10 @@ REQUIRED: dict[str, dict[str, str]] = {
         "orderIndex": "INTEGER", "speakerID": "BLOB",
     },
     "speaker": {"id": "BLOB", "name": "TEXT"},
-    "recordedmeeting": {"id": "BLOB", "date": "DATETIME", "duration": "DOUBLE", "appName": "TEXT"},
+    "recordedmeeting": {
+        "id": "BLOB", "date": "DATETIME", "duration": "DOUBLE", "appName": "TEXT",
+        "dateDeleted": "DOUBLE",
+    },
     "grdb_migrations": {"identifier": "TEXT"},
 }
 
