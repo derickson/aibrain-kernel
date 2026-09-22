@@ -1,0 +1,5 @@
+rust/target
+.git
+obsidian_vaults
+graft
+.env

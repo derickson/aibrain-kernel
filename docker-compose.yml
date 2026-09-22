@@ -56,6 +56,8 @@ services:
     environment:
       AIBRAIN_DATABASE_URL: postgres://aibrain:aibrain@db:5432/aibrain
       AIBRAIN_BIND: 0.0.0.0:8781
+      # config.json is mounted at /config; its brain paths must be /vaults/<name>.
+      AIBRAIN_HOME: /config
       # Passed through from the shell or the repo-root .env (compose reads
       # that file too, for ${...} interpolation). Unset means search stays
       # on Postgres, same as running natively.
