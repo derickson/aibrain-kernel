@@ -2,37 +2,47 @@
 
 Standard library only, like the rest of the repo — run them with:
 
-    python3 tests/test_kernel.py
+    python3 -m unittest tests.test_kernel
 
-They build a small vault in a temp directory, index it, and drive the HTTP API
-the way the browser does, so a passing run means the whole stack is wired up:
-scanning, link resolution, search, markdown, the universe payload, the local
-agent's SSE stream, and the job runner.
+Parsing, link resolution, layout and markdown rendering all live in Rust now
+and are tested there. What is left here is the seam: the HTTP surface the
+browser consumes, the citation tiers, vault discovery and the job runner.
+
+The tests that need a corpus start a real `aibrain-core` against a temp vault
+on an ephemeral port and point the Python side at it. If Postgres is not
+reachable they skip with a message rather than failing, because a missing
+container is an environment problem, not a broken build.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
+import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from aibrain import graph, md                                      # noqa: E402
 from aibrain.agents import LocalAgent                               # noqa: E402
-from aibrain.agents.base import EVIDENCE_ORDER                      # noqa: E402
+from aibrain.agents.base import EVIDENCE_ORDER, normalize           # noqa: E402
 from aibrain.config import (AgentConfig, BrainConfig, Config,       # noqa: E402
                             ScriptConfig, default_agents)
-from aibrain.index import Index, fts_query                         # noqa: E402
-from aibrain.jobs import JobRunner                                 # noqa: E402
-from aibrain.server import Handler, State, build_router            # noqa: E402
-from aibrain.vault import link_targets, normalize, parse_frontmatter, scan  # noqa: E402
+from aibrain.corpus import Corpus, CorpusError, unreachable_message  # noqa: E402
+from aibrain.jobs import JobRunner                                  # noqa: E402
+from aibrain.server import Handler, State, build_router             # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 VAULT = {
     "Index.md": (
@@ -59,155 +69,70 @@ def make_vault(root: Path) -> None:
         path.write_text(body, encoding="utf-8")
 
 
-class VaultTests(unittest.TestCase):
-    def test_frontmatter_and_links(self):
-        data, body = parse_frontmatter(VAULT["Index.md"])
-        self.assertEqual(data["title"], "Index")
-        self.assertNotIn("---", body.splitlines()[:1])
-        self.assertEqual(
-            link_targets(body), ["Protocols", "Recipes/Sourdough", "Nothing Here"]
-        )
+# ---------------------------------------------------------------------------
+# the corpus fixture
+# ---------------------------------------------------------------------------
 
-    def test_normalize_folds_separators(self):
-        self.assertEqual(normalize("Agent-Context_Protocol"), "agent context protocol")
-        self.assertEqual(normalize("Café"), "cafe")
-
-    def test_scan_finds_every_note(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            make_vault(root)
-            (root / ".obsidian").mkdir()
-            (root / ".obsidian" / "config.md").write_text("ignored", encoding="utf-8")
-            notes = list(scan(root, "t", [".obsidian"]))
-            self.assertEqual(len(notes), len(VAULT))
-            sources = {n.source for n in notes}
-            self.assertEqual(sources, {"Root", "Recipes", "Journal"})
+TEST_DATABASE_URL = os.environ.get(
+    "AIBRAIN_TEST_DATABASE_URL",
+    "postgres://aibrain:aibrain@127.0.0.1:5433/aibrain_test",
+)
 
 
-class IndexTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-        self.vault = self.root / "vault"
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def core_binary() -> Path | None:
+    """The debug build, built on demand. None if cargo cannot produce one."""
+    binary = REPO_ROOT / "rust" / "target" / "debug" / "aibrain-core"
+    if binary.exists():
+        return binary
+    if shutil.which("cargo") is None:
+        return None
+    result = subprocess.run(
+        ["cargo", "build", "--manifest-path", str(REPO_ROOT / "rust" / "Cargo.toml")],
+        capture_output=True, text=True,
+    )
+    return binary if result.returncode == 0 and binary.exists() else None
+
+
+class CorpusFixture:
+    """A temp vault, a temp config, and an `aibrain-core` serving them.
+
+    Each instance gets its own brain ids, so two of these can share the test
+    database without seeing each other's notes.
+    """
+
+    def __init__(self, extra_vaults: dict[str, dict] | None = None):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        self.home.mkdir()
+        self.proc: subprocess.Popen | None = None
+
+        tag = uuid.uuid4().hex[:8]
+        self.vault = root / "vault"
         make_vault(self.vault)
-        self.brain = BrainConfig(id="t", name="Test", path=str(self.vault))
-        self.index = Index(self.root / "index.sqlite3")
-        self.index.reindex([self.brain])
+        self.brain_id = f"t-{tag}"
+        brains = [BrainConfig(id=self.brain_id, name="Test", path=str(self.vault),
+                              seed=7)]
+        self.extra_ids: dict[str, str] = {}
+        for i, (name, files) in enumerate((extra_vaults or {}).items()):
+            path = root / name
+            for rel, body in files.items():
+                target = path / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body, encoding="utf-8")
+            bid = f"{name}-{tag}"
+            self.extra_ids[name] = bid
+            brains.append(BrainConfig(id=bid, name=name, path=str(path),
+                                      seed=20 + i * 13))
 
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def test_counts_and_links(self):
-        self.assertEqual(self.index.count(), len(VAULT))
-        index_note = self.index.note_by_path("t", "Index.md")
-        self.assertIsNotNone(index_note)
-        names = {n.title for n in self.index.neighbours(index_note.id)}
-        self.assertIn("Protocols", names)
-        self.assertIn("Sourdough", names)          # resolved through a path link
-        self.assertIn("Nothing Here", self.index.outgoing_unresolved(index_note.id))
-
-    def test_backlinks_are_symmetric(self):
-        protocols = self.index.note_by_path("t", "Protocols.md")
-        agents = self.index.note_by_path("t", "Agents.md")
-        # Agents links to Protocols; Protocols must show Agents as a neighbour.
-        self.assertIn(agents.id, [n.id for n in self.index.neighbours(protocols.id)])
-
-    def test_search_ranks_title_matches(self):
-        hits = self.index.search("sourdough")
-        self.assertTrue(hits)
-        self.assertEqual(hits[0].title, "Sourdough")
-        self.assertIn("<mark>", self.index.search("miso")[0].snippet.lower())
-
-    def test_search_is_prefix_and_injection_safe(self):
-        self.assertTrue(self.index.search("proto"))            # prefix
-        self.assertEqual(self.index.search('" OR "'), [])      # no crash, no match
-        self.assertEqual(fts_query(""), "")
-
-    def test_incremental_reindex_is_cheap_and_correct(self):
-        stats = self.index.reindex([self.brain])
-        self.assertEqual(stats["added"], 0)
-        self.assertEqual(stats["updated"], 0)
-
-        (self.vault / "Ramen.md").write_text("# Ramen\n\nNow about [[Agents]].\n",
-                                             encoding="utf-8")
-        time.sleep(0.01)
-        (self.vault / "Recipes" / "Ramen.md").write_text(
-            "# Ramen\n\nShoyu now. [[Protocols]]\n", encoding="utf-8")
-        stats = self.index.reindex([self.brain])
-        self.assertEqual(stats["added"], 1)
-        self.assertEqual(stats["updated"], 1)
-        self.assertTrue(self.index.search("shoyu"))
-        self.assertFalse(self.index.search("miso"))            # old text is gone
-
-    def test_deleted_notes_leave_the_index(self):
-        (self.vault / "Recipes" / "Ramen.md").unlink()
-        stats = self.index.reindex([self.brain])
-        self.assertEqual(stats["removed"], 1)
-        self.assertEqual(self.index.count(), len(VAULT) - 1)
-
-    def test_markdown_renders_and_resolves_wikilinks(self):
-        note = self.index.note_by_path("t", "Protocols.md")
-        body = (self.vault / "Protocols.md").read_text(encoding="utf-8")
-        html = md.render(body, self.index, "t")
-        self.assertIn("<strong>ACP</strong>", html)
-        self.assertIn("<code>A2A</code>", html)
-        self.assertIn("<table>", html)
-        self.assertIn('class="wiki" data-note=', html)
-        # A task list keeps its state.
-        tasks = md.render((self.vault / "Agents.md").read_text(encoding="utf-8"),
-                          self.index, "t")
-        self.assertIn('class="task done"', tasks)
-
-    def test_markdown_escapes_injected_html(self):
-        html = md.render("<img src=x onerror=alert(1)>\n\n[[Index]]", self.index, "t")
-        self.assertNotIn("<img", html)
-        self.assertIn("&lt;img", html)
-
-    def test_graph_payload_maps_ids_back_to_notes(self):
-        cfg = Config(brains=[self.brain], agents=default_agents())
-        result = graph.build(cfg, self.index)
-        self.assertEqual(len(result.node_ids), len(VAULT))
-        self.assertEqual(result.payload["stats"]["notes"], len(VAULT))
-
-        # Every edge index must land inside its own brain's node list.
-        brain = result.payload["brains"][0]
-        size = sum(s["count"] for s in brain["sources"])
-        for a, b in brain["edges"]:
-            self.assertTrue(0 <= a < size and 0 <= b < size)
-
-        # Node order is the contract between server and renderer.
-        flat = [n["nid"] for s in brain["sources"] for n in s["notes"]]
-        self.assertEqual(flat, result.node_ids)
-
-    def test_layout_keeps_galaxies_apart(self):
-        radii = [17.0, 5.0, 11.0, 9.0, 17.0, 6.0]
-        slots = graph.brain_slots(radii)
-        self.assertEqual(len(slots), len(radii))
-        for i in range(len(radii)):
-            for j in range(i + 1, len(radii)):
-                gap = sum((slots[i][k] - slots[j][k]) ** 2 for k in range(3)) ** 0.5
-                self.assertGreater(gap, radii[i] + radii[j],
-                                   f"galaxies {i} and {j} overlap")
-
-    def test_hub_spreading_is_a_permutation(self):
-        items = list(range(97))
-        spread = graph._spread_hubs(items)
-        self.assertEqual(sorted(spread), items)
-        self.assertNotEqual(spread[:5], items[:5])
-
-
-class ServerTests(unittest.TestCase):
-    """Drives the real HTTP server the way the browser does."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls._tmp = tempfile.TemporaryDirectory()
-        root = Path(cls._tmp.name)
-        vault = root / "vault"
-        make_vault(vault)
-
-        cfg = Config(
-            brains=[BrainConfig(id="t", name="Test", path=str(vault))],
+        self.cfg = Config(
+            brains=brains,
             agents=[a for a in default_agents() if a.kind == "local"],
             scripts=[ScriptConfig(
                 id="echo", name="Echo", description="test script",
@@ -215,11 +140,89 @@ class ServerTests(unittest.TestCase):
             )],
             port=0,
         )
-        cfg.path = root / "config.json"
-        cfg.save()
+        self.cfg.path = self.home / "config.json"
+        self.cfg.save()
 
-        cls.state = State(cfg)
-        cls.state.index.reindex(cfg.enabled_brains())
+        self.port = free_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.corpus = Corpus(self.base_url)
+
+    def start(self, binary: Path) -> None:
+        env = {
+            **os.environ,
+            "AIBRAIN_HOME": str(self.home),
+            "AIBRAIN_DATABASE_URL": TEST_DATABASE_URL,
+            "AIBRAIN_BIND": f"127.0.0.1:{self.port}",
+            "AIBRAIN_LOG": "aibrain_core=warn",
+        }
+        self.proc = subprocess.Popen(
+            [str(binary), "serve"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    "aibrain-core exited: " + (self.proc.stdout.read() or "")[-800:])
+            try:
+                self.corpus.health(timeout=1.0)
+                return
+            except CorpusError:
+                time.sleep(0.25)
+        raise RuntimeError(f"aibrain-core never answered on {self.base_url}")
+
+    def reindex(self, force: bool = False) -> dict:
+        return self.corpus.reindex(force=force)
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.tmp.cleanup()
+
+
+_SKIP_REASON: str | None = None
+
+
+def start_corpus(extra_vaults: dict[str, dict] | None = None) -> CorpusFixture:
+    """Bring a corpus up, or raise `unittest.SkipTest` with the reason."""
+    global _SKIP_REASON
+    if _SKIP_REASON:
+        raise unittest.SkipTest(_SKIP_REASON)
+    binary = core_binary()
+    if binary is None:
+        _SKIP_REASON = ("aibrain-core is not built and cargo could not build it — "
+                        "run `cargo build --manifest-path rust/Cargo.toml`")
+        raise unittest.SkipTest(_SKIP_REASON)
+    fixture = CorpusFixture(extra_vaults)
+    try:
+        fixture.start(binary)
+    except Exception as exc:
+        fixture.stop()
+        _SKIP_REASON = (
+            f"could not start aibrain-core against {TEST_DATABASE_URL}: {exc} — "
+            "start Postgres with `docker compose up -d db` and create the "
+            "aibrain_test database, or set AIBRAIN_TEST_DATABASE_URL"
+        )
+        raise unittest.SkipTest(_SKIP_REASON) from exc
+    fixture.reindex(force=True)
+    return fixture
+
+
+# ---------------------------------------------------------------------------
+# the HTTP surface
+# ---------------------------------------------------------------------------
+
+class ServerTests(unittest.TestCase):
+    """Drives the real HTTP server the way the browser does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus()
+        cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
         cls.state.universe(rebuild=True)
 
         handler = type("H", (Handler,),
@@ -233,23 +236,23 @@ class ServerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.state.close()
-        cls._tmp.cleanup()
+        cls.fixture.stop()
 
     # ---- helpers ---------------------------------------------------------
     def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=20) as r:
+        with urllib.request.urlopen(self.base + path, timeout=30) as r:
             return json.loads(r.read().decode())
 
     def post(self, path, body=None):
         data = json.dumps(body or {}).encode()
         req = urllib.request.Request(self.base + path, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
 
     def sse(self, path, limit=400):
         events = []
-        with urllib.request.urlopen(self.base + path, timeout=60) as r:
+        with urllib.request.urlopen(self.base + path, timeout=120) as r:
             for raw in r:
                 line = raw.decode()
                 if line.startswith("data:"):
@@ -259,15 +262,27 @@ class ServerTests(unittest.TestCase):
         return events
 
     # ---- tests -----------------------------------------------------------
-    def test_status_and_universe(self):
+    def test_status_reports_the_corpus_without_a_node_cap(self):
         status = self.get("/api/status")
         self.assertEqual(status["notes"], len(VAULT))
         self.assertEqual(len(status["brains"]), 1)
+        self.assertEqual(status["brains"][0]["notes"], len(VAULT))
+        # The cap is gone, so nothing may report one.
+        self.assertNotIn("maxNodes", status["brains"][0])
 
+    def test_universe_carries_the_buffers_the_renderer_reads(self):
         universe = self.get("/api/universe")
         self.assertEqual(universe["stats"]["notes"], len(VAULT))
-        self.assertTrue(universe["brains"][0]["sources"])
         self.assertTrue(universe["agents"])
+        brain = universe["brains"][0]
+        # Geometry comes from Rust as flat arrays, one entry per note.
+        self.assertEqual(len(brain["positions"]), len(VAULT) * 3)
+        for key in ("sizes", "sourceIndex", "degrees", "names"):
+            self.assertEqual(len(brain[key]), len(VAULT), key)
+        self.assertEqual(len(universe["noteIds"]), len(VAULT))
+        # Edge indices are local to their brain.
+        for a, b in brain["edges"]:
+            self.assertTrue(0 <= a < len(VAULT) and 0 <= b < len(VAULT))
 
     def test_static_files_are_served_and_confined(self):
         with urllib.request.urlopen(self.base + "/", timeout=10) as r:
@@ -281,15 +296,32 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(found["results"])
         top = found["results"][0]
         self.assertEqual(top["brain"], "Test")
+        self.assertEqual(top["brainId"], self.fixture.brain_id)
+        self.assertIsNotNone(top["gid"])
 
         note = self.get(f"/api/note/{top['nid']}")
         self.assertEqual(note["name"], "Protocols")
         self.assertIn("<table>", note["html"])
         self.assertTrue(note["linked"])
         self.assertGreater(note["words"], 0)
+        self.assertEqual(note["brain"], "Test")
+        # Neighbours are decorated too, or hovering one lights nothing up.
+        self.assertIsNotNone(note["linked"][0]["gid"])
 
         # The universe id round-trips back to the same note.
         self.assertEqual(self.get(f"/api/node/{note['gid']}")["nid"], note["nid"])
+
+    def test_search_can_be_scoped_to_one_brain(self):
+        mine = self.get(f"/api/search?q=protocols&brains={self.fixture.brain_id}")
+        self.assertTrue(mine["results"])
+        elsewhere = self.get("/api/search?q=protocols&brains=no-such-brain")
+        self.assertEqual(elsewhere["results"], [])
+
+    def test_recent_is_decorated_for_the_browser(self):
+        rows = self.get("/api/recent?limit=5")["results"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["brain"], "Test")
+        self.assertIn("gid", rows[0])
 
     def test_missing_note_is_a_404(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -327,10 +359,13 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(events[-1]["status"], "done")
         self.assertEqual(self.get(f"/api/job/{job['id']}")["exitCode"], 0)
 
-    def test_reindex_endpoint_runs_a_job(self):
+    def test_reindex_endpoint_reports_the_rust_stats(self):
         job = self.post("/api/reindex", {"force": False})["job"]
         events = self.sse(f"/api/stream/job/{job['id']}")
         self.assertEqual(events[-1]["status"], "done")
+        lines = " ".join(e.get("text", "") for e in events if e["type"] == "line")
+        self.assertIn("notes scanned", lines)
+        self.assertIn("links resolved", lines)
 
     def test_view_settings_round_trip(self):
         saved = self.post("/api/view", {"linkOpacity": 0.42})
@@ -346,21 +381,36 @@ class CitationTests(unittest.TestCase):
     looked identical to one that cited six, and none of them could be trusted.
     """
 
+    @classmethod
+    def setUpClass(cls):
+        # A second vault holding a duplicate title, so the ambiguity case has
+        # something to be ambiguous about.
+        cls.fixture = start_corpus({"Other": {
+            "Recipes/Ramen.md": "# Ramen\n\nA copy.\n"}})
+        cls.corpus = cls.fixture.corpus
+        cls.brain_id = cls.fixture.brain_id
+        cls.other_id = cls.fixture.extra_ids["Other"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.stop()
+
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        self.vault = root / "vault"
-        make_vault(self.vault)
-        self.brain = BrainConfig(id="t", name="Test", path=str(self.vault))
-        self.index = Index(root / "index.sqlite3")
-        self.index.reindex([self.brain])
         self.agent = LocalAgent(
-            AgentConfig(id="a", name="A", kind="local"), self.index, {"t": "Test"})
-        self.supplied = self.index.search("protocols", limit=6)
+            AgentConfig(id="a", name="A", kind="local", brains=[self.brain_id]),
+            self.corpus, {self.brain_id: "Test", self.other_id: "Other"})
+        self.supplied = self.corpus.search(
+            "protocols", limit=6, brain_ids=[self.brain_id])
         self.assertTrue(self.supplied, "fixture must retrieve something")
 
-    def tearDown(self):
-        self._tmp.cleanup()
+    def note_id(self, rel_path: str, brain_id: str | None = None) -> int:
+        row = self.corpus.note_by_path(brain_id or self.brain_id, rel_path)
+        self.assertIsNotNone(row, rel_path)
+        return row["nid"]
+
+    def test_normalize_folds_separators(self):
+        self.assertEqual(normalize("Agent-Context_Protocol"), "agent context protocol")
+        self.assertEqual(normalize("Café"), "cafe")
 
     def test_an_answer_citing_nothing_produces_no_citations(self):
         cites = self.agent.cites_from_text("I could not find anything.", self.supplied)
@@ -398,49 +448,74 @@ class CitationTests(unittest.TestCase):
                          len(cited_ids) + len(context))
 
     def test_an_observed_read_outranks_a_bare_mention(self):
-        protocols = self.index.note_by_path("t", "Protocols.md")
-        touched = {protocols.id: ("opened", "cat Protocols.md")}
+        touched = {self.note_id("Protocols.md"): ("opened", "cat Protocols.md")}
         cites = self.agent.cites_from_text("See [[Protocols]].", self.supplied, touched)
         self.assertEqual(cites[0].evidence, "opened")
         self.assertIn("cat", cites[0].why)
 
     def test_a_file_read_but_never_named_still_counts(self):
-        agents = self.index.note_by_path("t", "Agents.md")
         cites = self.agent.cites_from_text(
             "Nothing to report.", self.supplied,
-            {agents.id: ("read", "served via fs/read_text_file")})
+            {self.note_id("Agents.md"): ("read", "served via fs/read_text_file")})
         self.assertEqual([c.title for c in cites], ["Agents"])
         self.assertEqual(cites[0].evidence, "read")
 
     def test_citations_are_ordered_by_how_much_we_can_prove(self):
-        protocols = self.index.note_by_path("t", "Protocols.md")
         cites = self.agent.cites_from_text(
             "[[Index]] and [[Protocols]] and [[Agents]].", self.supplied,
-            {protocols.id: ("read", "served")})
+            {self.note_id("Protocols.md"): ("read", "served")})
         self.assertEqual(cites[0].title, "Protocols")
         ranks = [EVIDENCE_ORDER[c.evidence] for c in cites]
         self.assertEqual(ranks, sorted(ranks))
 
     def test_a_title_in_two_vaults_is_flagged_rather_than_guessed(self):
-        other = Path(self._tmp.name) / "vault2"
-        (other / "Recipes").mkdir(parents=True)
-        (other / "Recipes" / "Ramen.md").write_text("# Ramen\n\nA copy.\n",
-                                                    encoding="utf-8")
-        second = BrainConfig(id="t2", name="Other", path=str(other))
-        self.index.reindex([self.brain, second])
-        agent = LocalAgent(AgentConfig(id="a", name="A", kind="local"),
-                           self.index, {"t": "Test", "t2": "Other"})
+        # This agent sees both vaults, so [[Ramen]] is genuinely ambiguous.
+        agent = LocalAgent(
+            AgentConfig(id="a", name="A", kind="local",
+                        brains=[self.brain_id, self.other_id]),
+            self.corpus, {self.brain_id: "Test", self.other_id: "Other"})
         cites = agent.cites_from_text("As in [[Ramen]].", [])
         self.assertEqual(len(cites), 1, "one pill, not one per copy")
         self.assertEqual(cites[0].ambiguous_with, 1)
 
     def test_a_question_still_retrieves_when_a_word_is_absent(self):
-        # "describe" appears in no note. Requiring every term returns nothing,
-        # which used to leave remote agents with no context at all.
-        self.assertEqual(self.index.search("describe the protocols"), [])
-        self.assertTrue(self.index.search("describe the protocols", match="any"))
+        # "describe" appears in no note. Rust widens once server-side when the
+        # strict pass is empty, and the word-filtered pass here widens again.
         self.assertTrue(self.agent.retrieve("describe the protocols for me"))
 
+
+class StartupTests(unittest.TestCase):
+    """No Rust service means no app, and the message has to say how to fix it."""
+
+    def test_the_failure_message_names_both_commands(self):
+        message = unreachable_message("http://127.0.0.1:8781")
+        self.assertIn("docker compose up -d db", message)
+        self.assertIn("cargo run --manifest-path rust/Cargo.toml -- serve --watch",
+                      message)
+        self.assertIn("http://127.0.0.1:8781", message)
+
+    def test_an_unreachable_corpus_exits_non_zero_without_a_traceback(self):
+        from aibrain import __main__ as entry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            env = {**os.environ,
+                   "AIBRAIN_CORE_URL": f"http://127.0.0.1:{free_port()}"}
+            result = subprocess.run(
+                [sys.executable, "-m", "aibrain", "--config", str(config),
+                 "--no-browser"],
+                cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("docker compose up -d db", result.stderr)
+        self.assertTrue(hasattr(entry, "main"))
+
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
 
 class DiscoveryTests(unittest.TestCase):
     """Only symlinked vaults count, and a broken link says so."""
@@ -457,9 +532,8 @@ class DiscoveryTests(unittest.TestCase):
             (links / "Broken").symlink_to(root / "nope", target_is_directory=True)
 
             import aibrain.config as config
-            prior = config.VAULT_LINK_DIR
-            config.VAULT_LINK_DIR = links
-            try:
+            with patched(config, VAULT_LINK_DIR=links,
+                         SETTINGS_PATH=root / ".claude" / "settings.json"):
                 found = config.discover_vaults()
                 self.assertEqual([p.name for p in found], ["Real"])
                 problems = dict(config.link_problems())
@@ -469,8 +543,6 @@ class DiscoveryTests(unittest.TestCase):
                                                  path=str(unlinked))])
                 config.reconcile_brains(cfg)
                 self.assertEqual([b.id for b in cfg.brains], ["real"])
-            finally:
-                config.VAULT_LINK_DIR = prior
 
     def test_settings_survive_an_unlink_and_relink(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -482,9 +554,8 @@ class DiscoveryTests(unittest.TestCase):
             (links / "Kept").symlink_to(real, target_is_directory=True)
 
             import aibrain.config as config
-            prior = config.VAULT_LINK_DIR
-            config.VAULT_LINK_DIR = links
-            try:
+            with patched(config, VAULT_LINK_DIR=links,
+                         SETTINGS_PATH=root / ".claude" / "settings.json"):
                 cfg = Config()
                 config.reconcile_brains(cfg)
                 cfg.brains[0].enabled = False
@@ -501,8 +572,137 @@ class DiscoveryTests(unittest.TestCase):
                 # record was dropped with it. Documented here so the behaviour
                 # is a decision rather than a surprise.
                 self.assertTrue(cfg.brains[0].enabled)
-            finally:
-                config.VAULT_LINK_DIR = prior
+
+    def test_an_old_config_with_a_node_cap_still_loads(self):
+        # `max_nodes` was removed with the cap; a config written before that
+        # must not become unreadable.
+        raw = {"brains": [{"id": "t", "name": "T", "path": "/tmp/nope",
+                           "max_nodes": 2200}]}
+        cfg = Config.from_dict(raw)
+        self.assertEqual([b.id for b in cfg.brains], ["t"])
+        self.assertFalse(hasattr(cfg.brains[0], "max_nodes"))
+
+
+class DenyRuleTests(unittest.TestCase):
+    """The deny list is generated, so it cannot go stale when a vault moves."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.links = self.root / "obsidian_vaults"
+        self.links.mkdir()
+        self.settings = self.root / ".claude" / "settings.json"
+        self.settings.parent.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def link(self, name: str) -> Path:
+        real = self.root / "vaults" / name
+        real.mkdir(parents=True)
+        (self.links / name).symlink_to(real, target_is_directory=True)
+        return real.resolve()
+
+    def write(self, payload: dict) -> None:
+        self.settings.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def read(self) -> dict:
+        return json.loads(self.settings.read_text(encoding="utf-8"))
+
+    def test_every_linked_vault_gets_a_rule_and_unlinked_ones_lose_theirs(self):
+        import aibrain.config as config
+        first, second = self.link("Alpha"), self.link("Beta")
+        self.write({"permissions": {"deny": [
+            "Read(//Users/nobody/GoneVault/**)"]}})
+
+        with patched(config, VAULT_LINK_DIR=self.links, SETTINGS_PATH=self.settings):
+            config.reconcile_brains(Config())
+            deny = self.read()["permissions"]["deny"]
+            self.assertIn(f"Read(//{str(first).lstrip('/')}/**)", deny)
+            self.assertIn(f"Read(//{str(second).lstrip('/')}/**)", deny)
+            # The stale rule for a vault nobody links any more is gone.
+            self.assertNotIn("Read(//Users/nobody/GoneVault/**)", deny)
+            # The fixed non-vault entries survive.
+            self.assertTrue(any(r.endswith("/.ssh/**)") for r in deny))
+            self.assertTrue(any("Keychains" in r for r in deny))
+
+            (self.links / "Beta").unlink()
+            config.reconcile_brains(Config())
+            deny = self.read()["permissions"]["deny"]
+            self.assertIn(f"Read(//{str(first).lstrip('/')}/**)", deny)
+            self.assertNotIn(f"Read(//{str(second).lstrip('/')}/**)", deny)
+
+    def test_a_symlink_is_resolved_to_the_real_directory(self):
+        import aibrain.config as config
+        real = self.link("Gamma")
+        with patched(config, VAULT_LINK_DIR=self.links, SETTINGS_PATH=self.settings):
+            config.reconcile_brains(Config())
+        deny = self.read()["permissions"]["deny"]
+        # The rule names what the link points at, not the link itself.
+        self.assertIn(f"Read(//{str(real).lstrip('/')}/**)", deny)
+        self.assertNotIn(f"Read(//{str(self.links / 'Gamma').lstrip('/')}/**)", deny)
+
+    def test_everything_else_in_the_file_is_preserved(self):
+        import aibrain.config as config
+        self.link("Delta")
+        self.write({
+            "model": "opus",
+            "permissions": {"allow": ["Bash(ls:*)"],
+                            "deny": ["Bash(rm:*)", "Read(//stale/**)"]},
+        })
+        with patched(config, VAULT_LINK_DIR=self.links, SETTINGS_PATH=self.settings):
+            config.reconcile_brains(Config())
+        raw = self.read()
+        self.assertEqual(raw["model"], "opus")
+        self.assertEqual(raw["permissions"]["allow"], ["Bash(ls:*)"])
+        self.assertIn("Bash(rm:*)", raw["permissions"]["deny"])
+        self.assertNotIn("Read(//stale/**)", raw["permissions"]["deny"])
+
+    def test_a_checkout_with_no_link_folder_is_left_alone(self):
+        """A fresh clone or a worktree must not strip the committed rules.
+
+        No `obsidian_vaults/` at all is not the same as an empty one: it means
+        we have no idea which vaults the user has, so rewriting a shared file
+        to drop every vault rule would remove protection rather than refresh it.
+        """
+        import aibrain.config as config
+        original = {"permissions": {"deny": [
+            "Read(//Users/somebody/Vaults/Private/**)"]}}
+        self.write(original)
+        with patched(config, VAULT_LINK_DIR=self.root / "not-there",
+                     SETTINGS_PATH=self.settings):
+            self.assertFalse(config.write_deny_rules([]))
+        self.assertEqual(self.read(), original)
+
+    def test_writing_is_atomic_and_leaves_no_temp_file(self):
+        import aibrain.config as config
+        self.link("Epsilon")
+        with patched(config, VAULT_LINK_DIR=self.links, SETTINGS_PATH=self.settings):
+            self.assertTrue(config.write_deny_rules(config.discover_vaults()))
+            # A second call with the same vaults changes nothing.
+            self.assertFalse(config.write_deny_rules(config.discover_vaults()))
+        self.assertEqual(
+            [p.name for p in self.settings.parent.iterdir()], ["settings.json"])
+
+
+class patched:
+    """Swap module attributes for the duration of a block, then put them back."""
+
+    def __init__(self, module, **values):
+        self.module = module
+        self.values = values
+        self.prior: dict = {}
+
+    def __enter__(self):
+        for key, value in self.values.items():
+            self.prior[key] = getattr(self.module, key)
+            setattr(self.module, key, value)
+        return self.module
+
+    def __exit__(self, *exc):
+        for key, value in self.prior.items():
+            setattr(self.module, key, value)
+        return False
 
 
 class JobTests(unittest.TestCase):
@@ -525,6 +725,26 @@ class JobTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(job.status, "failed")
         self.assertTrue(any("failed to start" in line for line in job.lines))
+
+    def test_a_reindex_task_reports_what_rust_did(self):
+        """The job's output lines are the stats, not a Python scan log."""
+        class FakeCorpus:
+            base_url = "http://example.invalid"
+
+            def reindex(self, force=False):
+                return {"scanned": 6, "added": 1, "updated": 2, "removed": 0,
+                        "unchanged": 3, "links": 7}
+
+            def universe(self):
+                return {"noteIds": [], "brains": [], "stats": {}}
+
+        state = State(Config(), FakeCorpus())
+        lines: list[str] = []
+        state.reindex(lines.append)
+        joined = " ".join(lines)
+        self.assertIn("6 notes scanned", joined)
+        self.assertIn("+1 added", joined)
+        self.assertIn("7 links resolved", joined)
 
 
 if __name__ == "__main__":

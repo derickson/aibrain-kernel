@@ -8,12 +8,24 @@ UI only ever sees this event stream.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterator
 
 from ..config import AgentConfig
-from ..index import Index
-from ..vault import normalize
+from ..corpus import Corpus
+
+
+def normalize(text: str) -> str:
+    """Fold a link target or title into a comparable key.
+
+    The last survivor of the old `vault` module: link resolution itself moved
+    to Rust, but the citation resolver still has to decide whether the title
+    an agent wrote is the title of a note we found.
+    """
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return " ".join(text.lower().replace("_", " ").replace("-", " ").split())
 
 
 # How much we actually know about an agent's use of a note, strongest first.
@@ -87,10 +99,10 @@ class Event:
 class Agent:
     """Base class. Subclasses implement `ask`."""
 
-    def __init__(self, cfg: AgentConfig, index: Index, brain_names: dict[str, str],
+    def __init__(self, cfg: AgentConfig, corpus: Corpus, brain_names: dict[str, str],
                  colors: dict[str, str] | None = None):
         self.cfg = cfg
-        self.index = index
+        self.corpus = corpus
         self.brain_names = brain_names
         self.colors = colors or {}
 
@@ -104,13 +116,13 @@ class Agent:
         # means one absent verb — "describe", "summarise" — returns nothing at
         # all, which quietly left remote agents with no context whatsoever.
         # Try the strict reading first, then widen.
-        hits = self.index.search(question, limit=limit * 2, brain_ids=scope)
+        hits = self.corpus.search(question, limit=limit * 2, brain_ids=scope)
         if len(hits) < limit:
             words = [w for w in re.findall(r"[A-Za-z][\w'-]{3,}", question)
                      if w.lower() not in STOPWORDS]
             if words:
-                hits += self.index.search(" ".join(words[:8]), limit=limit * 2,
-                                          brain_ids=scope, match="any")
+                hits += self.corpus.search(" ".join(words[:8]), limit=limit * 2,
+                                           brain_ids=scope, any_terms=True)
         seen: set[int] = set()
         unique = []
         for hit in hits:
@@ -134,16 +146,17 @@ class Agent:
 
     def cite_note(self, note_id: int, evidence: str, why: str = "") -> Citation | None:
         """A citation for a note we already know the id of."""
-        note = self.index.note(note_id)
+        note = self.corpus.note(note_id)
         if note is None:
             return None
+        brain_id = note.get("brain_id", "")
         return Citation(
-            note_id=note.id,
-            title=note.title,
-            brain=self.brain_names.get(note.brain_id, note.brain_id),
-            source=note.source,
-            color=self.colors.get(note.brain_id, self.cfg.color),
-            snippet=note.excerpt[:200],
+            note_id=note.get("nid", note_id),
+            title=note.get("name", ""),
+            brain=self.brain_names.get(brain_id, brain_id),
+            source=note.get("source", ""),
+            color=self.colors.get(brain_id, self.cfg.color),
+            snippet=(note.get("excerpt") or "")[:200],
             evidence=evidence,
             why=why,
         )
@@ -154,8 +167,10 @@ class Agent:
             return ""
         chunks = []
         for i, hit in enumerate(hits, 1):
-            note = self.index.note(hit.note_id)
-            body = _plain(hit.snippet) or (note.excerpt if note else "")
+            body = _plain(hit.snippet)
+            if not body:
+                note = self.corpus.note(hit.note_id) or {}
+                body = note.get("excerpt", "")
             brain = self.brain_names.get(hit.brain_id, hit.brain_id)
             chunks.append(
                 f"[{i}] {hit.title}  ({brain} / {hit.source})\n"
@@ -189,8 +204,8 @@ class Agent:
             if not target:
                 continue
             matches = [
-                hit for hit in self.index.search(
-                    f'"{target}"', limit=8, brain_ids=self.cfg.brains or None)
+                hit for hit in self.corpus.search(
+                    target, limit=24, brain_ids=self.cfg.brains or None)
                 if normalize(hit.title) == target
             ]
             if not matches:

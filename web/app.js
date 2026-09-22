@@ -193,12 +193,14 @@ function renderChips() {
     chips.append(el('button', {
       class: 'chip',
       'aria-pressed': on ? 'true' : 'false',
-      title: `${brain.shown} of ${brain.total} notes · ${brain.path}`,
+      title: `${brain.total ?? brain.shown} notes · ${brain.path}`,
       onclick: () => {
         S.brainFocus = on ? null : brain.id;
         S.universe?.focusBrain(S.brainFocus);
         renderChips();
         renderStatus();
+        // The scope changed under an open query, so the results must follow.
+        if (S.query.trim()) runSearch(S.query);
       },
     },
       el('span', { class: 'pip', style: `background:${color};box-shadow:0 0 8px ${color}` }),
@@ -239,8 +241,8 @@ function renderStatus() {
   } else if (S.statusText) {
     text = S.statusText;
   } else if (stats) {
-    const shown = stats.shown < stats.notes ? `${stats.shown.toLocaleString()} of ` : '';
-    text = `${stats.brains} brains · ${shown}${stats.notes.toLocaleString()} notes · `
+    // Every note is drawn now, so there is no "shown of total" to report.
+    text = `${stats.brains} brains · ${stats.notes.toLocaleString()} notes · `
       + `${stats.cross} cross-links · ${stats.agents} agents`;
   } else {
     text = 'starting…';
@@ -366,7 +368,10 @@ const runSearch = debounce(async text => {
     return;
   }
   try {
-    const data = await api(`/api/search?q=${encodeURIComponent(text)}&limit=80`);
+    // Focusing a brain scopes the search to it, so the results and the lit
+    // stars agree about which galaxy you are looking at.
+    const scope = S.brainFocus ? `&brains=${encodeURIComponent(S.brainFocus)}` : '';
+    const data = await api(`/api/search?q=${encodeURIComponent(text)}&limit=80${scope}`);
     if (data.query !== $('#query').value) return;   // a newer keystroke won
     S.results = data.results;
     S.universe?.highlight(data.results.map(r => r.gid).filter(g => g != null));
@@ -384,9 +389,11 @@ function renderResults() {
   $('#empty-view').hidden = searching;
   if (!searching) return;
 
+  const brain = S.data?.brains.find(b => b.id === S.brainFocus);
+  const scope = brain ? ` IN ${brain.name.toUpperCase()}` : '';
   $('#results-label').textContent = any
-    ? `${S.results.length} RESULT${S.results.length === 1 ? '' : 'S'} FOR “${S.query.toUpperCase()}”`
-    : `NOTHING MATCHES “${S.query.toUpperCase()}”`;
+    ? `${S.results.length} RESULT${S.results.length === 1 ? '' : 'S'} FOR “${S.query.toUpperCase()}”${scope}`
+    : `NOTHING MATCHES “${S.query.toUpperCase()}”${scope}`;
   const list = $('#results');
   list.innerHTML = '';
   for (const item of S.results) {
@@ -1095,29 +1102,9 @@ function renderViewPanel() {
         'Ribbon twist only takes effect the next time the universe is rebuilt.')),
 
     el('div', { class: 'card' },
-      el('div', { class: 'section-title' }, 'DETAIL'),
-      el('p', { class: 'muted' },
-        'Each galaxy draws its most connected notes first. Raising the cap shows more '
-        + 'of a big vault at the cost of frame rate.'),
-      ...(S.status?.brains || []).filter(b => b.enabled).map(brain => el('div', { class: 'field' },
-        el('label', {}, `${brain.name.toUpperCase()} — ${brain.notes.toLocaleString()} NOTES`),
-        el('div', { class: 'range' },
-          el('input', {
-            type: 'range', min: 200, max: 6000, step: 100, value: brain.maxNodes,
-            onchange: async event => {
-              await api(`/api/brain/${brain.id}`, {
-                method: 'POST', body: { maxNodes: Number(event.target.value) },
-              });
-              await loadUniverse(true);
-              toast(`${brain.name}: showing up to ${event.target.value} notes`);
-            },
-          }),
-          el('span', { class: 'val' }, String(brain.maxNodes)))))),
-
-    el('div', { class: 'card' },
       el('div', { class: 'section-title' }, 'WHERE THINGS LIVE'),
-      el('div', { class: 'path' }, `config  ~/.aibrain/config.json`),
-      el('div', { class: 'path' }, `index   ~/.aibrain/index.sqlite3`))
+      el('div', { class: 'path' }, 'config  ~/.aibrain/config.json'),
+      el('div', { class: 'path' }, 'corpus  aibrain-core on postgres'))
   );
 }
 
@@ -1159,6 +1146,7 @@ function wireStaticHandlers() {
     S.universe?.resetView();
     renderChips();
     renderStatus();
+    if (S.query.trim()) runSearch(S.query);
   };
   $('#open-menu').onclick = () => openDrawer();
   $('#drawer-close').onclick = closeDrawer;

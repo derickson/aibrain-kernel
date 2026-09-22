@@ -22,14 +22,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import graph, md
 from .agents import Registry
 from .config import (AGENT_COLORS, VAULT_LINK_DIR, Config, ScriptConfig,
                      AgentConfig, BrainConfig, discover_vaults, link_problems,
                      reconcile_brains, slugify)
-from .index import Index
+from .corpus import Corpus, CorpusError
 from .jobs import JobRunner
-from .vault import strip_markup
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
@@ -38,46 +36,150 @@ mimetypes.add_type("font/woff2", ".woff2")
 
 
 class State:
-    """Everything the handlers share. One instance per process."""
+    """Everything the handlers share. One instance per process.
 
-    def __init__(self, cfg: Config):
+    The corpus itself lives in the Rust service; what is held here is the one
+    thing the browser needs that the service does not provide — the mapping
+    between a note id and its position in the universe payload, which is just
+    the order `noteIds` came back in.
+    """
+
+    def __init__(self, cfg: Config, corpus: Corpus | None = None):
         self.cfg = cfg
-        self.index = Index(cfg.db_path)
+        self.corpus = corpus or Corpus()
         self.jobs = JobRunner()
-        self.agents = Registry(cfg, self.index)
-        self.graph: graph.GraphResult | None = None
+        self.agents = Registry(cfg, self.corpus)
+        self._universe: dict | None = None
+        self._note_ids: list[int] = []
+        self._gid_of: dict[int, int] = {}
         self._graph_lock = threading.Lock()
         self.chat_history: dict[str, list[dict]] = {}
         self.active_streams: dict[str, threading.Event] = {}
 
     # ---- universe --------------------------------------------------------
-    def universe(self, rebuild: bool = False) -> graph.GraphResult:
+    def universe(self, rebuild: bool = False) -> dict:
+        """The Rust payload plus the things only Python knows about.
+
+        Agents are Python's: they are configured here, dragged here, and the
+        Rust service has never heard of them. Everything else is passed through
+        untouched, buffers included.
+        """
         with self._graph_lock:
-            if self.graph is None or rebuild:
-                self.graph = graph.build(self.cfg, self.index)
-            return self.graph
+            if self._universe is None or rebuild:
+                payload = dict(self.corpus.universe())
+                self._note_ids = [int(n) for n in payload.get("noteIds", [])]
+                self._gid_of = {nid: gid for gid, nid in enumerate(self._note_ids)}
+                payload["agents"] = self._agent_payload(payload.get("brains", []))
+                payload["options"] = {
+                    "rotationSpeed": self.cfg.view.rotation_speed,
+                    "linkOpacity": self.cfg.view.link_opacity,
+                    "showAllLabels": self.cfg.view.show_all_labels,
+                    "ribbonTwist": self.cfg.view.ribbon_twist,
+                }
+                stats = dict(payload.get("stats", {}))
+                stats["agents"] = len(payload["agents"])
+                payload["stats"] = stats
+                self._fit_camera(payload)
+                self._universe = payload
+            return self._universe
+
+    def _agent_payload(self, brains: list[dict]) -> list[dict]:
+        agents = self.cfg.enabled_agents()
+        slots = agent_slots(len(agents), brains)
+        return [
+            {
+                "id": a.id, "name": a.name, "protocol": a.label(), "kind": a.kind,
+                "color": a.color, "pos": a.pos or slots[i], "intro": a.intro,
+                "suggestions": a.suggestions,
+            }
+            for i, a in enumerate(agents)
+        ]
+
+    def _fit_camera(self, payload: dict) -> None:
+        """Widen Rust's framing to include the agent stars it cannot see."""
+        positions = [a["pos"] for a in payload.get("agents", [])]
+        if not positions:
+            return
+        payload["fitWidth"] = round(max(
+            float(payload.get("fitWidth", 0.0)),
+            max(abs(p[0]) + 4.0 for p in positions) * 2 + 20.0), 1)
+        payload["fitHeight"] = round(max(
+            float(payload.get("fitHeight", 0.0)),
+            max(abs(p[1]) + 4.0 for p in positions) * 2 + 20.0), 1)
 
     def note_id_for_gid(self, gid: int) -> int | None:
-        universe = self.universe()
-        if 0 <= gid < len(universe.node_ids):
-            return universe.node_ids[gid]
+        self.universe()
+        if 0 <= gid < len(self._note_ids):
+            return self._note_ids[gid]
         return None
 
     def gid_for_note(self, note_id: int) -> int | None:
-        universe = self.universe()
-        try:
-            return universe.node_ids.index(note_id)
-        except ValueError:
-            return None
+        self.universe()
+        return self._gid_of.get(int(note_id))
 
+    def brain_names(self) -> dict[str, str]:
+        return {b.id: b.name for b in self.cfg.brains}
+
+    def decorate(self, row: dict) -> dict:
+        """Add the two things the browser needs that Rust does not send."""
+        brain_id = row.get("brain_id", "")
+        return {
+            **row,
+            "gid": self.gid_for_note(row.get("nid", -1)),
+            "brain": self.brain_names().get(brain_id, brain_id),
+            "brainId": brain_id,
+        }
+
+    # ---- jobs ------------------------------------------------------------
     def reindex(self, emit: Callable[[str], None], force: bool = False) -> None:
-        self.index.reindex(self.cfg.enabled_brains(), emit, force=force)
+        emit("asking aibrain-core to rescan the vaults…")
+        stats = self.corpus.reindex(force=force)
+        emit(
+            f"{stats.get('scanned', 0)} notes scanned — "
+            f"+{stats.get('added', 0)} added, ~{stats.get('updated', 0)} updated, "
+            f"-{stats.get('removed', 0)} removed, ={stats.get('unchanged', 0)} unchanged"
+        )
+        emit(f"{stats.get('links', 0)} links resolved")
         emit("rebuilding the universe…")
         self.universe(rebuild=True)
         emit("universe ready")
 
     def close(self) -> None:
         self.agents.close()
+
+
+def agent_slots(count: int, placed: list[dict]) -> list[list[float]]:
+    """Find empty sky for the agent stars.
+
+    Stars parked past the edge of the field make the camera pull back until
+    every galaxy is a speck, so prefer space the galaxies already leave: the
+    band between stacked rows, and only otherwise the sky above them. Either
+    way the stars sit forward of the galaxies in z, so they read as nearer.
+
+    This is the last piece of layout still in Python, because it is the only
+    one that depends on something the Rust service does not know exists.
+    """
+    if count <= 0:
+        return []
+
+    centres = [(b["center"][1], b["radius"]) for b in placed] or [(0.0, 10.0)]
+    mid_free = all(abs(y) - r > 2.0 for y, r in centres)
+    lift = 0.0 if mid_free else max(y + r for y, r in centres) + 7.0
+
+    columns = sorted({round(b["center"][0], 1) for b in placed}) or [0.0]
+    reach = max((abs(b["center"][0]) + b["radius"] for b in placed), default=20.0)
+    lanes = [(columns[i] + columns[i + 1]) / 2 for i in range(len(columns) - 1)]
+    lanes += [-(reach + 6.0), reach + 6.0]
+    lanes.sort(key=abs)
+
+    out: list[list[float]] = []
+    for i in range(count):
+        out.append([
+            round(lanes[i % len(lanes)] + (i // len(lanes)) * 3.0, 2),
+            round(lift + (2.5 if i % 2 else -2.5), 2),
+            round(14.0 + (i % 3) * 2.0, 2),
+        ])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -239,21 +341,25 @@ def build_router(state: State) -> Router:
     # ---- universe --------------------------------------------------------
     def universe(h: Handler) -> None:
         rebuild = h.query().get("rebuild") == "1"
-        result = state.universe(rebuild=rebuild)
-        h.json({**result.payload, "indexedAt": state.index.get_meta("last_index", "")})
+        h.json(state.universe(rebuild=rebuild))
 
     def status(h: Handler) -> None:
-        stats = {s["brain_id"]: s for s in state.index.brain_stats()}
-        h.json({
+        core = state.corpus.status()
+        rows = {b.get("id"): b for b in core.get("brains", [])}
+        # Rust records when it last scanned each brain; the UI wants one date.
+        scanned = [b.get("scanned_at") for b in core.get("brains", [])
+                   if b.get("scanned_at")]
+        payload = {
             "title": state.cfg.title,
-            "notes": state.index.count(),
-            "indexedAt": state.index.get_meta("last_index", ""),
+            "notes": core.get("notes", 0),
+            "links": core.get("links", 0),
+            "revision": core.get("revision", 0),
+            "indexedAt": max(scanned) if scanned else "",
             "brains": [
                 {
                     "id": b.id, "name": b.name, "path": str(b.resolved_path()),
                     "enabled": b.enabled, "exists": b.resolved_path().is_dir(),
-                    "notes": stats.get(b.id, {}).get("notes", 0),
-                    "maxNodes": b.max_nodes,
+                    "notes": rows.get(b.id, {}).get("note_count", 0),
                 }
                 for b in state.cfg.brains
             ],
@@ -269,7 +375,13 @@ def build_router(state: State) -> Router:
             "scripts": [asdict(s) for s in state.cfg.scripts],
             "view": asdict(state.cfg.view),
             "jobs": state.jobs.list()[:8],
-        })
+        }
+        # Whatever else the service reports about itself — the search engine
+        # block, for one — travels through rather than being enumerated here.
+        for key in ("search",):
+            if key in core:
+                payload[key] = core[key]
+        h.json(payload)
 
     # ---- search & notes --------------------------------------------------
     def search(h: Handler) -> None:
@@ -277,74 +389,25 @@ def build_router(state: State) -> Router:
         text = q.get("q", "")
         limit = min(int(q.get("limit", 60)), 200)
         brain_ids = [b for b in q.get("brains", "").split(",") if b]
-        hits = state.index.search(text, limit=limit, brain_ids=brain_ids or None)
-        universe = state.universe()
-        gid_by_note = {nid: gid for gid, nid in enumerate(universe.node_ids)}
-        brain_names = {b.id: b.name for b in state.cfg.brains}
+        results = state.corpus.search_raw(text, limit=limit,
+                                          brain_ids=brain_ids or None)
         h.json({
             "query": text,
-            "count": len(hits),
-            "results": [
-                {
-                    "nid": hit.note_id,
-                    "gid": gid_by_note.get(hit.note_id),
-                    "name": hit.title,
-                    "brain": brain_names.get(hit.brain_id, hit.brain_id),
-                    "brainId": hit.brain_id,
-                    "source": hit.source,
-                    "snippet": hit.snippet,
-                    "score": round(hit.score, 3),
-                }
-                for hit in hits
-            ],
+            "count": len(results),
+            "results": [state.decorate(row) for row in results],
         })
 
     def note(h: Handler, nid: str) -> None:
-        row = state.index.note(int(nid))
-        if row is None:
+        page = state.corpus.note(int(nid))
+        if page is None:
             h.fail("no such note", 404)
             return
-        brain = state.cfg.brain(row.brain_id)
-        path = (brain.resolved_path() / row.rel_path) if brain else None
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace") if path else ""
-        except OSError as exc:
-            raw = f"*(could not read {path}: {exc})*"
-        from .vault import parse_frontmatter
-        frontmatter, body = parse_frontmatter(raw)
-        universe = state.universe()
-        gid_by_note = {nid_: gid for gid, nid_ in enumerate(universe.node_ids)}
-        brain_names = {b.id: b.name for b in state.cfg.brains}
-
-        neighbours = state.index.neighbours(row.id, limit=24)
         h.json({
-            "nid": row.id,
-            "gid": gid_by_note.get(row.id),
-            "name": row.title,
-            "brain": brain_names.get(row.brain_id, row.brain_id),
-            "brainId": row.brain_id,
-            "source": row.source,
-            "path": str(path) if path else "",
-            "relPath": row.rel_path,
-            "mtime": row.mtime,
-            "size": row.size,
-            "degree": row.degree,
-            "tags": [t for t in row.tags.split(",") if t],
-            "frontmatter": frontmatter,
-            "html": md.render(body, state.index, row.brain_id),
-            "words": len(strip_markup(body).split()),
-            "linked": [
-                {
-                    "nid": n.id,
-                    "gid": gid_by_note.get(n.id),
-                    "name": n.title,
-                    "brain": brain_names.get(n.brain_id, n.brain_id),
-                    "source": n.source,
-                    "degree": n.degree,
-                }
-                for n in neighbours
-            ],
-            "unresolved": state.index.outgoing_unresolved(row.id)[:12],
+            **state.decorate(page),
+            # The reader shows the path under the title, and the browser has
+            # always spelled it in camel case.
+            "relPath": page.get("rel_path", ""),
+            "linked": [state.decorate(row) for row in page.get("linked", [])],
         })
 
     def node(h: Handler, gid: str) -> None:
@@ -356,18 +419,8 @@ def build_router(state: State) -> Router:
         h.json({"nid": note_id})
 
     def recent(h: Handler) -> None:
-        rows = state.index.recent(limit=int(h.query().get("limit", 24)))
-        universe = state.universe()
-        gid_by_note = {nid: gid for gid, nid in enumerate(universe.node_ids)}
-        brain_names = {b.id: b.name for b in state.cfg.brains}
-        h.json({"results": [
-            {
-                "nid": r.id, "gid": gid_by_note.get(r.id), "name": r.title,
-                "brain": brain_names.get(r.brain_id, r.brain_id),
-                "source": r.source, "snippet": r.excerpt[:180], "mtime": r.mtime,
-            }
-            for r in rows
-        ]})
+        rows = state.corpus.recent(limit=int(h.query().get("limit", 24)))
+        h.json({"results": [state.decorate(row) for row in rows]})
 
     # ---- chat ------------------------------------------------------------
     def chat(h: Handler) -> None:
@@ -513,10 +566,9 @@ def build_router(state: State) -> Router:
         if brain is None:
             h.fail("unknown brain", 404)
             return
-        for key in ("name", "enabled", "max_nodes"):
-            camel = {"max_nodes": "maxNodes"}.get(key, key)
-            if camel in payload:
-                setattr(brain, key, payload[camel])
+        for key in ("name", "enabled"):
+            if key in payload:
+                setattr(brain, key, payload[key])
         state.cfg.save()
         h.json({"ok": True, "needsReindex": True})
 
@@ -695,7 +747,8 @@ def _apply_agent(agent: AgentConfig, payload: dict) -> None:
 
 
 def serve(cfg: Config, open_browser: bool = True) -> None:
-    state = State(cfg)
+    corpus = Corpus()
+    state = State(cfg, corpus)
     router = build_router(state)
 
     handler = type("BoundHandler", (Handler,), {"state": state, "router": router})
@@ -705,15 +758,13 @@ def serve(cfg: Config, open_browser: bool = True) -> None:
     url = f"http://{cfg.host}:{cfg.port}/"
     print(f"\n  {cfg.title} — {url}")
     print(f"  config  {cfg.path}")
-    print(f"  index   {cfg.db_path}")
+    print(f"  corpus  {corpus.base_url}")
     brains = cfg.enabled_brains()
     print(f"  brains  {', '.join(b.name for b in brains) or '(none configured)'}")
 
-    if state.index.count() == 0 and brains:
-        print("  first run: building the index in the background…")
-        state.jobs.run_task("Reindex", lambda emit: state.reindex(emit))
-    else:
-        threading.Thread(target=lambda: state.universe(rebuild=True), daemon=True).start()
+    # The universe payload is the expensive read; warm it so the first page
+    # load is not waiting on a cold Postgres.
+    threading.Thread(target=_warm, args=(state,), daemon=True).start()
 
     if open_browser:
         def launch() -> None:
@@ -729,3 +780,10 @@ def serve(cfg: Config, open_browser: bool = True) -> None:
     finally:
         state.close()
         httpd.server_close()
+
+
+def _warm(state: State) -> None:
+    try:
+        state.universe(rebuild=True)
+    except CorpusError as exc:
+        print(f"  could not load the universe: {exc}")

@@ -132,57 +132,44 @@ export function createUniverse(container, cfg) {
 
   function buildBrain(b, bi) {
     const rand = rng(b.seed ?? bi + 1);
-    const gauss = () => (rand() + rand() + rand() - 1.5) * 1.4;
     const R = b.radius ?? 7, offset = allNodes.length, local = [];
-    const golden = Math.PI * (3 - Math.sqrt(5)), baseRot = rand() * Math.PI * 2;
 
-    // Degree sets node size, so the hubs of a vault are literally its brightest
-    // stars. The 92nd percentile is the hub cut, which keeps labels sparse.
-    const degrees = [];
-    b.sources.forEach(s => s.notes.forEach(n => degrees.push(n.deg || 0)));
-    degrees.sort((x, y) => x - y);
-    const pct = p => degrees.length ? degrees[Math.min(degrees.length - 1,
-      Math.floor(degrees.length * p))] : 0;
-    const hubCut = Math.max(3, pct(0.965)), midCut = Math.max(2, pct(0.72));
-    const maxDeg = Math.max(1, degrees[degrees.length - 1] || 1);
+    // The positions are the server's now. Rust derives each one from a hash of
+    // (brain_id, rel_path) instead of from an index in a sorted array, which is
+    // what stops the galaxy reshuffling every time a note is edited — something
+    // the layout that used to run here could not do, because position *was* the
+    // array index. Node i in these buffers is global id offset + i, and that is
+    // the same id the server names a note by.
+    const positions = b.positions || [];
+    const sizes = b.sizes || [];
+    const sourceIndex = b.sourceIndex || [];
+    const degrees = b.degrees || [];
+    const names = b.names || [];
+    const noteIds = cfg.noteIds || [];
+    const count = sizes.length || Math.floor(positions.length / 3);
 
-    b.sources.forEach((src, si) => {
-      const notes = src.notes || [];
-      const count = notes.length || 1;
-      const y = 1 - (2 * (si + 0.5)) / b.sources.length;
-      const rad = Math.sqrt(Math.max(0, 1 - y * y));
-      const th = baseRot + si * golden;
-      const u = new THREE.Vector3(Math.cos(th) * rad, y, Math.sin(th) * rad).normalize();
-      const tilt = new THREE.Vector3(rand() - 0.5, rand() - 0.5, rand() - 0.5).normalize();
-      const w = new THREE.Vector3().crossVectors(u, tilt).normalize();
-      const v = new THREE.Vector3().crossVectors(w, u).normalize();
-      const span = Math.min(Math.PI * 1.2, 0.6 + count / 130);
-      const width = 0.08 + Math.min(0.34, count / 950);
-      const t0 = -span / 2, phase = rand() * Math.PI * 2;
+    // Degree still decides which stars earn a label; size arrives computed.
+    // The 96.5th percentile is the hub cut, which keeps labels sparse.
+    const ranked = Array.from(degrees).sort((x, y) => x - y);
+    const pct = p => (ranked.length
+      ? ranked[Math.min(ranked.length - 1, Math.floor(ranked.length * p))] : 0);
+    const hubCut = Math.max(3, pct(0.965));
+    const lastSource = Math.max(0, (b.sources || []).length - 1);
 
-      for (let k = 0; k < count; k++) {
-        const note = notes[k] || { name: 'Note', deg: 0, nid: -1 };
-        const t = t0 + span * (k / count) + (rand() - 0.5) * 0.08;
-        const lat = gauss() * width + opt.ribbonTwist * 0.6 * Math.sin(2.5 * t + phase);
-        const rr = rand() < 0.75 ? R * (0.96 + rand() * 0.04) : R * (0.78 + rand() * 0.18);
-        const p = new THREE.Vector3()
-          .addScaledVector(u, Math.cos(t) * Math.cos(lat))
-          .addScaledVector(v, Math.sin(t) * Math.cos(lat))
-          .addScaledVector(w, Math.sin(lat))
-          .multiplyScalar(rr);
-        const deg = note.deg || 0;
-        const hub = deg >= hubCut;
-        const size = hub
-          ? 0.5 + 0.45 * Math.min(1, deg / maxDeg)
-          : deg >= midCut ? 0.26 + 0.14 * rand() : 0.16 + 0.1 * rand();
-        allNodes.push({
-          gid: allNodes.length, nid: note.nid, bi, li: local.length, si,
-          pos: p, size, hub, deg, name: note.name, mtime: note.mtime || 0,
-        });
-        gadj.push([]);
-        local.push(allNodes[allNodes.length - 1]);
-      }
-    });
+    for (let i = 0; i < count; i++) {
+      const gid = allNodes.length;
+      const deg = degrees[i] || 0;
+      allNodes.push({
+        gid, nid: noteIds[gid] ?? -1, bi, li: i,
+        si: Math.min(sourceIndex[i] || 0, lastSource),
+        pos: new THREE.Vector3(positions[i * 3], positions[i * 3 + 1],
+                               positions[i * 3 + 2]),
+        size: sizes[i] ?? 0.2, hub: deg >= hubCut, deg,
+        name: names[i] || 'Note', mtime: 0,
+      });
+      gadj.push([]);
+      local.push(allNodes[gid]);
+    }
 
     const n = local.length;
     const edgeSet = new Set();
@@ -518,8 +505,8 @@ export function createUniverse(container, cfg) {
     const d = mkLabel("600 15px Manrope, system-ui, sans-serif");
     d.style.textAlign = 'center';
     d.style.letterSpacing = '-0.01em';
-    const shown = b.cfg.shown ?? b.n, total = b.cfg.total ?? shown;
-    const meta = shown < total ? `${shown} OF ${total} NOTES` : `${total} NOTES`;
+    // No cap any more, so this is just how many notes the vault holds.
+    const meta = `${b.cfg.total ?? b.n} NOTES`;
     d.innerHTML = `<div>${escapeHtml(b.cfg.name)}</div>` +
       `<div style="font:500 10px 'JetBrains Mono',monospace;letter-spacing:.18em;color:#8fb3c4;margin-top:3px">${meta}</div>`;
     return d;

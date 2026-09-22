@@ -64,6 +64,7 @@ pub fn router(ctx: Shared) -> Router {
         .route("/universe", get(universe))
         .route("/search", get(search))
         .route("/note/:id", get(note))
+        .route("/notes/by-path", get(note_by_path))
         .route("/notes/recent", get(recent))
         .route("/reindex", post(reindex))
         .with_state(ctx)
@@ -139,6 +140,28 @@ async fn note(
 ) -> ApiResult<Response> {
     match db::note_page(&ctx.pool, id).await? {
         Some(page) => Ok(Json(page).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such note" })),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ByPathParams {
+    brain: String,
+    path: String,
+}
+
+/// A note looked up by where it lives. The ACP agent only learns which files
+/// a subprocess opened, so a path is all it has to turn a read into a citation.
+async fn note_by_path(
+    State(ctx): State<Shared>,
+    Query(params): Query<ByPathParams>,
+) -> ApiResult<Response> {
+    match db::note_by_path(&ctx.pool, &params.brain, &params.path).await? {
+        Some(summary) => Ok(Json(summary).into_response()),
         None => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such note" })),

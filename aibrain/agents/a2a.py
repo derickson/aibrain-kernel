@@ -18,7 +18,7 @@ import uuid
 from typing import Any, Iterator
 
 from ..config import AgentConfig
-from ..index import Index
+from ..corpus import Corpus
 from .base import Agent, Event
 
 CARD_PATHS = [
@@ -185,9 +185,9 @@ def result_text(result: dict) -> tuple[str, str]:
 class A2AAgent(Agent):
     kind = "a2a"
 
-    def __init__(self, cfg: AgentConfig, index: Index, brain_names: dict[str, str],
+    def __init__(self, cfg: AgentConfig, corpus: Corpus, brain_names: dict[str, str],
                  colors: dict[str, str] | None = None):
-        super().__init__(cfg, index, brain_names, colors)
+        super().__init__(cfg, corpus, brain_names, colors)
         self.client = A2AClient(cfg.url, cfg.headers)
         self.context_id: str | None = None
 

@@ -55,7 +55,6 @@ class BrainConfig:
     center: list[float] | None = None
     radius: float | None = None
     seed: int | None = None
-    max_nodes: int = 2200
     exclude: list[str] = field(
         default_factory=lambda: [".obsidian", ".trash", ".git", "ZZ-Attachments",
                                  "ZZ-Attachements", "assets", "scans", "Excalidraw"]
@@ -212,10 +211,6 @@ class Config:
     def enabled_agents(self) -> list[AgentConfig]:
         return [a for a in self.agents if a.enabled]
 
-    @property
-    def db_path(self) -> Path:
-        return self.path.parent / "index.sqlite3"
-
 
 # ---------------------------------------------------------------------------
 # which vaults exist
@@ -296,7 +291,91 @@ def reconcile_brains(cfg: "Config") -> bool:
     if not changed:
         changed = any(cfg.brain(b).path != by_id[b].path for b in by_id)
     cfg.brains = list(by_id.values())
+    write_deny_rules(linked)
     return changed
+
+
+# Agents run with the repo as their working directory, so the vaults are only
+# out of reach because this file says so. A static list stops protecting a
+# vault the moment one is linked, and keeps denying one that was unlinked, so
+# it is regenerated from the symlinks every time they are reconciled.
+SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
+
+# Not vaults, and nothing to do with which brains exist — these stay whatever
+# the vault list does.
+FIXED_DENY = [
+    "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gh", "~/Library/Keychains",
+]
+
+
+def deny_rules(vaults: list[Path]) -> list[str]:
+    """The deny list a given set of linked vaults implies.
+
+    Symlinks are resolved because the rule has to name the real directory: a
+    deny on the link is not a deny on what it points at.
+    """
+    rules = []
+    for vault in vaults:
+        try:
+            real = vault.resolve()
+        except OSError:
+            continue
+        rules.append(f"Read(//{str(real).lstrip('/')}/**)")
+    for entry in FIXED_DENY:
+        real = Path(entry).expanduser()
+        rules.append(f"Read(//{str(real).lstrip('/')}/**)")
+    # Stable order, no duplicates, so a no-op reconcile does not rewrite it.
+    seen, out = set(), []
+    for rule in rules:
+        if rule not in seen:
+            seen.add(rule)
+            out.append(rule)
+    return out
+
+
+def write_deny_rules(vaults: list[Path]) -> bool:
+    """Rewrite the Read denials in `.claude/settings.json`. Returns if changed.
+
+    Everything else in the file is left alone, including any deny entry that
+    is not a `Read(...)` rule — those belong to whoever wrote them.
+    """
+    path = SETTINGS_PATH
+    if not path.parent.is_dir():
+        return False
+    # An empty `obsidian_vaults/` means the user unlinked everything, and the
+    # rules should go with them. A *missing* one means this checkout has never
+    # had links at all — a fresh clone, or a worktree — and we know nothing
+    # about which vaults exist, so rewriting a shared committed file to drop
+    # every vault rule would take protection away rather than keep it current.
+    if not VAULT_LINK_DIR.is_dir():
+        return False
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        # A settings file we cannot parse is not ours to overwrite.
+        return False
+    if not isinstance(raw, dict):
+        return False
+
+    permissions = raw.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        return False
+    prior = permissions.get("deny")
+    prior = prior if isinstance(prior, list) else []
+    kept = [r for r in prior if not (isinstance(r, str) and r.startswith("Read("))]
+    wanted = deny_rules(vaults) + kept
+    if wanted == prior:
+        return False
+
+    permissions["deny"] = wanted
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def slugify(name: str) -> str:

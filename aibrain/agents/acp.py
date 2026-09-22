@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ..config import AgentConfig
-from ..index import Index
+from ..corpus import Corpus
 from .base import Agent, Event
 
 PROTOCOL_VERSION = 1
@@ -406,9 +406,9 @@ class ACPAgent(Agent):
 
     kind = "acp"
 
-    def __init__(self, cfg: AgentConfig, index: Index, brain_names: dict[str, str],
+    def __init__(self, cfg: AgentConfig, corpus: Corpus, brain_names: dict[str, str],
                  colors: dict[str, str] | None = None):
-        super().__init__(cfg, index, brain_names, colors)
+        super().__init__(cfg, corpus, brain_names, colors)
         self.conn: ACPConnection | None = None
         self.vault_roots: list[Path] = []
         self.brain_roots: dict[str, str] = {}
@@ -530,11 +530,12 @@ class ACPAgent(Agent):
                     rel = Path(path).resolve().relative_to(root_path)
                 except ValueError:
                     continue
-                note = self.index.note_by_path(brain_id, rel.as_posix())
+                note = self.corpus.note_by_path(brain_id, rel.as_posix())
                 if note is not None:
-                    prior = out.get(note.id)
+                    nid = note["nid"]
+                    prior = out.get(nid)
                     if prior is None or (prior[0] == "opened" and evidence[0] == "read"):
-                        out[note.id] = evidence
+                        out[nid] = evidence
         return out
 
     def probe(self) -> dict:
