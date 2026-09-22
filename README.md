@@ -13,7 +13,9 @@ else, or you turn on Elasticsearch search.
 ```
 
 That starts Postgres, the Rust service that owns the corpus, and the Python
-UI, in that order, and opens <http://127.0.0.1:8760/>.
+UI, in that order, and opens <http://127.0.0.1:8760/>. `make dev` does the
+same; `make help` lists the other targets (`stop`, `docker-up`,
+`docker-down`, `docker-redeploy`, `test`).
 
 <!-- TODO: a screenshot of the universe belongs here -->
 
