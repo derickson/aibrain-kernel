@@ -56,6 +56,17 @@ services:
     environment:
       AIBRAIN_DATABASE_URL: postgres://aibrain:aibrain@db:5432/aibrain
       AIBRAIN_BIND: 0.0.0.0:8781
+      # config.json is mounted at /config; its brain paths must be /vaults/<name>.
+      AIBRAIN_HOME: /config
+      # Passed through from the shell or the repo-root .env (compose reads
+      # that file too, for ${...} interpolation). Unset means search stays
+      # on Postgres, same as running natively.
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-}
+      ELASTICSEARCH_API_KEY: ${ELASTICSEARCH_API_KEY:-}
+      AIBRAIN_ES_INFERENCE_ID: ${AIBRAIN_ES_INFERENCE_ID:-}
+      AIBRAIN_ES_INDEX_PREFIX: ${AIBRAIN_ES_INDEX_PREFIX:-}
+      AIBRAIN_ES_BATCH: ${AIBRAIN_ES_BATCH:-}
+      AIBRAIN_ES_POLL_MS: ${AIBRAIN_ES_POLL_MS:-}
     depends_on:
       db:
         condition: service_healthy

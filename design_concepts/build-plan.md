@@ -3,6 +3,27 @@
 Companion to `AI Brains.html`, which is the visual design this implements.
 Written 2026-09-22, after Phase 1a and 1b landed.
 
+## Status (updated 2026-09-22)
+
+Everything below has landed. The two stacks described in "Where things
+stand" no longer both exist: the browser now consumes Rust's corpus, and the
+SQLite path is gone.
+
+| Item | State |
+|---|---|
+| 1e — Point Python at Rust | done — `aibrain/corpus.py` replaces `Index`; `index.py`, `md.py`, `vault.py` and most of `graph.py` are deleted |
+| 1c — Remove the node cap | done — `web/universe.js` consumes Rust's `positions`/`sizes`/`sourceIndex`/`degrees`/`names`/`edges` buffers, edge brightness is a vertex attribute (`web/edges.js`), the cap and its slider are gone |
+| `/events` (SSE) | done — `rust/aibrain-core/src/events.rs`, proxied by Python's `/api/events` |
+| `graph_cache` | done — `rust/aibrain-core/src/graph.rs`, keyed by `(brain_id, revision)`, served with an ETag (304 when unchanged) |
+| Phase 2 — the to-do shelf + MCP server | done — `rust/aibrain-core/src/todo.rs`, `aibrain/mcp_todo.py` |
+| `dev.sh` as three processes | done |
+| `.claude/settings.json` deny rules regenerated in `reconcile_brains()` | done — `aibrain/config.py` |
+| README rewrite for the new architecture | done — see `README.md` |
+
+The rest of this document is left as it was written, as history of the plan
+that produced the above — including the "two parallel stacks" framing below,
+which was accurate when this was written and is not any more.
+
 ## Where things stand
 
 There are **two parallel stacks**, and only one of them is wired to the browser.
