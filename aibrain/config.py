@@ -354,12 +354,19 @@ def deny_rules(vaults: list[Path]) -> list[str]:
 
 
 def write_deny_rules(vaults: list[Path]) -> bool:
-    """Rewrite the Read denials in `.claude/settings.json`. Returns if changed.
+    """Add the Read denials to `.claude/settings.json`. Returns if changed.
 
-    Everything else in the file is left alone, including any deny entry that
-    is not a `Read(...)` rule — those belong to whoever wrote them.
+    Everything else in the file is left alone, and so is every rule that is
+    already there: this only ever adds. See the note where `wanted` is built
+    for why a rule is never taken away.
     """
     path = SETTINGS_PATH
+    # Loading the config is what triggers this, and plenty of things load the
+    # config without meaning to touch a file that is committed and shared —
+    # a test, a script, an editor plugin. The escape hatch is an env var so
+    # those can say so without the app losing the behaviour it wants.
+    if os.environ.get("AIBRAIN_MANAGE_DENY_RULES", "1") in ("0", "no", "false"):
+        return False
     if not path.parent.is_dir():
         return False
     # An empty `obsidian_vaults/` means the user unlinked everything, and the
@@ -382,8 +389,14 @@ def write_deny_rules(vaults: list[Path]) -> bool:
         return False
     prior = permissions.get("deny")
     prior = prior if isinstance(prior, list) else []
-    kept = [r for r in prior if not (isinstance(r, str) and r.startswith("Read("))]
-    wanted = deny_rules(vaults) + kept
+    # Only ever adds. The earlier version rebuilt the whole `Read(` block from
+    # the current symlinks, which meant an unlinked vault lost its rule — and
+    # so did any `Read(` denial someone had written by hand, because nothing in
+    # the file says which rules are ours. A rule that outlives its vault costs
+    # nothing; a rule that vanishes costs the protection it was there for. So
+    # a vault is unprotected only after the user edits this file themselves.
+    generated = deny_rules(vaults)
+    wanted = generated + [r for r in prior if r not in generated]
     if wanted == prior:
         return False
 

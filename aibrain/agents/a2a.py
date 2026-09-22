@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Iterator
@@ -31,6 +32,20 @@ TIMEOUT = 120.0
 
 class A2AError(RuntimeError):
     pass
+
+
+def same_origin(candidate: str, configured: str) -> bool:
+    """Same scheme, host and port as the URL the user configured."""
+    a = urllib.parse.urlparse(candidate)
+    b = urllib.parse.urlparse(configured)
+    if a.scheme not in ("http", "https") or not a.hostname:
+        return False
+    return (a.scheme, a.hostname, a.port or _default_port(a.scheme)) == (
+        b.scheme, b.hostname, b.port or _default_port(b.scheme))
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
 
 
 class A2AClient:
@@ -60,11 +75,23 @@ class A2AClient:
         raise A2AError("no agent card at " + self.url + " (" + "; ".join(errors[:2]) + ")")
 
     def endpoint(self) -> str:
+        """Where to post, from the agent card — but only on the same origin.
+
+        The card is written by the remote agent, and `headers` may carry a
+        static API key the user configured for it. A card naming
+        `http://someone-else/` would have sent that key to someone else, so a
+        card may move the path, not the host.
+        """
         if self.card:
             for key in ("url", "endpoint", "serviceEndpoint"):
                 value = self.card.get(key)
-                if isinstance(value, str) and value.startswith("http"):
+                if isinstance(value, str) and same_origin(value, self.url):
                     return value.rstrip("/")
+                if isinstance(value, str) and value.startswith("http"):
+                    raise A2AError(
+                        f"the agent card at {self.url} points at a different "
+                        f"host; refusing to send credentials there"
+                    )
         return self.url
 
     def _envelope(self, method: str, text: str, context_id: str | None) -> dict:

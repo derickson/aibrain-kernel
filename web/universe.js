@@ -663,7 +663,7 @@ export function createUniverse(container, cfg) {
     const d = mkLabel("600 13px Manrope, system-ui, sans-serif");
     d.style.textAlign = 'center';
     d.innerHTML = `<div>${escapeHtml(a.cfg.name)}</div>` +
-      `<div style="font:500 10px 'JetBrains Mono',monospace;letter-spacing:.16em;color:${a.cfg.color};margin-top:3px">${escapeHtml(a.cfg.protocol)}</div>`;
+      `<div style="font:500 10px 'JetBrains Mono',monospace;letter-spacing:.16em;color:${escapeHtml(a.cfg.color)};margin-top:3px">${escapeHtml(a.cfg.protocol)}</div>`;
     return d;
   });
 

@@ -13,3 +13,7 @@ rust/target/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# local secrets — never commit; see .env.example
+.env
+.env.local

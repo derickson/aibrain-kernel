@@ -41,7 +41,8 @@ from aibrain.config import (AgentConfig, BrainConfig, Config,       # noqa: E402
                             ScriptConfig, default_agents)
 from aibrain.corpus import Corpus, CorpusError, unreachable_message  # noqa: E402
 from aibrain.jobs import JobRunner                                  # noqa: E402
-from aibrain.server import Handler, State, build_router             # noqa: E402
+from aibrain.server import (Handler, State, build_router,           # noqa: E402
+                            link_name)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -414,6 +415,118 @@ class ServerTests(unittest.TestCase):
         self.assertAlmostEqual(saved["view"]["link_opacity"], 0.42)
         self.assertAlmostEqual(self.get("/api/status")["view"]["link_opacity"], 0.42)
 
+    # ---- who is allowed to ask -------------------------------------------
+    def raw(self, method, path, headers=None, body=None):
+        """One request with exactly the headers given. Returns (code, body)."""
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method)
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_a_host_header_we_were_not_reached_at_is_refused(self):
+        """DNS rebinding: evil.com resolving to 127.0.0.1 still says evil.com."""
+        for host in ("evil.com", "evil.com:8760", "127.0.0.1.evil.com",
+                     "[::1].evil.com"):
+            code, body = self.raw("GET", "/api/status", {"Host": host})
+            self.assertEqual(code, 403, f"{host} was allowed: {body!r}")
+        # The real thing still works.
+        self.assertEqual(self.raw("GET", "/api/status")[0], 200)
+
+    def test_a_cross_site_request_is_refused(self):
+        """CSRF: a page on another origin must not drive this API."""
+        host = self.base.removeprefix("http://")
+        blocked = [
+            {"Origin": "http://evil.com"},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"},
+            # Another local app on a different port is a different origin,
+            # and browsers call that "same-site" — it is still not us.
+            {"Sec-Fetch-Site": "same-site"},
+        ]
+        for headers in blocked:
+            code, _ = self.raw("POST", "/api/view", headers, {"linkOpacity": 0.9})
+            self.assertEqual(code, 403, headers)
+            code, _ = self.raw("GET", "/api/status", headers)
+            self.assertEqual(code, 403, headers)
+        # The page itself, and a non-browser client, both get through.
+        for headers in ({"Origin": f"http://{host}", "Sec-Fetch-Site": "same-origin"},
+                        {"Sec-Fetch-Site": "none"},
+                        {}):
+            code, _ = self.raw("POST", "/api/view", headers, {"linkOpacity": 0.24})
+            self.assertEqual(code, 200, headers)
+
+    def test_static_serving_refuses_every_spelling_of_traversal(self):
+        for path in ("/../aibrain/config.py",
+                     "/%2e%2e/aibrain/config.py",
+                     "/..%2faibrain%2fconfig.py",
+                     "/subdir/../../aibrain/config.py",
+                     "/../.env"):
+            code, _ = self.raw("GET", path)
+            self.assertEqual(code, 404, path)
+        self.assertEqual(self.raw("GET", "/app.js")[0], 200)
+
+    def test_a_body_larger_than_the_cap_is_refused(self):
+        """Refused on the header, before a byte of it is read into memory."""
+        host, port = self.httpd.server_address[0], self.httpd.server_address[1]
+        request = (
+            "POST /api/todos HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {4 << 20}\r\n"
+            "\r\n"
+        ).encode()
+        with socket.create_connection((host, port), timeout=10) as sock:
+            sock.sendall(request)
+            status = sock.recv(64).decode("utf-8", "replace")
+        self.assertIn("400", status.splitlines()[0])
+
+    def test_a_query_parameter_that_is_not_a_number_is_a_400(self):
+        for path in ("/api/search?q=a&limit=abc", "/api/recent?limit=nope",
+                     "/api/note/not-a-number", "/api/node/x"):
+            code, body = self.raw("GET", path)
+            self.assertEqual(code, 400, path)
+            self.assertIn("error", json.loads(body))
+        # And a negative or enormous one is clamped rather than passed on.
+        self.assertLessEqual(len(self.get("/api/recent?limit=99999")["results"]), 200)
+        self.get("/api/search?q=protocols&limit=-5")
+
+    def test_a_script_cannot_be_handed_arguments_by_the_caller(self):
+        """Only the toggles the script declares reach its command line."""
+        job = self.post("/api/script/echo/run",
+                        {"args": ["--wipe", "/"], "options": ["Nope"]})["job"]
+        self.assertNotIn("--wipe", job["command"])
+        events = self.sse(f"/api/stream/job/{job['id']}")
+        self.assertEqual(events[-1]["status"], "done")
+
+    def test_an_agent_colour_that_is_not_a_colour_is_refused(self):
+        """It lands in a `style="…"` the universe builds with innerHTML."""
+        code, _ = self.raw("POST", "/api/agent/kernel", None,
+                           {"color": '#000" onmouseover="alert(1)'})
+        self.assertEqual(code, 400)
+        self.assertEqual(
+            self.raw("POST", "/api/agent/kernel", None, {"color": "#b48cff"})[0], 200)
+
+    def test_an_internal_failure_does_not_hand_back_its_detail(self):
+        state = self.state
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("/Users/someone/Vaults/Private/secret.md is missing")
+
+        state.corpus.recent = boom
+        try:
+            code, body = self.raw("GET", "/api/recent")
+        finally:
+            del state.corpus.recent
+        self.assertEqual(code, 500)
+        payload = json.loads(body)
+        self.assertNotIn("secret.md", payload["error"])
+        self.assertNotIn("RuntimeError", payload["error"])
+
 
 class LiveUpdateTests(unittest.TestCase):
     """The change feed and the conditional universe.
@@ -767,6 +880,49 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(hasattr(cfg.brains[0], "max_nodes"))
 
 
+class A2AEndpointTests(unittest.TestCase):
+    """The agent card is written by the remote agent, so it is not trusted."""
+
+    def client(self, url="https://agent.example.com:8443/a2a"):
+        from aibrain.agents.a2a import A2AClient
+        return A2AClient(url, {"Authorization": "Bearer secret"})
+
+    def test_no_card_means_the_configured_url(self):
+        client = self.client()
+        self.assertEqual(client.endpoint(), "https://agent.example.com:8443/a2a")
+
+    def test_a_card_may_move_the_path(self):
+        client = self.client()
+        client.card = {"url": "https://agent.example.com:8443/other/path/"}
+        self.assertEqual(client.endpoint(),
+                         "https://agent.example.com:8443/other/path")
+
+    def test_a_card_may_not_move_the_host(self):
+        from aibrain.agents.a2a import A2AError
+        for elsewhere in ("http://evil.example.net/a2a",
+                          "https://agent.example.com:9999/a2a",
+                          "http://agent.example.com:8443/a2a"):
+            client = self.client()
+            client.card = {"url": elsewhere}
+            with self.assertRaises(A2AError, msg=elsewhere):
+                client.endpoint()
+
+
+class LinkNameTests(unittest.TestCase):
+    """`add_brain` turns a supplied name into a file inside obsidian_vaults/."""
+
+    def test_a_plain_name_is_kept(self):
+        for name in ("Grognard", "Obsidian Cloud Home", "notes.v2", "a-b_c"):
+            self.assertEqual(link_name(name), name)
+        self.assertEqual(link_name("  Spaced  "), "Spaced")
+
+    def test_a_name_that_is_really_a_path_is_refused(self):
+        for name in ("../../.ssh/authorized_keys", "a/b", "a\\b", "..", ".",
+                     "", "   ", ".hidden", "with\x00null", "line\nbreak",
+                     "x" * 200):
+            self.assertIsNone(link_name(name), name)
+
+
 class DenyRuleTests(unittest.TestCase):
     """The deny list is generated, so it cannot go stale when a vault moves."""
 
@@ -793,7 +949,7 @@ class DenyRuleTests(unittest.TestCase):
     def read(self) -> dict:
         return json.loads(self.settings.read_text(encoding="utf-8"))
 
-    def test_every_linked_vault_gets_a_rule_and_unlinked_ones_lose_theirs(self):
+    def test_every_linked_vault_gets_a_rule_and_no_rule_is_ever_dropped(self):
         import aibrain.config as config
         first, second = self.link("Alpha"), self.link("Beta")
         self.write({"permissions": {"deny": [
@@ -804,17 +960,40 @@ class DenyRuleTests(unittest.TestCase):
             deny = self.read()["permissions"]["deny"]
             self.assertIn(f"Read(//{str(first).lstrip('/')}/**)", deny)
             self.assertIn(f"Read(//{str(second).lstrip('/')}/**)", deny)
-            # The stale rule for a vault nobody links any more is gone.
-            self.assertNotIn("Read(//Users/nobody/GoneVault/**)", deny)
+            # A rule nothing here generated is somebody's deliberate denial;
+            # regenerating the list must not quietly delete it.
+            self.assertIn("Read(//Users/nobody/GoneVault/**)", deny)
             # The fixed non-vault entries survive.
             self.assertTrue(any(r.endswith("/.ssh/**)") for r in deny))
             self.assertTrue(any("Keychains" in r for r in deny))
 
+            # Unlinking a vault stops it being a brain, but the vault is still
+            # on disk and an agent still runs with the repo as its cwd, so the
+            # denial stays until the user takes it out themselves.
             (self.links / "Beta").unlink()
             config.reconcile_brains(Config())
             deny = self.read()["permissions"]["deny"]
             self.assertIn(f"Read(//{str(first).lstrip('/')}/**)", deny)
-            self.assertNotIn(f"Read(//{str(second).lstrip('/')}/**)", deny)
+            self.assertIn(f"Read(//{str(second).lstrip('/')}/**)", deny)
+            self.assertEqual(len(deny), len(set(deny)), "no rule is duplicated")
+
+    def test_the_rewrite_can_be_switched_off(self):
+        """Loading a config should not be able to edit a shared file blind."""
+        import aibrain.config as config
+        self.link("Zeta")
+        original = {"permissions": {"deny": []}}
+        self.write(original)
+        with patched(config, VAULT_LINK_DIR=self.links, SETTINGS_PATH=self.settings):
+            prior = os.environ.get("AIBRAIN_MANAGE_DENY_RULES")
+            os.environ["AIBRAIN_MANAGE_DENY_RULES"] = "0"
+            try:
+                self.assertFalse(config.write_deny_rules(config.discover_vaults()))
+            finally:
+                if prior is None:
+                    del os.environ["AIBRAIN_MANAGE_DENY_RULES"]
+                else:
+                    os.environ["AIBRAIN_MANAGE_DENY_RULES"] = prior
+        self.assertEqual(self.read(), original)
 
     def test_a_symlink_is_resolved_to_the_real_directory(self):
         import aibrain.config as config
@@ -840,7 +1019,8 @@ class DenyRuleTests(unittest.TestCase):
         self.assertEqual(raw["model"], "opus")
         self.assertEqual(raw["permissions"]["allow"], ["Bash(ls:*)"])
         self.assertIn("Bash(rm:*)", raw["permissions"]["deny"])
-        self.assertNotIn("Read(//stale/**)", raw["permissions"]["deny"])
+        # Including a Read rule somebody wrote by hand.
+        self.assertIn("Read(//stale/**)", raw["permissions"]["deny"])
 
     def test_a_checkout_with_no_link_folder_is_left_alone(self):
         """A fresh clone or a worktree must not strip the committed rules.

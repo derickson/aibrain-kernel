@@ -21,8 +21,11 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "charset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# No `macros` feature: nothing here uses `sqlx::query!` or `sqlx::migrate!`
+# (migrations are applied by `db::migrate` from plain .sql files), and asking
+# for it compiles sqlx-macros-core for nothing.
 sqlx = { version = "0.8", default-features = false, features = [
-  "runtime-tokio", "tls-none", "postgres", "macros", "migrate", "chrono", "json",
+  "runtime-tokio", "tls-none", "postgres", "migrate", "chrono", "json",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

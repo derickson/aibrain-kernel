@@ -155,7 +155,7 @@ class TodoTools:
         return "\n".join(lines)
 
     def _add_todo(self, args: dict) -> str:
-        body = str(args.get("body", "")).strip()
+        body = str(args.get("body", "")).strip()[:4000]
         if not body:
             return "Nothing to add: body was empty."
         row = self.corpus.add_todo(body, scheduled_on=args.get("day") or None)
@@ -181,8 +181,11 @@ class TodoTools:
         return "Linked: " + self._line(row.get("todo", {}))
 
     def _search_history(self, args: dict) -> str:
-        limit = int(args.get("limit") or 20)
-        payload = self.corpus.todo_history(str(args.get("q") or ""), limit=limit)
+        # A model will happily ask for a million rows. Clamp rather than fail:
+        # the tool result should be the list, not a lecture about the limit.
+        limit = max(1, min(200, int(args.get("limit") or 20)))
+        payload = self.corpus.todo_history(str(args.get("q") or "")[:2000],
+                                           limit=limit)
         rows = payload.get("todos", [])
         if not rows:
             return "Nothing in the history matches that."
