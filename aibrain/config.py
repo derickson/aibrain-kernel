@@ -352,6 +352,10 @@ FIXED_DENY = [
 ]
 
 
+def _read_rule(path: Path) -> str:
+    return f"Read({path}/**)"
+
+
 def deny_rules(vaults: list[Path]) -> list[str]:
     """The deny list a given set of linked vaults implies.
 
@@ -364,10 +368,9 @@ def deny_rules(vaults: list[Path]) -> list[str]:
             real = vault.resolve()
         except OSError:
             continue
-        rules.append(f"Read(//{str(real).lstrip('/')}/**)")
+        rules.append(_read_rule(real))
     for entry in FIXED_DENY:
-        real = Path(entry).expanduser()
-        rules.append(f"Read(//{str(real).lstrip('/')}/**)")
+        rules.append(_read_rule(Path(entry).expanduser()))
     # Stable order, no duplicates, so a no-op reconcile does not rewrite it.
     seen, out = set(), []
     for rule in rules:
@@ -413,13 +416,34 @@ def write_deny_rules(vaults: list[Path]) -> bool:
         return False
     prior = permissions.get("deny")
     prior = prior if isinstance(prior, list) else []
+    # Paths that the user has explicitly allowed should not be denied — deny
+    # wins over allow in Claude Code, so a generated deny rule would silently
+    # override a hand-written allow rule and block access the user intended.
+    # Extract the bare path prefixes from every allow rule so we can do a
+    # simple prefix check rather than an exact string match.
+    raw_allowed = permissions.get("allow")
+    raw_allowed = raw_allowed if isinstance(raw_allowed, list) else []
+    allowed_prefixes = []
+    for rule in raw_allowed:
+        # Allow rules look like Read(/some/path/**) or Read(/some/path/*)
+        if rule.startswith("Read(") and rule.endswith(")"):
+            p = rule[5:-1].rstrip("*").rstrip("/")
+            allowed_prefixes.append(p)
+
+    def _is_allowed(deny_rule: str) -> bool:
+        if not (deny_rule.startswith("Read(") and deny_rule.endswith(")")):
+            return False
+        p = deny_rule[5:-1].rstrip("*").rstrip("/")
+        return any(p == a or p.startswith(a + "/") or a.startswith(p + "/")
+                   for a in allowed_prefixes)
+
     # Only ever adds. The earlier version rebuilt the whole `Read(` block from
     # the current symlinks, which meant an unlinked vault lost its rule — and
     # so did any `Read(` denial someone had written by hand, because nothing in
     # the file says which rules are ours. A rule that outlives its vault costs
     # nothing; a rule that vanishes costs the protection it was there for. So
     # a vault is unprotected only after the user edits this file themselves.
-    generated = deny_rules(vaults)
+    generated = [r for r in deny_rules(vaults) if not _is_allowed(r)]
     wanted = generated + [r for r in prior if r not in generated]
     if wanted == prior:
         return False
