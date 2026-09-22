@@ -149,6 +149,12 @@ async fn search(
     let mut results = None;
     if let Some(es) = &ctx.es {
         match es::search::run(&ctx.pool, es, &query, &brains, limit).await {
+            // The semantic leg matches every indexed note, so an empty answer
+            // means the notes are not in the index yet — a vault scanned
+            // moments ago whose queue is still draining. Postgres has them.
+            Ok(hits) if hits.is_empty() && !query.trim().is_empty() => {
+                tracing::debug!("elasticsearch returned nothing, using postgres");
+            }
             Ok(hits) => {
                 engine = "elasticsearch";
                 results = Some(hits);

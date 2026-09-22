@@ -17,6 +17,7 @@ container is an environment problem, not a broken build.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import socket
@@ -60,6 +61,20 @@ VAULT = {
     "Recipes/Ramen.md": "# Ramen\n\nMiso broth. #cooking\n",
     "Journal/2026-01-01.md": "# New year\n\nThought about [[Agents]] today.\n",
 }
+
+
+def every_key(value) -> set[str]:
+    """Every key name anywhere in a JSON payload, however deeply nested."""
+    found: set[str] = set()
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            found.update(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return found
 
 
 def make_vault(root: Path) -> None:
@@ -158,6 +173,12 @@ class CorpusFixture:
             # `?now=` unless this is set, so production cannot time travel.
             "AIBRAIN_TODO_TEST_CLOCK": "1",
         }
+        # The binary loads the repo `.env`, which carries live Elasticsearch
+        # credentials. A test must never index a throwaway vault into the real
+        # cluster, so Elasticsearch is switched off unless a run opts in.
+        if not os.environ.get("AIBRAIN_TEST_ELASTICSEARCH"):
+            env["ELASTICSEARCH_URL"] = ""
+            env["ELASTICSEARCH_API_KEY"] = ""
         self.proc = subprocess.Popen(
             [str(binary), "serve"], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -286,6 +307,24 @@ class ServerTests(unittest.TestCase):
         # Edge indices are local to their brain.
         for a, b in brain["edges"]:
             self.assertTrue(0 <= a < len(VAULT) and 0 <= b < len(VAULT))
+
+    def test_universe_places_every_note_it_names(self):
+        """Every id in `noteIds` has a position, because nothing is capped."""
+        universe = self.get("/api/universe")
+        placed = 0
+        for brain in universe["brains"]:
+            self.assertEqual(len(brain["positions"]) % 3, 0)
+            self.assertTrue(all(math.isfinite(v) for v in brain["positions"]))
+            placed += len(brain["positions"]) // 3
+        self.assertEqual(placed, len(universe["noteIds"]))
+        self.assertEqual(placed, universe["stats"]["notes"])
+
+    def test_nothing_reports_a_cap_or_a_shown_count(self):
+        """1c deleted the cap, so no payload may still describe one."""
+        for path in ("/api/status", "/api/universe"):
+            keys = every_key(self.get(path))
+            for gone in ("maxNodes", "max_nodes", "shown"):
+                self.assertNotIn(gone, keys, f"{gone} survives in {path}")
 
     def test_static_files_are_served_and_confined(self):
         with urllib.request.urlopen(self.base + "/", timeout=10) as r:
@@ -1080,6 +1119,27 @@ class _NoCorpus:
     """Stands in for the HTTP client in tests that never reach the service."""
 
     base_url = "http://example.invalid"
+
+
+# ---------------------------------------------------------------------------
+# the renderer's one piece of testable logic
+# ---------------------------------------------------------------------------
+
+class EdgeShadingTests(unittest.TestCase):
+    """Edge brightness is a shader attribute now; what feeds it is JS.
+
+    `web/edges.js` is plain ES modules with no DOM and no three.js, so node
+    can run its assertions. There is no JS test runner in the repo, so this
+    shells out and skips when node is absent.
+    """
+
+    def test_edge_brightness_follows_the_highlight_set(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed, so web/edges.js has no runner")
+        script = REPO_ROOT / "tests" / "test_edges.mjs"
+        result = subprocess.run([node, str(script)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
