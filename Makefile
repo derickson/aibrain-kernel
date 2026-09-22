@@ -1,7 +1,7 @@
 # Operating aibrain-kernel.
 #
 #   make dev              postgres + aibrain-core + the UI, in this terminal
-#   make stop             stop the two native processes; the database stays up
+#   make stop             stop aibrain-core, the UI, and the postgres container
 #   make docker-up        start the containers (PROFILE=full adds the watcher)
 #   make docker-down      stop and remove the containers; the data volume stays
 #   make docker-redeploy  rebuild the watcher image and recreate the containers
@@ -26,6 +26,8 @@ dev:
 stop:
 	@pkill -f 'aibrain-core serve' && echo "stopped aibrain-core" || echo "aibrain-core was not running"
 	@pkill -f 'python3? -m aibrain' && echo "stopped aibrain (ui)" || echo "aibrain (ui) was not running"
+	$(COMPOSE) stop
+	@$(COMPOSE) --profile full stop watcher >/dev/null 2>&1 || true
 
 docker-up:
 	$(COMPOSE) $(COMPOSE_FLAGS) up -d
