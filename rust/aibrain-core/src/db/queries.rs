@@ -86,11 +86,31 @@ pub async fn upsert_brain(
 }
 
 /// Forget every brain that is no longer linked. Cascades to its notes.
+///
+/// The notes are queued for deletion from Elasticsearch first, while the brain
+/// row (and so its name, which the index name is derived from) still exists.
+/// The index itself is left in place: it is empty afterwards, and dropping an
+/// index outright is the one move that cannot be undone by a resync.
 pub async fn retain_brains(pool: &PgPool, keep: &[String]) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
+         SELECT n.brain_id, b.name, n.id, n.rel_path, 'delete'
+           FROM note n JOIN brain b ON b.id = n.brain_id
+          WHERE NOT (n.brain_id = ANY($1))
+         ON CONFLICT (brain_id, rel_path) DO UPDATE
+            SET op = 'delete', note_id = EXCLUDED.note_id,
+                brain_name = EXCLUDED.brain_name, enqueued_at = now(),
+                attempts = 0, last_error = NULL, locked_until = NULL",
+    )
+    .bind(keep)
+    .execute(&mut *tx)
+    .await?;
     let result = sqlx::query("DELETE FROM brain WHERE NOT (id = ANY($1))")
         .bind(keep)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected())
 }
 
@@ -200,14 +220,47 @@ pub async fn upsert_note(
     Ok(row.get("id"))
 }
 
+/// Delete notes, recording a search deletion for each on the way out.
+///
+/// `RETURNING` is what makes this safe: the rel_path is captured in the same
+/// statement that removes the row, so there is no window in which a note is
+/// gone from Postgres and nothing remembers to remove it from Elasticsearch.
 pub async fn delete_notes(pool: &PgPool, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    sqlx::query("DELETE FROM note WHERE id = ANY($1)")
-        .bind(ids)
-        .execute(pool)
+    let mut tx = pool.begin().await?;
+    let gone = sqlx::query(
+        "DELETE FROM note WHERE id = ANY($1)
+         RETURNING id, brain_id, rel_path",
+    )
+    .bind(ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    if !gone.is_empty() {
+        let brain_ids: Vec<String> = gone.iter().map(|r| r.get("brain_id")).collect();
+        let rel_paths: Vec<String> = gone.iter().map(|r| r.get("rel_path")).collect();
+        let note_ids: Vec<i64> = gone.iter().map(|r| r.get("id")).collect();
+        sqlx::query(
+            "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
+             SELECT w.brain_id, COALESCE(b.name, ''), w.note_id, w.rel_path, 'delete'
+               FROM unnest($1::text[], $2::text[], $3::bigint[])
+                    AS w(brain_id, rel_path, note_id)
+               LEFT JOIN brain b ON b.id = w.brain_id
+             ON CONFLICT (brain_id, rel_path) DO UPDATE
+                SET op = 'delete', note_id = EXCLUDED.note_id,
+                    brain_name = EXCLUDED.brain_name, enqueued_at = now(),
+                    attempts = 0, last_error = NULL, locked_until = NULL",
+        )
+        .bind(&brain_ids)
+        .bind(&rel_paths)
+        .bind(&note_ids)
+        .execute(&mut *tx)
         .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -700,6 +753,311 @@ pub async fn resolve_targets(
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<String, _>("key"), r.get::<i64, _>("id")))
+        .collect())
+}
+
+// ── The Elasticsearch work queue ───────────────────────────────────────────
+//
+// Everything below fills or drains `search_queue`. It runs whether or not
+// Elasticsearch is configured: an insert is cheap, and a queue that was kept
+// while the feature was off is what lets it be turned on without a resync.
+
+#[derive(Debug, Clone)]
+// note_id and attempts are carried for diagnostics — they show up in a
+// `SELECT * FROM search_queue` and in a debug print of a stuck row.
+#[allow(dead_code)]
+pub struct QueueItem {
+    pub id: i64,
+    pub brain_id: String,
+    pub brain_name: String,
+    pub note_id: Option<i64>,
+    pub rel_path: String,
+    /// `upsert` or `delete`.
+    pub op: String,
+    pub attempts: i32,
+    /// Carried so completion can refuse to delete a row that was re-enqueued
+    /// while we held it.
+    pub enqueued_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One note changed. The latest operation wins; earlier edits coalesce away.
+pub async fn enqueue_note(
+    pool: &PgPool,
+    brain_id: &str,
+    brain_name: &str,
+    note_id: Option<i64>,
+    rel_path: &str,
+    op: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (brain_id, rel_path) DO UPDATE
+            SET op = EXCLUDED.op, note_id = EXCLUDED.note_id,
+                brain_name = EXCLUDED.brain_name, enqueued_at = now(),
+                attempts = 0, last_error = NULL, locked_until = NULL",
+    )
+    .bind(brain_id)
+    .bind(brain_name)
+    .bind(note_id)
+    .bind(rel_path)
+    .bind(op)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Queue an upsert for every note, or for one brain. The backfill path.
+pub async fn enqueue_all(pool: &PgPool, brain_id: Option<&str>) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
+         SELECT n.brain_id, b.name, n.id, n.rel_path, 'upsert'
+           FROM note n JOIN brain b ON b.id = n.brain_id
+          WHERE $1::text IS NULL OR n.brain_id = $1::text
+         ON CONFLICT (brain_id, rel_path) DO UPDATE
+            SET op = 'upsert', note_id = EXCLUDED.note_id,
+                brain_name = EXCLUDED.brain_name, enqueued_at = now(),
+                attempts = 0, last_error = NULL, locked_until = NULL",
+    )
+    .bind(brain_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Take up to `limit` items, leasing them so a second worker skips them.
+pub async fn claim_queue(pool: &PgPool, limit: i64, lease_secs: i64) -> Result<Vec<QueueItem>> {
+    let rows = sqlx::query(
+        "WITH ready AS (
+             SELECT id FROM search_queue
+              WHERE locked_until IS NULL OR locked_until < now()
+              ORDER BY enqueued_at, id
+              LIMIT $1
+              FOR UPDATE SKIP LOCKED
+         )
+         UPDATE search_queue q
+            SET locked_until = now() + make_interval(secs => $2::double precision)
+           FROM ready
+          WHERE q.id = ready.id
+      RETURNING q.id, q.brain_id, q.brain_name, q.note_id, q.rel_path, q.op,
+                q.attempts, q.enqueued_at",
+    )
+    .bind(limit)
+    .bind(lease_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| QueueItem {
+            id: r.get("id"),
+            brain_id: r.get("brain_id"),
+            brain_name: r.get("brain_name"),
+            note_id: r.try_get("note_id").ok(),
+            rel_path: r.get("rel_path"),
+            op: r.get("op"),
+            attempts: r.get("attempts"),
+            enqueued_at: r.get("enqueued_at"),
+        })
+        .collect())
+}
+
+/// Drop rows that made it into Elasticsearch.
+///
+/// The `enqueued_at` guard is the point: if the note was saved again while the
+/// batch was in flight, the row was reset to a newer timestamp and must stay.
+pub async fn finish_queue(pool: &PgPool, done: &[QueueItem]) -> Result<u64> {
+    if done.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = done.iter().map(|i| i.id).collect();
+    let stamps: Vec<chrono::DateTime<chrono::Utc>> =
+        done.iter().map(|i| i.enqueued_at).collect();
+    let result = sqlx::query(
+        "DELETE FROM search_queue q
+          USING unnest($1::bigint[], $2::timestamptz[]) AS w(id, stamp)
+          WHERE q.id = w.id AND q.enqueued_at = w.stamp",
+    )
+    .bind(&ids)
+    .bind(&stamps)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Record a failure and back the row off. 2^attempts seconds, capped at an hour.
+pub async fn fail_queue(pool: &PgPool, failures: &[(i64, String)]) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = failures.iter().map(|(id, _)| *id).collect();
+    let reasons: Vec<String> = failures
+        .iter()
+        .map(|(_, why)| why.chars().take(500).collect())
+        .collect();
+    sqlx::query(
+        "UPDATE search_queue q
+            SET attempts = q.attempts + 1,
+                last_error = w.reason,
+                locked_until = now() + make_interval(
+                    secs => least(3600.0, power(2.0, least(q.attempts + 1, 12))::double precision))
+           FROM unnest($1::bigint[], $2::text[]) AS w(id, reason)
+          WHERE q.id = w.id",
+    )
+    .bind(&ids)
+    .bind(&reasons)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QueueStats {
+    pub pending: i64,
+    pub failing: i64,
+    pub oldest_age_s: f64,
+}
+
+pub async fn queue_stats(pool: &PgPool) -> Result<QueueStats> {
+    let row = sqlx::query(
+        "SELECT count(*) AS pending,
+                count(*) FILTER (WHERE attempts > 0) AS failing,
+                -- extract() is NUMERIC in modern Postgres, so the cast is not
+                -- decoration: without it this decodes as the wrong type.
+                COALESCE(extract(epoch FROM now() - min(enqueued_at)), 0)::double precision
+                    AS oldest
+           FROM search_queue",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(QueueStats {
+        pending: row.get("pending"),
+        failing: row.get("failing"),
+        oldest_age_s: row.get::<f64, _>("oldest"),
+    })
+}
+
+pub async fn queue_depth_for_brain(pool: &PgPool, brain_id: &str) -> Result<i64> {
+    let row = sqlx::query("SELECT count(*) AS c FROM search_queue WHERE brain_id = $1")
+        .bind(brain_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("c"))
+}
+
+pub async fn count_notes_for_brain(pool: &PgPool, brain_id: &str) -> Result<i64> {
+    let row = sqlx::query("SELECT count(*) AS c FROM note WHERE brain_id = $1")
+        .bind(brain_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("c"))
+}
+
+/// Everything Elasticsearch needs about one note.
+#[derive(Debug, Clone)]
+pub struct IndexDoc {
+    pub note_id: i64,
+    pub brain_id: String,
+    pub brain_name: String,
+    pub rel_path: String,
+    pub title: String,
+    pub source: String,
+    pub tags: Vec<String>,
+    pub headings: Vec<String>,
+    pub excerpt: String,
+    pub body: String,
+    pub mtime: f64,
+    pub degree: i32,
+    pub size: i64,
+    pub content_hash: String,
+}
+
+/// Fetch the notes behind a set of `(brain_id, rel_path)` pairs.
+///
+/// Keyed on the path rather than the note id because the id is a Postgres
+/// serial: rebuild the database and every id moves, while the path does not.
+pub async fn notes_by_path(
+    pool: &PgPool,
+    brain_ids: &[String],
+    rel_paths: &[String],
+) -> Result<Vec<IndexDoc>> {
+    if brain_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT n.id, n.brain_id, b.name AS brain_name, n.rel_path, n.title, n.source,
+                n.tags, n.headings, n.excerpt, n.body, n.mtime, n.degree, n.size,
+                encode(n.content_hash, 'hex') AS content_hash
+           FROM unnest($1::text[], $2::text[]) AS w(brain_id, rel_path)
+           JOIN note n ON n.brain_id = w.brain_id AND n.rel_path = w.rel_path
+           JOIN brain b ON b.id = n.brain_id",
+    )
+    .bind(brain_ids)
+    .bind(rel_paths)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| IndexDoc {
+            note_id: r.get("id"),
+            brain_id: r.get("brain_id"),
+            brain_name: r.get("brain_name"),
+            rel_path: r.get("rel_path"),
+            title: r.get("title"),
+            source: r.get("source"),
+            tags: text_array(&r, "tags"),
+            headings: text_array(&r, "headings"),
+            excerpt: r.get("excerpt"),
+            body: r.get("body"),
+            mtime: r.get("mtime"),
+            degree: r.get("degree"),
+            size: r.get("size"),
+            content_hash: r.get("content_hash"),
+        })
+        .collect())
+}
+
+/// Resolve search hits back to authoritative Postgres rows.
+///
+/// Elasticsearch may be a few seconds behind, so its `_source` is treated as a
+/// ranking signal only. A hit whose note is gone from Postgres is dropped by
+/// the caller — it simply will not appear in this map.
+pub async fn summaries_by_path(
+    pool: &PgPool,
+    brain_ids: &[String],
+    rel_paths: &[String],
+) -> Result<std::collections::HashMap<(String, String), NoteSummary>> {
+    if brain_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let rows = sqlx::query(
+        "SELECT n.id, n.brain_id, n.rel_path, n.title, n.source, n.degree, n.mtime
+           FROM unnest($1::text[], $2::text[]) AS w(brain_id, rel_path)
+           JOIN note n ON n.brain_id = w.brain_id AND n.rel_path = w.rel_path",
+    )
+    .bind(brain_ids)
+    .bind(rel_paths)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let brain_id: String = r.get("brain_id");
+            let rel_path: String = r.get("rel_path");
+            (
+                (brain_id.clone(), rel_path.clone()),
+                NoteSummary {
+                    nid: r.get("id"),
+                    brain_id,
+                    rel_path,
+                    name: r.get("title"),
+                    source: r.get("source"),
+                    degree: r.get("degree"),
+                    mtime: r.get("mtime"),
+                    snippet: String::new(),
+                    score: None,
+                },
+            )
+        })
         .collect())
 }
 
