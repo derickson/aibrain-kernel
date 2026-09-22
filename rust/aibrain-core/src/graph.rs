@@ -89,7 +89,6 @@ pub async fn build(pool: &PgPool, cfg: &Config) -> Result<Value> {
             "seed": spec.seed,
             "revision": row.revision,
             "path": spec.root,
-            "shown": placed.len(),
             "total": placed.len(),
             "sources": sources,
             "positions": positions,
@@ -126,7 +125,6 @@ pub async fn build(pool: &PgPool, cfg: &Config) -> Result<Value> {
         "options": { "ribbonTwist": cfg.ribbon_twist },
         "stats": {
             "notes": note_ids.len(),
-            "shown": note_ids.len(),
             "brains": brains_out.len(),
             "cross": cross.len(),
         },

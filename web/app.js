@@ -193,7 +193,7 @@ function renderChips() {
     chips.append(el('button', {
       class: 'chip',
       'aria-pressed': on ? 'true' : 'false',
-      title: `${brain.total ?? brain.shown} notes · ${brain.path}`,
+      title: `${brain.total ?? 0} notes · ${brain.path}`,
       onclick: () => {
         S.brainFocus = on ? null : brain.id;
         S.universe?.focusBrain(S.brainFocus);
@@ -205,7 +205,7 @@ function renderChips() {
     },
       el('span', { class: 'pip', style: `background:${color};box-shadow:0 0 8px ${color}` }),
       el('span', {}, brain.name),
-      el('span', { class: 'count' }, String(brain.shown))
+      el('span', { class: 'count' }, String(brain.total ?? 0))
     ));
   }
 }
