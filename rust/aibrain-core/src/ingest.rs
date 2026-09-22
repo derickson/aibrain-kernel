@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use sqlx::PgPool;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::config::BrainSpec;
@@ -15,7 +16,7 @@ use crate::db;
 use crate::layout;
 use crate::vault::{self, scan};
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Stats {
     pub scanned: usize,
     pub added: usize,
@@ -23,12 +24,38 @@ pub struct Stats {
     pub removed: usize,
     pub unchanged: usize,
     pub links: i64,
+    /// Every brain whose revision this run moved, and what it moved to.
+    /// Empty when the scan found nothing to do, which is the usual case.
+    pub bumped: Vec<(String, i64)>,
 }
 
 impl Stats {
     pub fn changed(&self) -> bool {
         self.added > 0 || self.updated > 0 || self.removed > 0
     }
+}
+
+/// Which brains a run has to bump.
+///
+/// The ones the caller saw change directly, plus any whose note count or total
+/// degree moved across the run. That second half is what catches a vault
+/// changed from outside itself: a new `[[target]]` in vault A resolving into
+/// vault B raises B's degrees, and so B's star sizes, without any file in B
+/// being touched.
+fn brains_to_bump(
+    before: &BTreeMap<String, (i64, i64)>,
+    after: &BTreeMap<String, (i64, i64)>,
+    touched: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut out: BTreeSet<String> = after
+        .iter()
+        .filter(|(id, fingerprint)| before.get(*id) != Some(fingerprint))
+        .map(|(id, _)| id.clone())
+        .collect();
+    // A brain the caller wrote to still counts even when the counts came out
+    // the same — an edited note changes its text, not its degree.
+    out.extend(touched.iter().filter(|id| after.contains_key(*id)).cloned());
+    out.into_iter().collect()
 }
 
 /// Rescan every brain and rebuild the link graph.
@@ -39,6 +66,7 @@ pub async fn reindex(
     mut progress: impl FnMut(&str),
 ) -> Result<Stats> {
     let mut total = Stats::default();
+    let before = db::brain_fingerprints(pool).await?;
 
     let keep: Vec<String> = brains.iter().map(|b| b.id.clone()).collect();
     let dropped = db::retain_brains(pool, &keep).await?;
@@ -46,9 +74,13 @@ pub async fn reindex(
         progress(&format!("dropped {dropped} brain(s) no longer linked"));
     }
 
+    let mut touched: BTreeSet<String> = BTreeSet::new();
     for brain in brains {
         db::upsert_brain(pool, &brain.id, &brain.name, &brain.root, brain.seed).await?;
         let stats = ingest_brain(pool, brain, force, &mut progress).await?;
+        if stats.changed() {
+            touched.insert(brain.id.clone());
+        }
         total.scanned += stats.scanned;
         total.added += stats.added;
         total.updated += stats.updated;
@@ -58,6 +90,9 @@ pub async fn reindex(
 
     progress("resolving links…");
     total.links = db::rebuild_links(pool).await?;
+
+    let after = db::brain_fingerprints(pool).await?;
+    total.bumped = db::bump_revisions(pool, &brains_to_bump(&before, &after, &touched)).await?;
     Ok(total)
 }
 
@@ -183,25 +218,27 @@ pub async fn ingest_brain(
 
 /// Re-read one file after the watcher saw it change.
 ///
-/// Returns whether anything actually changed, so the caller only bumps the
-/// revision — and only invalidates the layout cache — when it needs to.
-pub async fn ingest_one(pool: &PgPool, brain: &BrainSpec, rel_path: &str) -> Result<bool> {
+/// `None` when nothing actually changed, so the caller only bumps the
+/// revision — and only invalidates the layout cache — when it needs to. `Some`
+/// carries the note's id, which is what the change event names; for a delete
+/// that is the id the note had, which is still what a client needs to forget.
+pub async fn ingest_one(pool: &PgPool, brain: &BrainSpec, rel_path: &str) -> Result<Option<i64>> {
     let path = Path::new(&brain.root).join(rel_path);
     let known = db::existing_notes(pool, &brain.id).await?;
 
     if !path.is_file() {
         if let Some((id, _, _, _)) = known.get(rel_path) {
             db::delete_notes(pool, &[*id]).await?;
-            return Ok(true);
+            return Ok(Some(*id));
         }
-        return Ok(false);
+        return Ok(None);
     }
 
     let text = tokio::fs::read_to_string(&path).await?;
     let parsed = vault::parse(rel_path, &text);
     if let Some((_, hash, _, _)) = known.get(rel_path) {
         if hash.as_slice() == parsed.content_hash.as_slice() {
-            return Ok(false);
+            return Ok(None);
         }
     }
 
@@ -213,6 +250,65 @@ pub async fn ingest_one(pool: &PgPool, brain: &BrainSpec, rel_path: &str) -> Res
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
-    write_note(pool, brain, &parsed, mtime, meta.len() as i64).await?;
-    Ok(true)
+    let id = write_note(pool, brain, &parsed, mtime, meta.len() as i64).await?;
+    Ok(Some(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, i64, i64)]) -> BTreeMap<String, (i64, i64)> {
+        pairs.iter().map(|(id, n, d)| (id.to_string(), (*n, *d))).collect()
+    }
+
+    fn set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_scan_that_changed_nothing_bumps_nothing() {
+        let same = map(&[("a", 10, 4), ("b", 3, 0)]);
+        assert!(brains_to_bump(&same, &same, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn only_the_vault_that_gained_a_note_is_bumped() {
+        let before = map(&[("a", 10, 4), ("b", 3, 0)]);
+        let after = map(&[("a", 11, 4), ("b", 3, 0)]);
+        assert_eq!(brains_to_bump(&before, &after, &BTreeSet::new()), vec!["a"]);
+    }
+
+    #[test]
+    fn an_edit_that_moved_no_counts_still_bumps_its_own_vault() {
+        // Rewriting a note's prose changes neither the count nor the degree,
+        // but the browser is holding the old title and excerpt.
+        let same = map(&[("a", 10, 4), ("b", 3, 0)]);
+        assert_eq!(brains_to_bump(&same, &same, &set(&["b"])), vec!["b"]);
+    }
+
+    #[test]
+    fn a_link_resolving_across_vaults_bumps_both() {
+        // A new [[target]] written in `a` resolved into `b`, so both ends
+        // gained a degree and both galaxies have to be redrawn.
+        let before = map(&[("a", 10, 4), ("b", 3, 0)]);
+        let after = map(&[("a", 10, 5), ("b", 3, 1)]);
+        assert_eq!(brains_to_bump(&before, &after, &set(&["a"])), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_new_vault_is_bumped_and_a_dropped_one_is_not() {
+        let before = map(&[("a", 10, 4), ("gone", 5, 2)]);
+        let after = map(&[("a", 10, 4), ("fresh", 0, 0)]);
+        assert_eq!(brains_to_bump(&before, &after, &BTreeSet::new()), vec!["fresh"]);
+    }
+
+    #[test]
+    fn a_vault_touched_but_since_dropped_is_not_bumped() {
+        // Nothing to update, and naming it would make the UPDATE claim a row
+        // count it did not have.
+        let before = map(&[("a", 10, 4)]);
+        let after = map(&[("a", 10, 4)]);
+        assert!(brains_to_bump(&before, &after, &set(&["gone"])).is_empty());
+    }
 }

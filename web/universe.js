@@ -162,7 +162,7 @@ export function createUniverse(container, cfg) {
 
   function buildBrain(b, bi) {
     const rand = rng(b.seed ?? bi + 1);
-    const R = b.radius ?? 7, offset = allNodes.length, local = [];
+    const R = b.radius ?? 7, offset = allNodes.length;
 
     // The positions are the server's now. Rust derives each one from a hash of
     // (brain_id, rel_path) instead of from an index in a sorted array, which is
@@ -170,65 +170,108 @@ export function createUniverse(container, cfg) {
     // the layout that used to run here could not do, because position *was* the
     // array index. Node i in these buffers is global id offset + i, and that is
     // the same id the server names a note by.
-    const positions = b.positions || [];
-    const sizes = b.sizes || [];
-    const sourceIndex = b.sourceIndex || [];
-    const degrees = b.degrees || [];
-    const names = b.names || [];
-    const noteIds = cfg.noteIds || [];
-    const count = sizes.length || Math.floor(positions.length / 3);
+    //
+    // Reading them happens in a function rather than inline because it happens
+    // twice: once here, and again whenever that vault's revision moves and
+    // `repack` refills these same buffers without rebuilding the galaxy.
+    let local = [], n = 0;
+    let pos = new Float32Array(0), col = new Float32Array(0), siz = new Float32Array(0);
 
-    // Degree still decides which stars earn a label; size arrives computed.
-    // The 96.5th percentile is the hub cut, which keeps labels sparse.
-    const ranked = Array.from(degrees).sort((x, y) => x - y);
-    const pct = p => (ranked.length
-      ? ranked[Math.min(ranked.length - 1, Math.floor(ranked.length * p))] : 0);
-    const hubCut = Math.max(3, pct(0.965));
-    const lastSource = Math.max(0, (b.sources || []).length - 1);
+    function readNodes(src, noteIds) {
+      const positions = src.positions || [];
+      const sizes = src.sizes || [];
+      const sourceIndex = src.sourceIndex || [];
+      const degrees = src.degrees || [];
+      const names = src.names || [];
+      const count = sizes.length || Math.floor(positions.length / 3);
 
-    for (let i = 0; i < count; i++) {
-      const gid = allNodes.length;
-      const deg = degrees[i] || 0;
-      allNodes.push({
-        gid, nid: noteIds[gid] ?? -1, bi, li: i,
-        si: Math.min(sourceIndex[i] || 0, lastSource),
-        pos: new THREE.Vector3(positions[i * 3], positions[i * 3 + 1],
-                               positions[i * 3 + 2]),
-        size: sizes[i] ?? 0.2, hub: deg >= hubCut, deg,
-        name: names[i] || 'Note', mtime: 0,
+      // Degree still decides which stars earn a label; size arrives computed.
+      // The 96.5th percentile is the hub cut, which keeps labels sparse.
+      const ranked = Array.from(degrees).sort((x, y) => x - y);
+      const pct = p => (ranked.length
+        ? ranked[Math.min(ranked.length - 1, Math.floor(ranked.length * p))] : 0);
+      const hubCut = Math.max(3, pct(0.965));
+      const lastSource = Math.max(0, (src.sources || []).length - 1);
+
+      local = [];
+      for (let i = 0; i < count; i++) {
+        const gid = offset + i;
+        const deg = degrees[i] || 0;
+        const node = allNodes[gid] || (allNodes[gid] = { gid, bi, li: i });
+        node.nid = noteIds[gid] ?? -1;
+        node.si = Math.min(sourceIndex[i] || 0, lastSource);
+        node.pos = new THREE.Vector3(positions[i * 3], positions[i * 3 + 1],
+                                     positions[i * 3 + 2]);
+        node.size = sizes[i] ?? 0.2;
+        node.hub = deg >= hubCut;
+        node.deg = deg;
+        node.name = names[i] || 'Note';
+        node.mtime = 0;
+        if (!gadj[gid]) gadj[gid] = [];
+        local.push(node);
+      }
+      n = count;
+
+      if (pos.length !== n * 3) {
+        pos = new Float32Array(n * 3);
+        col = new Float32Array(n * 3);
+        siz = new Float32Array(n);
+      }
+      local.forEach((x, i) => {
+        pos.set([x.pos.x, x.pos.y, x.pos.z], i * 3);
+        const c = new THREE.Color(src.sources[x.si].color);
+        col.set([c.r, c.g, c.b], i * 3);
+        siz[i] = x.size;
       });
-      gadj.push([]);
-      local.push(allNodes[gid]);
     }
 
-    const n = local.length;
-    const edgeSet = new Set();
-    const edges = [];
-    for (const [a, c] of (b.edges || [])) {
-      if (a === c || a < 0 || c < 0 || a >= n || c >= n) continue;
-      const key = a < c ? a * n + c : c * n + a;
-      if (edgeSet.has(key)) continue;
-      edgeSet.add(key);
-      edges.push([a, c]);
-      gadj[offset + a].push(offset + c);
-      gadj[offset + c].push(offset + a);
+    readNodes(b, cfg.noteIds || []);
+
+    // Local edge list, deduplicated. Rebuilt wholesale on a repack: a note
+    // gaining a link changes how many there are, so these cannot be patched.
+    let edges = [], E = 0;
+    let epos = new Float32Array(0), ebase = new Float32Array(0);
+    // Two brightness snapshots per vertex — where the last ease had got to and
+    // where it is heading. The shader mixes between them.
+    let eFrom = new Float32Array(0), eTo = new Float32Array(0);
+    let eFromAttr = null, eToAttr = null;
+
+    function readEdges(src) {
+      const edgeSet = new Set();
+      edges = [];
+      for (const [a, c] of (src.edges || [])) {
+        if (a === c || a < 0 || c < 0 || a >= n || c >= n) continue;
+        const key = a < c ? a * n + c : c * n + a;
+        if (edgeSet.has(key)) continue;
+        edgeSet.add(key);
+        edges.push([a, c]);
+      }
+      E = edges.length;
+      epos = new Float32Array(E * 6);
+      ebase = new Float32Array(E * 6);
+      eFrom = new Float32Array(E * 2).fill(1);
+      eTo = new Float32Array(E * 2).fill(1);
+      edges.forEach(([a, c], i) => {
+        epos.set(pos.subarray(a * 3, a * 3 + 3), i * 6);
+        epos.set(pos.subarray(c * 3, c * 3 + 3), i * 6 + 3);
+        const m = local[a].si === local[c].si ? 0.7 : 0.5;
+        for (let k = 0; k < 3; k++) {
+          ebase[i * 6 + k] = col[a * 3 + k] * m;
+          ebase[i * 6 + 3 + k] = col[c * 3 + k] * m;
+        }
+      });
+      eFromAttr = new THREE.BufferAttribute(eFrom, 1);
+      eToAttr = new THREE.BufferAttribute(eTo, 1);
     }
-    const E = edges.length;
+
+    readEdges(b);
 
     const group = new THREE.Group();
     group.position.fromArray(b.center);
     group.rotation.y = rand() * Math.PI * 2;
     scene.add(group);
 
-    const pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
-    const siz = new Float32Array(n);
     const bri = new Float32Array(n).fill(1), briT = new Float32Array(n).fill(1);
-    local.forEach((x, i) => {
-      pos.set([x.pos.x, x.pos.y, x.pos.z], i * 3);
-      const c = new THREE.Color(b.sources[x.si].color);
-      col.set([c.r, c.g, c.b], i * 3);
-      siz[i] = x.size;
-    });
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -257,41 +300,32 @@ export function createUniverse(container, cfg) {
       blending: THREE.AdditiveBlending, opacity: glowGain,
     })), points);
 
-    const epos = new Float32Array(E * 6), ebase = new Float32Array(E * 6);
-    // Two brightness snapshots per vertex — where the last ease had got to and
-    // where it is heading. The shader mixes between them.
-    const eFrom = new Float32Array(E * 2).fill(1);
-    const eTo = new Float32Array(E * 2).fill(1);
-    edges.forEach(([a, c], i) => {
-      epos.set(pos.subarray(a * 3, a * 3 + 3), i * 6);
-      epos.set(pos.subarray(c * 3, c * 3 + 3), i * 6 + 3);
-      const m = local[a].si === local[c].si ? 0.7 : 0.5;
-      for (let k = 0; k < 3; k++) {
-        ebase[i * 6 + k] = col[a * 3 + k] * m;
-        ebase[i * 6 + 3 + k] = col[c * 3 + k] * m;
-      }
-    });
     const egeo = new THREE.BufferGeometry();
-    egeo.setAttribute('position', new THREE.BufferAttribute(epos, 3));
-    egeo.setAttribute('aBase', new THREE.BufferAttribute(ebase, 3));
-    const eFromAttr = new THREE.BufferAttribute(eFrom, 1);
-    const eToAttr = new THREE.BufferAttribute(eTo, 1);
-    egeo.setAttribute('aFrom', eFromAttr);
-    egeo.setAttribute('aTo', eToAttr);
     // Chords cut through the middle of the shell, so a well-linked vault piles
     // thousands of them into the same few pixels and the core burns out. Thin
     // the lines as their count grows; the structure survives, the smear does not.
-    const linkGain = clamp(Math.sqrt(1200 / Math.max(1, E)), 0.2, 1.0);
     const eMix = { value: 1 };
     const emat = new THREE.ShaderMaterial({
       uniforms: {
         uR: { value: R }, uMix: eMix,
-        uOpacity: { value: opt.linkOpacity * linkGain },
+        uOpacity: { value: opt.linkOpacity },
       },
       vertexShader: EDGE_VERT, fragmentShader: EDGE_FRAG,
       transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
     });
-    emat.userData.gain = linkGain;
+
+    /** Hand the current edge arrays to the GPU. Called again on every repack,
+     *  because a changed link count means new buffers, not new contents. */
+    function uploadEdges() {
+      egeo.setAttribute('position', new THREE.BufferAttribute(epos, 3));
+      egeo.setAttribute('aBase', new THREE.BufferAttribute(ebase, 3));
+      egeo.setAttribute('aFrom', eFromAttr);
+      egeo.setAttribute('aTo', eToAttr);
+      const linkGain = clamp(Math.sqrt(1200 / Math.max(1, E)), 0.2, 1.0);
+      emat.userData.gain = linkGain;
+      emat.uniforms.uOpacity.value = opt.linkOpacity * linkGain;
+    }
+    uploadEdges();
     group.add(new THREE.LineSegments(egeo, emat));
 
     const hgeo = new THREE.BufferGeometry();
@@ -346,20 +380,61 @@ export function createUniverse(container, cfg) {
     };
 
     // One label per ribbon: its most connected note.
-    const labelIds = [];
-    b.sources.forEach((_, si) => {
-      const top = local.filter(x => x.si === si).sort((p, q) => q.deg - p.deg)[0];
-      if (top) labelIds.push(top.gid);
-    });
-    const hubs = local.filter(x => x.hub).map(x => offset + x.li);
+    function pickLabels() {
+      const labelIds = [];
+      b.sources.forEach((_, si) => {
+        const top = local.filter(x => x.si === si).sort((p, q) => q.deg - p.deg)[0];
+        if (top) labelIds.push(top.gid);
+      });
+      const hubs = local.filter(x => x.hub).map(x => offset + x.li);
+      return {
+        labelIds,
+        hubs: hubs.length ? hubs : local.slice(0, 4).map(x => offset + x.li),
+      };
+    }
 
-    return {
+    const handle = {
       cfg: b, bi, R, offset, n, local, edges, E, group, points, pos, col, bri, briT,
       briAttr, epos, ebase, eFrom, eTo, eFromAttr, eToAttr, eMix, eT: 0,
       emat, setHighlight, ripple,
-      ripples, core, coreOpacity: core.material.opacity, labelIds,
-      spin: 0.7 + rand() * 0.6, hubs: hubs.length ? hubs : local.slice(0, 4).map(x => offset + x.li),
+      ripples, core, coreOpacity: core.material.opacity,
+      spin: 0.7 + rand() * 0.6,
+      ...pickLabels(),
+
+      /** Refill this galaxy from a newer payload, in place.
+       *
+       * Only legal when the note count has not moved: the global ids the rest
+       * of this module indexes by are positions in one flat array, so a vault
+       * that gained a note shifts every vault after it. `update` checks that
+       * before calling, and falls back to a rebuild when it cannot hold.
+       *
+       * Nothing about the view is touched — the group keeps its rotation, the
+       * camera its target, the selection its brightness — so an edit lands as
+       * a star changing size rather than the sky blinking.
+       */
+      repack(next, noteIds) {
+        b = next;
+        readNodes(next, noteIds);
+        readEdges(next);
+        uploadEdges();
+        geo.attributes.position.needsUpdate = true;
+        geo.attributes.aColor.needsUpdate = true;
+        geo.attributes.aSize.needsUpdate = true;
+        // Picking raycasts against the cached bounding sphere, which would
+        // otherwise still describe where the notes used to be.
+        geo.computeBoundingSphere();
+        // The ease has nothing to ease from any more; recomputeTargets will
+        // aim it again the moment the caller asks.
+        eFrom.fill(1);
+        eTo.fill(1);
+        setHighlight([]);
+        Object.assign(handle, {
+          cfg: next, local, edges, E, pos, col, epos, ebase, eFrom, eTo,
+          eFromAttr, eToAttr, ...pickLabels(),
+        });
+      },
     };
+    return handle;
   }
 
   cfg.brains.forEach((b, bi) => brains.push(buildBrain(b, bi)));
@@ -380,9 +455,9 @@ export function createUniverse(container, cfg) {
     cross.push([a, c]);
     gadj[a].push(c); gadj[c].push(a);
   }
-  const cpos = new Float32Array(cross.length * 6), ccol = new Float32Array(cross.length * 6);
-  const cbri = new Float32Array(cross.length).fill(1);
-  const cbriT = new Float32Array(cross.length).fill(1);
+  let cpos = new Float32Array(cross.length * 6), ccol = new Float32Array(cross.length * 6);
+  let cbri = new Float32Array(cross.length).fill(1);
+  let cbriT = new Float32Array(cross.length).fill(1);
   const cgeo = new THREE.BufferGeometry();
   cgeo.setAttribute('position', new THREE.BufferAttribute(cpos, 3));
   cgeo.setAttribute('color', new THREE.BufferAttribute(ccol, 3));
@@ -390,6 +465,36 @@ export function createUniverse(container, cfg) {
     vertexColors: true, transparent: true, opacity: 0.18,
     blending: THREE.AdditiveBlending, depthWrite: false,
   })));
+
+  /** Rebuild every adjacency and every arc between galaxies.
+   *
+   * A link is global — resolving one in a vault can attach it to a note in
+   * another — so after a repack there is no safe way to patch a subset. One
+   * pass over the whole edge list is a few milliseconds and cannot go wrong.
+   */
+  function relink(pairs) {
+    for (let i = 0; i < N; i++) gadj[i].length = 0;
+    for (const b of brains) {
+      for (const [a, c] of b.edges) {
+        gadj[b.offset + a].push(b.offset + c);
+        gadj[b.offset + c].push(b.offset + a);
+      }
+    }
+    cross.length = 0;
+    for (const [a, c] of (pairs || [])) {
+      if (a < 0 || c < 0 || a >= N || c >= N) continue;
+      cross.push([a, c]);
+      gadj[a].push(c); gadj[c].push(a);
+    }
+    if (cpos.length !== cross.length * 6) {
+      cpos = new Float32Array(cross.length * 6);
+      ccol = new Float32Array(cross.length * 6);
+      cbri = new Float32Array(cross.length).fill(1);
+      cbriT = new Float32Array(cross.length).fill(1);
+      cgeo.setAttribute('position', new THREE.BufferAttribute(cpos, 3));
+      cgeo.setAttribute('color', new THREE.BufferAttribute(ccol, 3));
+    }
+  }
 
   // ---------- stars
   {
@@ -543,14 +648,15 @@ export function createUniverse(container, cfg) {
   });
   hoverEl.append(hoverName, hoverSub);
 
+  // No cap any more, so the second line is just how many notes the vault holds.
+  const brainLabel = (name, total) =>
+    `<div>${escapeHtml(name)}</div>` +
+    `<div style="font:500 10px 'JetBrains Mono',monospace;letter-spacing:.18em;color:#8fb3c4;margin-top:3px">${total} NOTES</div>`;
   const brainEls = brains.map(b => {
     const d = mkLabel("600 15px Manrope, system-ui, sans-serif");
     d.style.textAlign = 'center';
     d.style.letterSpacing = '-0.01em';
-    // No cap any more, so this is just how many notes the vault holds.
-    const meta = `${b.cfg.total ?? b.n} NOTES`;
-    d.innerHTML = `<div>${escapeHtml(b.cfg.name)}</div>` +
-      `<div style="font:500 10px 'JetBrains Mono',monospace;letter-spacing:.18em;color:#8fb3c4;margin-top:3px">${meta}</div>`;
+    d.innerHTML = brainLabel(b.cfg.name, b.cfg.total ?? b.n);
     return d;
   });
   const agentEls = agents.map(a => {
@@ -942,6 +1048,45 @@ export function createUniverse(container, cfg) {
       id: b.cfg.id, name: b.cfg.name, notes: b.n,
       total: b.cfg.total ?? b.n, links: b.E, color: b.cfg.sources[0]?.color,
     })),
+
+    /** Fold a newer `/api/universe` payload in without rebuilding the scene.
+     *
+     * Returns true when it was applied. False means the change is structural
+     * — a vault added, removed, reordered, or one whose note count moved —
+     * and the caller has to build a fresh universe, because the global ids
+     * everything here indexes by are about to shift.
+     *
+     * The view is deliberately untouched: camera, focus, hover, search
+     * highlight and each galaxy's rotation all survive, so an edit shows up
+     * as one star changing and nothing else moving.
+     */
+    update(next) {
+      const incoming = next?.brains || [];
+      if (incoming.length !== brains.length) return false;
+      const moved = [];
+      for (let i = 0; i < brains.length; i++) {
+        const b = brains[i], nb = incoming[i];
+        const count = nb.sizes?.length ?? Math.floor((nb.positions?.length || 0) / 3);
+        if (nb.id !== b.cfg.id || count !== b.n) return false;
+        if ((nb.revision ?? 0) !== (b.cfg.revision ?? 0)) moved.push(i);
+      }
+      if (!moved.length) return true;
+
+      const noteIds = next.noteIds || [];
+      for (const i of moved) brains[i].repack(incoming[i], noteIds);
+      relink(next.cross);
+
+      nidToGid.clear();
+      for (const nd of allNodes) if (nd.nid >= 0) nidToGid.set(nd.nid, nd.gid);
+      // A renamed note keeps its label element, so the text has to follow it.
+      for (const [gid, d] of labelEls) d.textContent = trim(allNodes[gid].name, 34);
+      for (const i of moved) {
+        const b = brains[i];
+        brainEls[i].innerHTML = brainLabel(b.cfg.name, b.cfg.total ?? b.n);
+      }
+      recomputeTargets();
+      return true;
+    },
 
     /** Light up an explicit set of nodes — used for server-side search results. */
     highlight(gids) {

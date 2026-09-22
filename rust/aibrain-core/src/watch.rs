@@ -9,7 +9,7 @@
 //! the editor writes a temp file, renames it over the original, and touches the
 //! directory. Reacting to each one would reparse the same note several times.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::new_debouncer;
 
 use crate::api::Ctx;
+use crate::events::Change;
 use crate::ingest;
 
 /// How long to wait for a burst of writes to settle before reacting.
@@ -96,31 +97,73 @@ fn run(ctx: Arc<Ctx>, runtime: tokio::runtime::Handle) -> anyhow::Result<()> {
 
         let ctx = ctx.clone();
         runtime.spawn(async move {
-            let mut changed = false;
-            for path in touched {
-                let Some((brain, rel)) = locate(&cfg.brains, &path) else {
-                    continue;
-                };
-                match ingest::ingest_one(&ctx.pool, brain, &rel).await {
-                    Ok(true) => {
-                        tracing::info!("changed {}/{}", brain.name, rel);
-                        changed = true;
-                    }
-                    // A write that did not alter the bytes — an autosave.
-                    Ok(false) => {}
-                    Err(err) => tracing::warn!("could not ingest {rel}: {err:#}"),
-                }
-            }
-            if changed {
-                // Links are global: a new `[[target]]` in one note can resolve
-                // against another vault, so the graph is rebuilt rather than
-                // patched. It is one pass of SQL and cheap enough to do here.
-                if let Err(err) = crate::db::rebuild_links(&ctx.pool).await {
-                    tracing::warn!("link rebuild failed: {err:#}");
-                }
-                ctx.revision.fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = apply(&ctx, &cfg, touched).await {
+                tracing::warn!("watch round failed: {err:#}");
             }
         });
+    }
+    Ok(())
+}
+
+/// Re-read one debounced burst of files and tell anyone listening.
+///
+/// The revision is per brain now, so the events this publishes carry the
+/// number a client can compare against the one it is holding. Note events go
+/// out first and the brain event last, so a UI that only handles the coarse
+/// one still sees the right revision arrive after the notes it explains.
+pub(crate) async fn apply(
+    ctx: &Arc<Ctx>,
+    cfg: &crate::config::Config,
+    touched: HashSet<PathBuf>,
+) -> anyhow::Result<()> {
+    let before = crate::db::brain_fingerprints(&ctx.pool).await?;
+    // brain id -> the notes in it this round rewrote.
+    let mut written: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+
+    for path in touched {
+        let Some((brain, rel)) = locate(&cfg.brains, &path) else {
+            continue;
+        };
+        match ingest::ingest_one(&ctx.pool, brain, &rel).await {
+            Ok(Some(note_id)) => {
+                tracing::info!("changed {}/{}", brain.name, rel);
+                written.entry(brain.id.clone()).or_default().push(note_id);
+            }
+            // A write that did not alter the bytes — an autosave.
+            Ok(None) => {}
+            Err(err) => tracing::warn!("could not ingest {rel}: {err:#}"),
+        }
+    }
+    if written.is_empty() {
+        return Ok(());
+    }
+
+    // Links are global: a new `[[target]]` in one note can resolve against
+    // another vault, so the graph is rebuilt rather than patched. It is one
+    // pass of SQL and cheap enough to do here.
+    crate::db::rebuild_links(&ctx.pool).await?;
+
+    let after = crate::db::brain_fingerprints(&ctx.pool).await?;
+    let mut bumping: BTreeSet<String> = after
+        .iter()
+        .filter(|(id, fingerprint)| before.get(*id) != Some(fingerprint))
+        .map(|(id, _)| id.clone())
+        .collect();
+    bumping.extend(written.keys().filter(|id| after.contains_key(*id)).cloned());
+    let bumped = crate::db::bump_revisions(&ctx.pool, &bumping.into_iter().collect::<Vec<_>>())
+        .await?;
+    ctx.revision.fetch_add(1, Ordering::Relaxed);
+
+    let revision_of: BTreeMap<&str, i64> =
+        bumped.iter().map(|(id, rev)| (id.as_str(), *rev)).collect();
+    for (brain_id, note_ids) in &written {
+        let revision = revision_of.get(brain_id.as_str()).copied().unwrap_or(0);
+        for note_id in note_ids {
+            ctx.events.publish(Change::note(brain_id, revision, *note_id));
+        }
+    }
+    for (brain_id, revision) in &bumped {
+        ctx.events.publish(Change::brain(brain_id, *revision));
     }
     Ok(())
 }

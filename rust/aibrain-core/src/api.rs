@@ -7,27 +7,41 @@
 //! question: give me this note *and* its neighbours *and* its rendered HTML.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::{Stream, StreamExt};
 
 use crate::config::Config;
 use crate::db;
 use crate::es;
+use crate::events::{self, Change};
 use crate::graph;
+
+/// How often a stream with nothing to say reminds the other end it is there.
+/// Long enough to be free, short enough that no reverse proxy's idle timeout
+/// gets there first.
+const PING: Duration = Duration::from_secs(15);
 
 pub struct Ctx {
     pub pool: PgPool,
     pub config_path: std::path::PathBuf,
     /// Bumped whenever ingest changes anything, so clients can poll cheaply.
+    /// Per-brain revisions live in Postgres; this stays a coarse global one.
     pub revision: std::sync::atomic::AtomicI64,
     /// `None` when no cluster is configured; search then answers from Postgres.
     pub es: Option<Arc<es::Es>>,
+    /// Where ingest announces what changed, and `/events` listens.
+    pub events: events::Bus,
 }
 
 impl Ctx {
@@ -65,6 +79,7 @@ pub fn router(ctx: Shared) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/universe", get(universe))
+        .route("/events", get(events))
         .route("/search", get(search))
         .route("/note/:id", get(note))
         .route("/notes/by-path", get(note_by_path))
@@ -110,9 +125,60 @@ async fn status(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>>
     })))
 }
 
-async fn universe(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+/// The whole corpus as packed geometry, or a 304 when nothing moved.
+///
+/// The revisions are read first and hashed into the ETag, so a browser holding
+/// a current copy costs one small query instead of a full layout. What does
+/// get built comes out of `graph_cache` for every brain whose revision has not
+/// moved since it was last packed.
+async fn universe(State(ctx): State<Shared>, headers: HeaderMap) -> ApiResult<Response> {
     let cfg = ctx.config()?;
-    Ok(Json(graph::build(&ctx.pool, &cfg).await?))
+    let revisions = graph::revisions(&ctx.pool, &cfg).await?;
+    let etag = graph::etag(&revisions, &graph::shape_of(&cfg));
+
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| graph::etag_matches(value, &etag));
+    if unchanged {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
+    let payload = graph::build(&ctx.pool, &cfg, &revisions).await?;
+    Ok((
+        [
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        Json(payload),
+    )
+        .into_response())
+}
+
+/// The change feed the browser subscribes to.
+///
+/// A comment goes out immediately so the headers flush and the client knows
+/// the stream is open, and another every fifteen seconds after that. Nothing
+/// here has to notice a disconnect: axum drops the stream, which drops the
+/// receiver, which is the whole cleanup.
+async fn events(
+    State(ctx): State<Shared>,
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    let changes = BroadcastStream::new(ctx.events.subscribe()).filter_map(|received| {
+        let change = match received {
+            Ok(change) => change,
+            // The client fell behind the channel. Saying so is better than
+            // silently dropping events it would never know it missed.
+            Err(BroadcastStreamRecvError::Lagged(missed)) => {
+                tracing::debug!("an /events subscriber missed {missed} change(s)");
+                Change::lagged()
+            }
+        };
+        Event::default().json_data(&change).ok().map(Ok)
+    });
+    let opening = tokio_stream::once(Ok(Event::default().comment(" ping")));
+    Sse::new(opening.chain(changes))
+        .keep_alive(KeepAlive::new().interval(PING).text(" ping"))
 }
 
 #[derive(Deserialize)]
@@ -264,6 +330,9 @@ async fn reindex(
     if stats.changed() {
         ctx.revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    ctx.events.publish_all(
+        stats.bumped.iter().map(|(id, rev)| Change::reindex(id, *rev)),
+    );
     Ok(Json(json!({
         "scanned": stats.scanned,
         "added": stats.added,
@@ -271,5 +340,10 @@ async fn reindex(
         "removed": stats.removed,
         "unchanged": stats.unchanged,
         "links": stats.links,
+        // Which vaults moved, so a caller that is not watching /events still
+        // learns what to invalidate.
+        "bumped": stats.bumped.iter()
+            .map(|(id, rev)| json!({ "brain_id": id, "revision": rev }))
+            .collect::<Vec<_>>(),
     })))
 }

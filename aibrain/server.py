@@ -10,6 +10,7 @@ web/. There is no build step.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import re
@@ -50,6 +51,7 @@ class State:
         self.jobs = JobRunner()
         self.agents = Registry(cfg, self.corpus)
         self._universe: dict | None = None
+        self._etag = ""
         self._note_ids: list[int] = []
         self._gid_of: dict[int, int] = {}
         self._graph_lock = threading.Lock()
@@ -66,22 +68,62 @@ class State:
         """
         with self._graph_lock:
             if self._universe is None or rebuild:
-                payload = dict(self.corpus.universe())
-                self._note_ids = [int(n) for n in payload.get("noteIds", [])]
-                self._gid_of = {nid: gid for gid, nid in enumerate(self._note_ids)}
-                payload["agents"] = self._agent_payload(payload.get("brains", []))
-                payload["options"] = {
-                    "rotationSpeed": self.cfg.view.rotation_speed,
-                    "linkOpacity": self.cfg.view.link_opacity,
-                    "showAllLabels": self.cfg.view.show_all_labels,
-                    "ribbonTwist": self.cfg.view.ribbon_twist,
-                }
-                stats = dict(payload.get("stats", {}))
-                stats["agents"] = len(payload["agents"])
-                payload["stats"] = stats
-                self._fit_camera(payload)
-                self._universe = payload
+                payload, etag = self.corpus.universe_with_etag()
+                self._adopt(payload or {}, etag)
             return self._universe
+
+    def universe_with_etag(self, rebuild: bool = False) -> tuple[dict, str]:
+        """The payload and the tag that identifies it, asking Rust first.
+
+        `universe()` answers from memory because a dozen call sites use it to
+        map a note id to a star. This one always checks, because it answers the
+        browser and the browser is the thing that has to notice an edit. The
+        check is one small query on the Rust side when nothing has moved.
+        """
+        with self._graph_lock:
+            if self._universe is None or rebuild:
+                payload, etag = self.corpus.universe_with_etag()
+                self._adopt(payload or {}, etag)
+            else:
+                payload, etag = self.corpus.universe_with_etag(self._etag)
+                if payload is not None:
+                    self._adopt(payload, etag)
+            return self._universe, self._local_etag()
+
+    def _adopt(self, payload: dict, etag: str) -> None:
+        """Fold a fresh Rust payload into the things only Python knows."""
+        payload = dict(payload)
+        self._note_ids = [int(n) for n in payload.get("noteIds", [])]
+        self._gid_of = {nid: gid for gid, nid in enumerate(self._note_ids)}
+        payload["agents"] = self._agent_payload(payload.get("brains", []))
+        payload["options"] = {
+            "rotationSpeed": self.cfg.view.rotation_speed,
+            "linkOpacity": self.cfg.view.link_opacity,
+            "showAllLabels": self.cfg.view.show_all_labels,
+            "ribbonTwist": self.cfg.view.ribbon_twist,
+        }
+        stats = dict(payload.get("stats", {}))
+        stats["agents"] = len(payload["agents"])
+        payload["stats"] = stats
+        self._fit_camera(payload)
+        self._universe = payload
+        self._etag = etag
+
+    def _local_etag(self) -> str:
+        """Rust's tag, plus what Python added to the payload.
+
+        The agents and the view options are Python's: moving an agent changes
+        what the browser must draw without changing a single note, so the tag
+        the browser holds has to move too.
+        """
+        if not self._etag:
+            return ""
+        mine = json.dumps(
+            [self._universe.get("agents", []), self._universe.get("options", {})],
+            sort_keys=True, default=_jsonable,
+        )
+        salt = hashlib.blake2b(mine.encode("utf-8"), digest_size=6).hexdigest()
+        return '"%s.%s"' % (self._etag.strip('"'), salt)
 
     def _agent_payload(self, brains: list[dict]) -> list[dict]:
         agents = self.cfg.enabled_agents()
@@ -242,6 +284,24 @@ class Handler(BaseHTTPRequestHandler):
     def fail(self, message: str, code: int = 400) -> None:
         self.json({"error": message}, code)
 
+    def not_modified(self, etag: str) -> None:
+        """A 304 carries no body, only the tag that is still good."""
+        self.send_response(304)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def matches_etag(self, etag: str) -> bool:
+        """Does the browser already hold this exact payload?"""
+        header = self.headers.get("If-None-Match") or ""
+        want = etag.removeprefix("W/").strip()
+        return any(
+            candidate.strip() == "*"
+            or candidate.strip().removeprefix("W/").strip() == want
+            for candidate in header.split(",") if candidate.strip()
+        )
+
     def body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
@@ -347,7 +407,31 @@ def build_router(state: State) -> Router:
     # ---- universe --------------------------------------------------------
     def universe(h: Handler) -> None:
         rebuild = h.query().get("rebuild") == "1"
-        h.json(state.universe(rebuild=rebuild))
+        payload, etag = state.universe_with_etag(rebuild=rebuild)
+        # An explicit rebuild is the browser saying "I know it moved", so the
+        # conditional is skipped rather than answered.
+        if etag and not rebuild and h.matches_etag(etag):
+            h.not_modified(etag)
+            return
+        body = json.dumps(payload, default=_jsonable).encode("utf-8")
+        extra = {"ETag": etag} if etag else None
+        h._send(200, body, "application/json; charset=utf-8", extra)
+
+    def events(h: Handler) -> None:
+        """The Rust change feed, forwarded frame by frame.
+
+        Nothing is collected on the way through: `sse()` writes and flushes
+        each event as the generator produces it, and a browser that closes the
+        tab breaks the pipe, which ends the generator, which closes the socket
+        to Rust.
+        """
+        def proxied() -> Iterator[dict]:
+            try:
+                yield from state.corpus.stream_events()
+            except CorpusError as exc:
+                yield {"type": "error", "text": str(exc)}
+
+        h.sse(proxied())
 
     def status(h: Handler) -> None:
         core = state.corpus.status()
@@ -757,6 +841,7 @@ def build_router(state: State) -> Router:
 
     # ---- routes ----------------------------------------------------------
     router.get("/api/universe", universe)
+    router.get("/api/events", events)
     router.get("/api/status", status)
     router.get("/api/search", search)
     router.get("/api/recent", recent)
