@@ -452,7 +452,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.host_is_local():
             self.fail("this server only answers on localhost", 403)
             return
-        if not self.origin_is_same():
+        # Reads are safe: a cross-site page cannot see the response without
+        # CORS headers, and a GET is how a bookmark, a link from anywhere, or
+        # the browser's own address bar reaches the page. Only a request that
+        # changes state or starts work has to come from the page itself.
+        if method not in ("GET", "HEAD") and not self.origin_is_same():
             self.fail("cross-origin requests are not accepted", 403)
             return
         path = urllib.parse.urlparse(self.path).path

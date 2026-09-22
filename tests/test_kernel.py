@@ -454,8 +454,12 @@ class ServerTests(unittest.TestCase):
         for headers in blocked:
             code, _ = self.raw("POST", "/api/view", headers, {"linkOpacity": 0.9})
             self.assertEqual(code, 403, headers)
+            # A read is not a CSRF vector, and a navigation from a link on
+            # any site is exactly how someone opens the app.
             code, _ = self.raw("GET", "/api/status", headers)
-            self.assertEqual(code, 403, headers)
+            self.assertEqual(code, 200, headers)
+            code, _ = self.raw("GET", "/", headers)
+            self.assertEqual(code, 200, headers)
         # The page itself, and a non-browser client, both get through.
         for headers in ({"Origin": f"http://{host}", "Sec-Fetch-Site": "same-origin"},
                         {"Sec-Fetch-Site": "none"},
