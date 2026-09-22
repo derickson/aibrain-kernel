@@ -55,6 +55,10 @@ class BrainConfig:
     center: list[float] | None = None
     radius: float | None = None
     seed: int | None = None
+    # "" means unset: reconcile_brains() backfills it from SOURCE_COLORS the
+    # first time this brain is seen, same as an agent's color is picked once
+    # at creation rather than recomputed on every read.
+    color: str = ""
     exclude: list[str] = field(
         default_factory=lambda: [".obsidian", ".trash", ".git", "ZZ-Attachments",
                                  "ZZ-Attachements", "assets", "scans", "Excalidraw"]
@@ -297,17 +301,22 @@ def reconcile_brains(cfg: "Config") -> bool:
     """
     linked = discover_vaults()
     by_id: dict[str, BrainConfig] = {}
+    backfilled = False
     for i, path in enumerate(linked):
         bid = slugify(path.name)
         prior = cfg.brain(bid)
         if prior is not None:
             prior.path = str(path)
+            if not prior.color:
+                prior.color = SOURCE_COLORS[i % len(SOURCE_COLORS)]
+                backfilled = True
             by_id[bid] = prior
         else:
             by_id[bid] = BrainConfig(
-                id=bid, name=path.name, path=str(path), seed=7 + i * 13)
+                id=bid, name=path.name, path=str(path), seed=7 + i * 13,
+                color=SOURCE_COLORS[i % len(SOURCE_COLORS)])
 
-    changed = [b.id for b in cfg.brains] != list(by_id)
+    changed = backfilled or [b.id for b in cfg.brains] != list(by_id)
     if not changed:
         changed = any(cfg.brain(b).path != by_id[b].path for b in by_id)
     cfg.brains = list(by_id.values())

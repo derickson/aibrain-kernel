@@ -99,6 +99,7 @@ async fn setup() -> Option<Harness> {
         root: dir.to_string_lossy().into_owned(),
         seed: 3,
         excludes: vec![],
+        color: "#4db3f0".into(),
     };
 
     // A dedicated test database, so starting from a clean queue is fair game

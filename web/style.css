@@ -538,6 +538,17 @@ button { cursor: pointer; background: none; border: none; }
 .card-head { display: flex; align-items: center; gap: 10px; }
 .card-head .pip { width: 9px; height: 9px; border-radius: 50%; flex: none; box-shadow: 0 0 10px currentColor; }
 .card-head .nm { font: 700 14px Manrope, system-ui, sans-serif; flex: 1; min-width: 0; }
+
+/* A native color input, styled down to a plain round swatch — it doubles as
+   the brain's color indicator and the control that changes it. */
+.card-head .color-pick {
+  width: 18px; height: 18px; flex: none; padding: 0; border: none;
+  border-radius: 50%; background: none; cursor: pointer; appearance: none;
+  -webkit-appearance: none;
+}
+.card-head .color-pick::-webkit-color-swatch-wrapper { padding: 0; border-radius: 50%; }
+.card-head .color-pick::-webkit-color-swatch { border: 1px solid var(--line-mid); border-radius: 50%; }
+.card-head .color-pick::-moz-color-swatch { border: 1px solid var(--line-mid); border-radius: 50%; }
 .card-head .badge {
   font: 500 9px 'JetBrains Mono', monospace; letter-spacing: .14em;
   color: var(--fg-faint); border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px;

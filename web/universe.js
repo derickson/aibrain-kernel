@@ -373,7 +373,7 @@ export function createUniverse(container, cfg) {
     const coreShape = new THREE.Mesh(
       new THREE.IcosahedronGeometry(R * 0.3, 0),
       new THREE.MeshBasicMaterial({
-        color: b.sources?.[0]?.color || '#7fd8e8',
+        color: b.color || '#7fd8e8',
         wireframe: true, transparent: true, opacity: 0.6, depthWrite: false,
       })
     );

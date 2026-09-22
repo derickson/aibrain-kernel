@@ -222,6 +222,7 @@ mod tests {
             root: vault.to_string_lossy().into_owned(),
             seed: 1,
             excludes: vec![],
+            color: "#4db3f0".into(),
         }];
 
         let inside = std::fs::canonicalize(&vault).unwrap().join("Notes/A.md");

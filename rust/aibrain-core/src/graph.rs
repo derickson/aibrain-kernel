@@ -48,9 +48,10 @@ pub fn signature(spec: &BrainSpec, ribbon_twist: f64) -> String {
 
 /// The ETag for a universe: a hash of every `(brain_id, revision)` pair.
 ///
-/// `shape` folds in the things that are not per-brain — the corpus title and
-/// the ribbon twist — because a payload that changed for one of those reasons
-/// must not answer 304 to a browser holding the old one.
+/// `shape` folds in everything a payload can change by that is *not* a note
+/// revision — the corpus title, the ribbon twist, and each brain's color —
+/// because a payload that changed for one of those reasons must not answer
+/// 304 to a browser holding the old one.
 pub fn etag(revisions: &[(String, i64)], shape: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(shape.as_bytes());
@@ -95,9 +96,17 @@ pub async fn revisions(pool: &PgPool, cfg: &Config) -> Result<Vec<(String, i64)>
         .collect())
 }
 
-/// The corpus-wide half of the ETag input.
+/// The corpus-wide half of the ETag input, plus every brain's color — a
+/// color edit does not touch a note's revision, so without this a browser
+/// holding a cached payload would never learn about it.
 pub fn shape_of(cfg: &Config) -> String {
-    format!("{}|{:.6}", cfg.title, cfg.ribbon_twist)
+    let colors: String = cfg
+        .brains
+        .iter()
+        .map(|b| format!("{}={}", b.id, b.color))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}|{:.6}|{colors}", cfg.title, cfg.ribbon_twist)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +379,7 @@ pub async fn build(pool: &PgPool, cfg: &Config, revisions: &[(String, i64)]) -> 
         brains_out.push(json!({
             "id": spec.id,
             "name": spec.name,
+            "color": spec.color,
             "center": slots[index],
             "radius": meta.radius,
             "seed": spec.seed,
@@ -428,6 +438,7 @@ mod tests {
             root: format!("/vaults/{id}"),
             seed,
             excludes: vec![],
+            color: "#4db3f0".into(),
         }
     }
 
@@ -467,6 +478,21 @@ mod tests {
     fn the_shape_is_part_of_the_tag() {
         let pairs = vec![("a".to_string(), 1)];
         assert_ne!(etag(&pairs, "Title|0.250000"), etag(&pairs, "Title|0.400000"));
+    }
+
+    #[test]
+    fn a_brain_color_change_is_part_of_the_shape() {
+        // A color edit never touches a note, so revisions alone would not
+        // catch it — a client holding the old ETag would 304 forever.
+        let mut cfg = Config {
+            brains: vec![spec("a", "A", 1)],
+            ribbon_twist: 0.25,
+            title: "t".into(),
+            todo_day_start_hour: 4,
+        };
+        let before = shape_of(&cfg);
+        cfg.brains[0].color = "#000000".into();
+        assert_ne!(before, shape_of(&cfg));
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub struct BrainSpec {
     pub root: String,
     pub seed: i32,
     pub excludes: Vec<String>,
+    /// The UI owns assigning this (see `reconcile_brains` in aibrain/config.py);
+    /// the fallback below only covers a config Python has not touched yet.
+    pub color: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +30,8 @@ struct RawBrain {
     seed: Option<i32>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    color: Option<String>,
 }
 
 fn yes() -> bool {
@@ -97,6 +102,9 @@ pub fn load(path: &Path) -> Result<Config> {
         .enumerate()
         .map(|(i, b)| BrainSpec {
             seed: b.seed.unwrap_or(7 + i as i32 * 13),
+            color: b.color.filter(|c| !c.is_empty()).unwrap_or_else(|| {
+                crate::layout::SOURCE_COLORS[i % crate::layout::SOURCE_COLORS.len()].to_string()
+            }),
             id: b.id,
             name: b.name,
             root: expand(&b.path),
@@ -168,6 +176,33 @@ mod tests {
         )
         .unwrap();
         assert!(load(&path).unwrap().brains.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_color_falls_back_to_the_palette_but_an_explicit_one_wins() {
+        let dir = std::env::temp_dir().join(format!("aibrain-cfg5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("A");
+        let b = dir.join("B");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            format!(
+                r##"{{"brains":[
+                     {{"id":"a","name":"A","path":"{}"}},
+                     {{"id":"b","name":"B","path":"{}","color":"#123456"}}
+                   ]}}"##,
+                a.to_string_lossy(),
+                b.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.brains[0].color, crate::layout::SOURCE_COLORS[0]);
+        assert_eq!(cfg.brains[1].color, "#123456");
         std::fs::remove_dir_all(&dir).ok();
     }
 

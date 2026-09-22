@@ -925,11 +925,18 @@ def build_router(state: State) -> Router:
         if brain is None:
             h.fail("unknown brain", 404)
             return
-        for key in ("name", "enabled"):
+        if "color" in payload and not _is_hex_color(payload["color"]):
+            # Ends up inside a `style="…"` on the chip and the universe
+            # wireframe; anything but a hex colour belongs somewhere else.
+            raise BadRequest("color must be a hex value like #4db3f0")
+        for key in ("name", "enabled", "color"):
             if key in payload:
                 setattr(brain, key, payload[key])
         state.cfg.save()
-        h.json({"ok": True, "needsReindex": True})
+        # A colour-only change is cosmetic — the universe already has every
+        # note placed, so there is nothing for a rescan to fix.
+        needs_reindex = any(k in payload for k in ("name", "enabled"))
+        h.json({"ok": True, "needsReindex": needs_reindex})
 
     def add_brain(h: Handler) -> None:
         """Link a vault into `obsidian_vaults/`, which is what makes it a brain."""

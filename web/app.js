@@ -303,7 +303,7 @@ function renderChips() {
   chips.innerHTML = '';
   for (const brain of (S.data?.brains || [])) {
     const on = S.brainFocus === brain.id;
-    const color = brain.sources?.[0]?.color || 'var(--accent)';
+    const color = brain.color || 'var(--accent)';
     chips.append(el('button', {
       class: 'chip',
       'aria-pressed': on ? 'true' : 'false',
@@ -471,7 +471,7 @@ function noteRow(item, onClick) {
 
 function colorForBrain(brainId) {
   const brain = S.data?.brains.find(b => b.id === brainId);
-  return brain?.sources?.[0]?.color || '#7fd8e8';
+  return brain?.color || '#7fd8e8';
 }
 
 const runSearch = debounce(async text => {
@@ -843,9 +843,20 @@ function renderBrainsPanel() {
   for (const brain of (S.status?.brains || [])) {
     const card = el('div', { class: 'card' },
       el('div', { class: 'card-head' },
-        el('span', {
-          class: 'pip',
-          style: `background:${colorForBrain(brain.id)};color:${colorForBrain(brain.id)}`,
+        el('input', {
+          type: 'color', class: 'color-pick', title: 'Brain color',
+          value: colorForBrain(brain.id),
+          onchange: async event => {
+            try {
+              await api(`/api/brain/${brain.id}`, {
+                method: 'POST', body: { color: event.target.value },
+              });
+              // Cosmetic only — no rescan needed, just a fresh universe read
+              // so the chip and the wireframe core pick up the new color.
+              await loadUniverse(true);
+              renderDrawer();
+            } catch (err) { toast(String(err.message || err), true); }
+          },
         }),
         el('span', { class: 'nm' }, brain.name),
         el('span', { class: 'badge' }, `${brain.notes.toLocaleString()} NOTES`)),
