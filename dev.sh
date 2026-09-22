@@ -45,12 +45,26 @@ echo "==> aibrain-core"
 cargo run --manifest-path rust/Cargo.toml -- serve --watch &
 pids+=($!)
 
-# The Python server refuses to start until /health answers, so give the Rust
-# side a moment rather than racing it into a failure message.
-sleep 2
+# The Python server refuses to start until /health answers. On a first-time
+# build cargo must compile everything — poll instead of sleeping a fixed amount.
+echo -n "    waiting for aibrain-core"
+for _ in $(seq 1 180); do
+  if curl -sf http://127.0.0.1:8781/health >/dev/null 2>&1; then
+    echo " — ready"
+    break
+  fi
+  echo -n "."
+  sleep 2
+done
 
 echo "==> aibrain (ui)"
 python3 -m aibrain "$@" &
 pids+=($!)
 
-wait -n
+# wait -n requires bash 4.3+; macOS ships bash 3.2. Poll instead.
+while true; do
+  for pid in "${pids[@]}"; do
+    kill -0 "$pid" 2>/dev/null || exit 0
+  done
+  sleep 2
+done

@@ -79,6 +79,7 @@ const S = {
   note: null,
   noteFrom: null,
   results: [],
+  searchMeta: null,    // {engine, ms} for the last /api/search response
   query: '',
   brainFocus: null,
   hover: null,
@@ -477,6 +478,7 @@ function colorForBrain(brainId) {
 const runSearch = debounce(async text => {
   if (!text.trim()) {
     S.results = [];
+    S.searchMeta = null;
     S.universe?.highlight(null);
     renderResults();
     return;
@@ -485,9 +487,11 @@ const runSearch = debounce(async text => {
     // Focusing a brain scopes the search to it, so the results and the lit
     // stars agree about which galaxy you are looking at.
     const scope = S.brainFocus ? `&brains=${encodeURIComponent(S.brainFocus)}` : '';
+    const started = performance.now();
     const data = await api(`/api/search?q=${encodeURIComponent(text)}&limit=80${scope}`);
     if (data.query !== $('#query').value) return;   // a newer keystroke won
     S.results = data.results;
+    S.searchMeta = { engine: data.engine || '', ms: Math.round(performance.now() - started) };
     S.universe?.highlight(data.results.map(r => r.gid).filter(g => g != null));
     renderResults();
   } catch (err) {
@@ -508,6 +512,14 @@ function renderResults() {
   $('#results-label').textContent = any
     ? `${S.results.length} RESULT${S.results.length === 1 ? '' : 'S'} FOR “${S.query.toUpperCase()}”${scope}`
     : `NOTHING MATCHES “${S.query.toUpperCase()}”${scope}`;
+  const meta = $('#results-meta');
+  if (S.searchMeta?.engine) {
+    meta.hidden = false;
+    meta.dataset.engine = S.searchMeta.engine;
+    meta.innerHTML = `<span class="engine">${esc(S.searchMeta.engine.toUpperCase())}</span> · ${S.searchMeta.ms}ms`;
+  } else {
+    meta.hidden = true;
+  }
   const list = $('#results');
   list.innerHTML = '';
   for (const item of S.results) {
@@ -819,7 +831,8 @@ async function renderDrawer() {
   if ($('#drawer').hidden) return;
   try { await refreshStatus(); } catch { /* render what we have */ }
   ({ brains: renderBrainsPanel, agents: renderAgentsPanel,
-     tools: renderToolsPanel, view: renderViewPanel }[S.drawerTab])();
+     tools: renderToolsPanel, meetings: renderMeetingsPanel,
+     view: renderViewPanel }[S.drawerTab])();
 }
 
 function renderBrainsPanel() {
@@ -883,7 +896,42 @@ function renderBrainsPanel() {
             toast(`${brain.name} removed`);
             renderDrawer();
           },
-        }, 'Remove'))
+        }, 'Remove')),
+      // Starts off for every brain — only one vault may catch raw_transcripts/
+      // at a time, so turning this on for one turns it off for the others.
+      el('div', { class: 'card-actions' },
+        el('label', { class: 'switch' },
+          el('input', {
+            type: 'checkbox', ...(brain.meetingTarget ? { checked: true } : {}),
+            onchange: async event => {
+              try {
+                await api(`/api/brain/${brain.id}`, {
+                  method: 'POST', body: { meetingTarget: event.target.checked },
+                });
+                toast(event.target.checked
+                  ? `${brain.name} is now the meeting recording target`
+                  : `${brain.name} is no longer the meeting recording target`);
+                renderDrawer();
+              } catch (err) { toast(String(err.message || err), true); }
+            },
+          }),
+          el('span', {}, 'Meeting recording target'))),
+      brain.meetingTarget ? el('div', { class: 'field' },
+        el('label', {}, 'RAW TRANSCRIPTS FOLDER'),
+        el('input', {
+          type: 'text', value: brain.meetingFolder || 'Meetings', placeholder: 'Meetings',
+          onchange: async event => {
+            const value = event.target.value.trim() || 'Meetings';
+            event.target.value = value;
+            try {
+              await api(`/api/brain/${brain.id}`, {
+                method: 'POST', body: { meetingFolder: value },
+              });
+              toast(`Meeting transcripts will land in ${brain.name}/${value}`);
+            } catch (err) { toast(String(err.message || err), true); }
+          },
+        }),
+        el('div', { class: 'hint' }, 'Path inside this vault, relative to its root.')) : null
     );
     panel.append(card);
   }
@@ -1142,6 +1190,116 @@ function renderToolsPanel() {
   }
 }
 
+function renderMeetingsPanel() {
+  const panel = $('#panel-meetings');
+  panel.innerHTML = '';
+
+  const target = (S.status?.brains || []).find(b => b.meetingTarget);
+  if (!target) {
+    panel.append(el('p', { class: 'muted' },
+      'No brain is set as the meeting recording target. Open the Brains tab ' +
+      'and turn on “Meeting recording target” for one vault.'));
+    return;
+  }
+
+  panel.append(el('p', { class: 'muted' },
+    `Raw transcripts land in raw_transcripts/, staged to absorb into ` +
+    `${target.name} → ${target.meetingFolder || 'Meetings'}. Pull, review, ` +
+    `then choose what to copy in — nothing moves until you import.`));
+
+  const script = (S.status?.scripts || []).find(s => s.id === 'macwhisper');
+  const pullConsole = el('div', { class: 'console' }, 'not run yet');
+  const card = el('div', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('span', { class: 'pip', style: 'background:#f2952d;color:#f2952d' }),
+      el('span', { class: 'nm' }, 'MacWhisper import')));
+
+  const preview = el('div', {});
+  const importConsole = el('div', { class: 'console', hidden: true });
+  const importButton = el('button', {
+    class: 'btn primary', disabled: true,
+    onclick: async () => {
+      const files = [...preview.querySelectorAll('input[type=checkbox]:checked')]
+        .map(cb => cb.dataset.name);
+      if (!files.length) return;
+      if (!confirm(
+        `Copy ${files.length} file${files.length === 1 ? '' : 's'} into ` +
+        `${target.name} → ${target.meetingFolder || 'Meetings'}? Files with ` +
+        `the same name already there will be overwritten.`
+      )) return;
+      importButton.disabled = true;
+      importConsole.hidden = false;
+      try {
+        const { job } = await api('/api/meetings/import', { method: 'POST', body: { files } });
+        attachConsole(importConsole, job.id, () => {
+          loadMeetingPreview(preview, importButton);
+        });
+      } catch (err) {
+        toast(String(err.message || err), true);
+        importButton.disabled = false;
+      }
+    },
+  }, 'Import selected');
+
+  if (script) {
+    const running = (S.status?.jobs || []).find(j => j.name === script.name && j.status === 'running');
+    const runButton = el('button', {
+      class: 'btn primary',
+      onclick: async () => {
+        if (!confirm('Pulling transcripts will quit MacWhisper (it relaunches automatically when done). Continue?')) return;
+        runButton.disabled = true;
+        try {
+          const { job } = await api(`/api/script/${script.id}/run`, { method: 'POST', body: { options: [] } });
+          attachConsole(pullConsole, job.id, () => { runButton.disabled = false; loadMeetingPreview(preview, importButton); });
+        } catch (err) {
+          toast(String(err.message || err), true);
+          runButton.disabled = false;
+        }
+      },
+    }, running ? 'Running…' : 'Pull from MacWhisper');
+    if (running) {
+      runButton.disabled = true;
+      attachConsole(pullConsole, running.id, () => {
+        runButton.disabled = false;
+        runButton.textContent = 'Pull from MacWhisper';
+        loadMeetingPreview(preview, importButton);
+      });
+    }
+    card.append(el('div', { class: 'card-actions' }, runButton), pullConsole);
+  }
+
+  card.append(
+    el('div', { class: 'label mono', style: 'margin-top:4px' }, 'PREVIEW — SELECT WHAT TO IMPORT'),
+    preview,
+    el('div', { class: 'card-actions' }, importButton),
+    importConsole);
+  panel.append(card);
+  loadMeetingPreview(preview, importButton);
+}
+
+async function loadMeetingPreview(node, importButton) {
+  node.innerHTML = '';
+  try {
+    const { files } = await api('/api/meetings/preview');
+    if (!files.length) {
+      node.append(el('div', { class: 'muted' }, 'raw_transcripts/ is empty — nothing staged.'));
+      if (importButton) importButton.disabled = true;
+      return;
+    }
+    for (const file of files) {
+      node.append(el('label', { class: 'file-row' },
+        el('span', { style: 'display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden' },
+          el('input', { type: 'checkbox', checked: true, 'data-name': file.name }),
+          el('span', { style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, file.name)),
+        el('span', { class: `badge ${file.status}` }, file.status.toUpperCase())));
+    }
+    if (importButton) importButton.disabled = false;
+  } catch (err) {
+    node.append(el('div', { class: 'muted' }, String(err.message || err)));
+    if (importButton) importButton.disabled = true;
+  }
+}
+
 function attachConsole(node, jobId, onDone) {
   node.textContent = '';
   const existing = S.jobStreams.get(jobId);
@@ -1265,13 +1423,41 @@ function wireStaticHandlers() {
 
   $('#open-search').onclick = openSearch;
   $('#right-close').onclick = closeRight;
-  $('#reset-view').onclick = () => {
+  $('#reset-view').onclick = async () => {
     S.brainFocus = null;
     S.statusText = null;
-    S.universe?.resetView();
     renderChips();
     renderStatus();
+    try {
+      // Snap any dragged agents back to their default slots too — a rebuild
+      // if something actually moved, a cheap camera reset otherwise.
+      const { changed } = await api('/api/agents/reset-positions', { method: 'POST' });
+      if (changed) await loadUniverse(true);
+      else S.universe?.resetView();
+    } catch (err) {
+      S.universe?.resetView();
+      toast(String(err.message || err), true);
+    }
     if (S.query.trim()) runSearch(S.query);
+  };
+  $('#import-meetings').onclick = async () => {
+    try { await refreshStatus(); } catch (err) { toast(String(err.message || err), true); return; }
+    const target = (S.status.brains || []).find(b => b.meetingTarget);
+    if (!target) {
+      toast('Set a brain as the meeting recording target first (Brains tab).', true);
+      openDrawer('brains');
+      return;
+    }
+    const script = (S.status.scripts || []).find(s => s.id === 'macwhisper');
+    if (!script) {
+      toast('The macwhisper script is not configured.', true);
+      return;
+    }
+    if (!confirm('Pulling meeting transcripts will quit MacWhisper (it relaunches automatically when done). Continue?')) return;
+    try {
+      await api(`/api/script/${script.id}/run`, { method: 'POST', body: { options: [] } });
+      openDrawer('meetings');
+    } catch (err) { toast(String(err.message || err), true); }
   };
   wireShelf();              // the day's list — see the section at the bottom
   $('#open-menu').onclick = () => openDrawer();

@@ -119,6 +119,14 @@ button { cursor: pointer; background: none; border: none; }
 
 .label { font-size: 10px; letter-spacing: .18em; color: var(--fg-mute); }
 
+.results-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+}
+.results-head #results-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#results-meta { flex: none; letter-spacing: .1em; }
+#results-meta .engine { color: var(--fg-mono); }
+#results-meta[data-engine="elasticsearch"] .engine { color: var(--accent); }
+
 /* ───────────────────────────── chat (left) ────────────────────────────── */
 
 .chat-head {
@@ -272,21 +280,22 @@ button { cursor: pointer; background: none; border: none; }
 
 .topbar {
   position: absolute; top: 0; left: 0; right: 0;
-  /* Equal 1fr flanks put the middle column at the true center of the bar,
-     regardless of how wide the brand or the right-hand controls are. */
-  display: grid; grid-template-columns: 1fr minmax(0, auto) 1fr; align-items: center;
+  display: flex; align-items: center; justify-content: space-between;
   gap: 16px;
   padding: 16px 20px; pointer-events: none;
   background: linear-gradient(180deg, rgba(4, 6, 11, .85), transparent);
 }
 .topbar > * { pointer-events: auto; }
-.brand { display: flex; align-items: center; gap: 10px; justify-self: start; }
+.brand { display: flex; align-items: center; gap: 10px; }
 .brand-dot { width: 10px; height: 10px; background: var(--accent); }
 .brand-name { font-size: 14px; font-weight: 700; letter-spacing: -.01em; }
 
+/* Brains sit low in the universe, so their quick selector lives low too,
+   centered above the hints and the status line rather than beside them. */
 .chips {
+  position: absolute; left: 50%; bottom: 56px; transform: translateX(-50%);
   display: flex; gap: 6px; overflow-x: auto; padding: 2px;
-  justify-self: center; max-width: 100%;
+  max-width: calc(100% - 40px);
 }
 .chips::-webkit-scrollbar { height: 0; }
 .chip {
@@ -340,10 +349,10 @@ button { cursor: pointer; background: none; border: none; }
 }
 
 /* The agent rail: a fallback way in, for when a star is off screen or behind a
-   galaxy. It sits above the hints and the status line rather than beside them,
-   because either can be long enough to meet it in the middle. */
+   galaxy. Agents sit high in the universe, so their quick selector lives high
+   too, centered just under the topbar rather than beside it. */
 .agent-rail {
-  position: absolute; left: 50%; bottom: 56px; transform: translateX(-50%);
+  position: absolute; left: 50%; top: 70px; transform: translateX(-50%);
   display: flex; gap: 8px; max-width: calc(100% - 40px);
   overflow-x: auto; padding: 2px;
 }
@@ -549,9 +558,10 @@ button { cursor: pointer; background: none; border: none; }
 .card-head .color-pick::-webkit-color-swatch-wrapper { padding: 0; border-radius: 50%; }
 .card-head .color-pick::-webkit-color-swatch { border: 1px solid var(--line-mid); border-radius: 50%; }
 .card-head .color-pick::-moz-color-swatch { border: 1px solid var(--line-mid); border-radius: 50%; }
-.card-head .badge {
+.badge {
   font: 500 9px 'JetBrains Mono', monospace; letter-spacing: .14em;
   color: var(--fg-faint); border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px;
+  flex: none;
 }
 .card .path {
   font: 400 11px 'JetBrains Mono', monospace; letter-spacing: 0;
@@ -615,6 +625,15 @@ button { cursor: pointer; background: none; border: none; }
 }
 .console .err { color: #ff8a80; }
 .console .ok { color: #7ee0b8; }
+
+.file-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 5px 0; border-bottom: 1px solid var(--line);
+  font: 400 12px 'JetBrains Mono', monospace; color: var(--fg-dim);
+}
+.file-row:last-child { border-bottom: none; }
+.badge.new { color: #7ee0b8; border-color: rgba(62, 207, 154, .35); }
+.badge.overwrite { color: #ff9b8f; border-color: rgba(255, 122, 89, .35); }
 .section-title {
   font: 500 10px 'JetBrains Mono', monospace; letter-spacing: .18em;
   color: var(--fg-mute); margin-top: 6px;

@@ -15,6 +15,7 @@ import json
 import math
 import mimetypes
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -25,13 +26,16 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .agents import Registry
-from .config import (AGENT_COLORS, VAULT_LINK_DIR, Config, ScriptConfig,
-                     AgentConfig, BrainConfig, discover_vaults, link_problems,
-                     reconcile_brains, slugify)
+from .config import (AGENT_COLORS, REPO_ROOT, VAULT_LINK_DIR, Config,
+                     ScriptConfig, AgentConfig, BrainConfig, discover_vaults,
+                     link_problems, reconcile_brains, slugify)
 from .corpus import Corpus, CorpusError
 from .jobs import JobRunner
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+# Where scripts/macwhisper/macwhisper_export.py stages raw transcripts —
+# see that script's DEFAULT_OUT for the source of truth.
+RAW_TRANSCRIPTS_DIR = REPO_ROOT / "raw_transcripts"
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("font/woff2", ".woff2")
@@ -450,6 +454,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         if not self.host_is_local():
+            self.close_connection = True
             self.fail("this server only answers on localhost", 403)
             return
         # Reads are safe: a cross-site page cannot see the response without
@@ -457,6 +462,7 @@ class Handler(BaseHTTPRequestHandler):
         # the browser's own address bar reaches the page. Only a request that
         # changes state or starts work has to come from the page itself.
         if method not in ("GET", "HEAD") and not self.origin_is_same():
+            self.close_connection = True
             self.fail("cross-origin requests are not accepted", 403)
             return
         path = urllib.parse.urlparse(self.path).path
@@ -481,6 +487,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET":
             self._static(path)
             return
+        # A POST/PATCH with no matching route may still have a body sitting
+        # unread on the socket — every branch above this point that responds
+        # without calling h.body() has to close rather than keep the
+        # connection alive, or those bytes get parsed as the start of the
+        # next request line and corrupt it too (garbled "Bad request syntax"
+        # errors on whatever request happens to reuse the connection next).
+        self.close_connection = True
         self.fail("not found", 404)
 
     def _static(self, path: str) -> None:
@@ -607,6 +620,7 @@ def build_router(state: State) -> Router:
                     "notes": rows.get(b.id, {}).get("note_count", 0),
                     # What the layout cache and the change feed both key off.
                     "revision": rows.get(b.id, {}).get("revision", 0),
+                    "meetingTarget": b.meeting_target, "meetingFolder": b.meeting_folder,
                 }
                 for b in state.cfg.brains
             ],
@@ -929,9 +943,20 @@ def build_router(state: State) -> Router:
             # Ends up inside a `style="…"` on the chip and the universe
             # wireframe; anything but a hex colour belongs somewhere else.
             raise BadRequest("color must be a hex value like #4db3f0")
+        if "meetingFolder" in payload and not str(payload["meetingFolder"]).strip():
+            raise BadRequest("meetingFolder must not be empty")
         for key in ("name", "enabled", "color"):
             if key in payload:
                 setattr(brain, key, payload[key])
+        if "meetingFolder" in payload:
+            brain.meeting_folder = str(payload["meetingFolder"]).strip()
+        if "meetingTarget" in payload:
+            brain.meeting_target = bool(payload["meetingTarget"])
+            if brain.meeting_target:
+                # Only one vault can catch raw_transcripts/ at a time.
+                for other in state.cfg.brains:
+                    if other.id != brain.id:
+                        other.meeting_target = False
         state.cfg.save()
         # A colour-only change is cosmetic — the universe already has every
         # note placed, so there is nothing for a rescan to fix.
@@ -1019,6 +1044,83 @@ def build_router(state: State) -> Router:
             "problems": [{"name": n, "reason": r} for n, r in link_problems()],
         })
 
+    def meeting_preview(h: Handler) -> None:
+        """What absorbing raw_transcripts/ into the target vault would do.
+
+        Preview only — nothing is copied here; see import_meetings for that.
+        """
+        target = next((b for b in state.cfg.brains if b.meeting_target), None)
+        if target is None:
+            h.fail("no brain is set as the meeting recording target", 409)
+            return
+        dest = target.resolved_meeting_folder()
+        files = []
+        if RAW_TRANSCRIPTS_DIR.is_dir():
+            for path in sorted(RAW_TRANSCRIPTS_DIR.glob("*.md")):
+                files.append({
+                    "name": path.name,
+                    "status": "overwrite" if (dest / path.name).exists() else "new",
+                    "size": path.stat().st_size,
+                })
+        h.json({
+            "brainId": target.id, "brainName": target.name,
+            "folder": str(dest), "files": files,
+        })
+
+    def import_meetings(h: Handler) -> None:
+        """Copy the chosen raw_transcripts/ files into the target vault, then rescan.
+
+        Runs as a job (like any script) so the console shows exactly what
+        happened to each file. Copies rather than moves raw_transcripts/, so
+        re-running the exporter and the import later is always safe — the
+        staging folder is a mirror of MacWhisper, not a one-shot queue.
+        """
+        payload = h.body()
+        target = next((b for b in state.cfg.brains if b.meeting_target), None)
+        if target is None:
+            h.fail("no brain is set as the meeting recording target", 409)
+            return
+        staged = {p.name: p for p in RAW_TRANSCRIPTS_DIR.glob("*.md")} if RAW_TRANSCRIPTS_DIR.is_dir() else {}
+        names = payload.get("files")
+        if names is None:
+            selected = list(staged)
+        elif isinstance(names, list):
+            # Only filenames actually staged right now — never trust a path
+            # the browser merely claims exists.
+            selected = [n for n in names if isinstance(n, str) and n in staged]
+        else:
+            h.fail("files must be a list of names")
+            return
+        if not selected:
+            h.fail("nothing to import")
+            return
+
+        job_name = "Import meeting transcripts"
+        existing = state.jobs.running(job_name)
+        if existing:
+            h.json({"job": existing.to_dict(), "alreadyRunning": True})
+            return
+
+        def run(emit: Callable[[str], None]) -> None:
+            dest = target.resolved_meeting_folder()
+            dest.mkdir(parents=True, exist_ok=True)
+            added = overwritten = 0
+            for name in selected:
+                dest_path = dest / name
+                was_there = dest_path.exists()
+                shutil.copy2(staged[name], dest_path)
+                if was_there:
+                    overwritten += 1
+                    emit(f"overwrote {name}")
+                else:
+                    added += 1
+                    emit(f"added {name}")
+            emit(f"{added} added, {overwritten} overwritten in {dest}")
+            state.reindex(emit)
+
+        job = state.jobs.run_task(job_name, run)
+        h.json({"job": job.to_dict()})
+
     def save_agent(h: Handler, agent_id: str) -> None:
         payload = h.body()
         agent = state.cfg.agent(agent_id)
@@ -1072,6 +1174,16 @@ def build_router(state: State) -> Router:
             state.cfg.save()
         h.json({"ok": True})
 
+    def reset_agent_positions(h: Handler) -> None:
+        """Drop every dragged-to position so agents fall back to their slots."""
+        moved = [a for a in state.cfg.agents if a.pos is not None]
+        for agent in moved:
+            agent.pos = None
+        if moved:
+            state.cfg.save()
+            state.universe(rebuild=True)
+        h.json({"ok": True, "changed": bool(moved)})
+
     # ---- routes ----------------------------------------------------------
     router.get("/api/universe", universe)
     router.get("/api/events", events)
@@ -1106,9 +1218,12 @@ def build_router(state: State) -> Router:
     router.post("/api/brain/<brain_id>/remove", remove_brain)
     router.post("/api/brains/add", add_brain)
     router.get("/api/brains/discover", discover)
+    router.get("/api/meetings/preview", meeting_preview)
+    router.post("/api/meetings/import", import_meetings)
     router.post("/api/agent/<agent_id>", save_agent)
     router.post("/api/agent/<agent_id>/remove", remove_agent)
     router.post("/api/agent/<agent_id>/move", move_agent)
+    router.post("/api/agents/reset-positions", reset_agent_positions)
     router.post("/api/agents/add", add_agent)
     return router
 

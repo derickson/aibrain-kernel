@@ -63,9 +63,18 @@ class BrainConfig:
         default_factory=lambda: [".obsidian", ".trash", ".git", "ZZ-Attachments",
                                  "ZZ-Attachements", "assets", "scans", "Excalidraw"]
     )
+    # At most one brain may be the meeting-recording target at a time —
+    # enforced in server.py's save_brain, which clears it on the others.
+    # A new brain always starts with this off.
+    meeting_target: bool = False
+    # Where raw_transcripts/ gets absorbed into, relative to this vault's root.
+    meeting_folder: str = "Meetings"
 
     def resolved_path(self) -> Path:
         return Path(self.path).expanduser()
+
+    def resolved_meeting_folder(self) -> Path:
+        return self.resolved_path() / (self.meeting_folder or "Meetings")
 
 
 @dataclass
