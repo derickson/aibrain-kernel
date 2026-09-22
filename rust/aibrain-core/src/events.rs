@@ -77,7 +77,8 @@ impl Bus {
         self.tx.subscribe()
     }
 
-    /// How many streams are open. Only used for logging and tests.
+    /// How many streams are open.
+    #[cfg(test)]
     pub fn listeners(&self) -> usize {
         self.tx.receiver_count()
     }

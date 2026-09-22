@@ -445,7 +445,7 @@ pub async fn count_links(pool: &PgPool) -> Result<i64> {
 /// Notes for one brain, everything it has — no cap.
 pub async fn notes_for_layout(pool: &PgPool, brain_id: &str) -> Result<Vec<crate::layout::LayoutNote>> {
     let rows = sqlx::query(
-        "SELECT id, rel_path, title, source, degree, mtime
+        "SELECT id, rel_path, source, degree
            FROM note WHERE brain_id = $1 ORDER BY id",
     )
     .bind(brain_id)
@@ -456,10 +456,8 @@ pub async fn notes_for_layout(pool: &PgPool, brain_id: &str) -> Result<Vec<crate
         .map(|r| crate::layout::LayoutNote {
             id: r.get("id"),
             rel_path: r.get("rel_path"),
-            title: r.get("title"),
             source: r.get("source"),
             degree: r.get("degree"),
-            mtime: r.get("mtime"),
         })
         .collect())
 }
@@ -1116,6 +1114,7 @@ pub async fn bump_revisions(pool: &PgPool, ids: &[String]) -> Result<Vec<(String
 }
 
 /// One brain's revision, or None when it is not in the database yet.
+#[cfg(test)]
 pub async fn brain_revision(pool: &PgPool, brain_id: &str) -> Result<Option<i64>> {
     let row = sqlx::query("SELECT revision FROM brain WHERE id = $1")
         .bind(brain_id)

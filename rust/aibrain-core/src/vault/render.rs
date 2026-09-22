@@ -74,7 +74,8 @@ fn wikilink_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(!?)\[\[([^\[\]]+?)\]\]").unwrap())
 }
 
-/// Render markdown, leaving wikilinks as placeholders the caller resolves.
+/// Render markdown with no wikilink resolved; the tests' shorthand.
+#[cfg(test)]
 pub fn to_html(body: &str, _brain_id: &str) -> String {
     to_html_with(body, &HashMap::new())
 }

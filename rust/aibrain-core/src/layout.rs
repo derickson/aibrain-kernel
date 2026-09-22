@@ -28,28 +28,13 @@ pub struct SourceMeta {
     pub count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrainMeta {
-    pub id: String,
-    pub name: String,
-    pub center: [f32; 3],
-    pub radius: f32,
-    pub seed: i32,
-    pub sources: Vec<SourceMeta>,
-    pub notes: usize,
-    pub edges: usize,
-    pub path: String,
-}
-
 /// A note as the layout needs it.
 #[derive(Debug, Clone)]
 pub struct LayoutNote {
     pub id: i64,
     pub rel_path: String,
-    pub title: String,
     pub source: String,
     pub degree: i32,
-    pub mtime: f64,
 }
 
 /// Where a note ended up.
@@ -209,9 +194,6 @@ impl Rng {
         t = t.wrapping_add((t ^ (t >> 7)).wrapping_mul(61 | t)) ^ t;
         ((t ^ (t >> 14)) as f64) / 4294967296.0
     }
-    fn gauss(&mut self) -> f64 {
-        (self.next() + self.next() + self.next() - 1.5) * 1.4
-    }
 }
 
 /// Place every note in one brain onto its shell.
@@ -363,10 +345,8 @@ mod tests {
         LayoutNote {
             id,
             rel_path: path.to_string(),
-            title: path.to_string(),
             source: source.to_string(),
             degree,
-            mtime: 0.0,
         }
     }
 
