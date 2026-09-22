@@ -1,7 +1,7 @@
 # The Rust service for the compose `full` profile: a host where the vault
 # lives in the container's own filesystem, so FSEvents forwarding does not
 # matter. In dev on a Mac, run the binary natively instead (see dev.sh).
-FROM rust:1.82-bookworm AS build
+FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/aibrain-core ./aibrain-core
