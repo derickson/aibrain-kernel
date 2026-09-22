@@ -169,6 +169,9 @@ class CorpusFixture:
             "AIBRAIN_DATABASE_URL": TEST_DATABASE_URL,
             "AIBRAIN_BIND": f"127.0.0.1:{self.port}",
             "AIBRAIN_LOG": "aibrain_core=warn",
+            # Lets the to-do tests say what time it is. The service refuses
+            # `?now=` unless this is set, so production cannot time travel.
+            "AIBRAIN_TODO_TEST_CLOCK": "1",
         }
         # The binary loads the repo `.env`, which carries live Elasticsearch
         # credentials. A test must never index a throwaway vault into the real
@@ -784,6 +787,338 @@ class JobTests(unittest.TestCase):
         self.assertIn("6 notes scanned", joined)
         self.assertIn("+1 added", joined)
         self.assertIn("7 links resolved", joined)
+
+
+# ---------------------------------------------------------------------------
+# the day's list
+# ---------------------------------------------------------------------------
+
+class TodoTests(unittest.TestCase):
+    """The /api/todos proxies, driven the way the shelf drives them.
+
+    The service is started with AIBRAIN_TODO_TEST_CLOCK=1 by the fixture, so
+    these can say what day it is instead of waiting for tomorrow.
+    """
+
+    # Far enough out that nothing else in the shared test database is here.
+    MONDAY = "2031-05-05"
+    TUESDAY = "2031-05-06"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus()
+        cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        handler = type("H", (Handler,),
+                       {"state": cls.state, "router": build_router(cls.state)})
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.httpd.daemon_threads = True
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    def setUp(self):
+        # Per test, not per class: the list is one shared thing, so a test
+        # that counted the class's rows would count its siblings' too.
+        self.marker = f"zzpy{uuid.uuid4().hex[:8]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        # Nothing is deleted, by design — there is no route that would. Every
+        # row these tests write carries a unique marker instead, so a shared
+        # test database stays usable.
+        cls.httpd.shutdown()
+        cls.state.close()
+        cls.fixture.stop()
+
+    # ---- helpers ---------------------------------------------------------
+    def call(self, path, body=None, method=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data,
+                                     method=method or ("POST" if data else "GET"))
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+
+    def add(self, text, day=None, now=None):
+        query = f"?now={now}" if now else ""
+        payload = self.call(f"/api/todos{query}",
+                            {"body": f"{text} {self.marker}",
+                             "scheduled_on": day or self.MONDAY})
+        return payload["todo"]
+
+    def mine(self, payload):
+        return [t for t in payload["todos"] if self.marker in t["body"]]
+
+    # ---- tests -----------------------------------------------------------
+    def test_an_item_is_added_listed_completed_and_then_absent_tomorrow(self):
+        carried = self.add("water the plants")
+        finished = self.add("post the letter")
+
+        day = self.call(f"/api/todos?day={self.MONDAY}&now={self.MONDAY}T09:00:00")
+        self.assertEqual(day["day"], self.MONDAY)
+        bodies = [t["body"] for t in self.mine(day)]
+        self.assertEqual(len(bodies), 2)
+        self.assertTrue(all(t["state"] == "open" for t in self.mine(day)))
+        # sort_order, not insertion order by accident.
+        self.assertEqual(bodies[0], carried["body"])
+
+        done = self.call(f"/api/todos/{finished['id']}/complete"
+                         f"?now={self.TUESDAY}T01:00:00", {})
+        self.assertEqual(done["todo"]["state"], "completed")
+
+        # One in the morning is still Monday, so it is still on Monday's list.
+        day = self.call(f"/api/todos?day={self.MONDAY}&now={self.MONDAY}T09:00:00")
+        states = {t["id"]: t["state"] for t in self.mine(day)}
+        self.assertEqual(states[finished["id"]], "completed")
+        self.assertEqual(states[carried["id"]], "open")
+
+        # Tuesday carries the open one and drops the completed one.
+        day = self.call(f"/api/todos?day={self.TUESDAY}&now={self.TUESDAY}T09:00:00")
+        rows = self.mine(day)
+        self.assertEqual([t["id"] for t in rows], [carried["id"]])
+        self.assertEqual(rows[0]["first_scheduled_on"], self.MONDAY)
+        self.assertEqual(rows[0]["scheduled_on"], self.TUESDAY)
+
+    def test_history_keeps_what_the_day_view_no_longer_shows(self):
+        todo = self.add("buy stamps")
+        self.call(f"/api/todos/{todo['id']}/complete?now={self.MONDAY}T10:00:00", {})
+        found = self.call(f"/api/todos/history?q=stamps+{self.marker}")
+        rows = [t for t in found["todos"] if t["id"] == todo["id"]]
+        self.assertEqual(len(rows), 1, "the completed item is still searchable")
+        kinds = [e["kind"] for e in rows[0]["events"]]
+        self.assertIn("created", kinds)
+        self.assertIn("completed", kinds)
+
+    def test_a_note_can_be_linked_and_resolves_to_its_id(self):
+        todo = self.add("reread the protocols note")
+        linked = self.call(f"/api/todos/{todo['id']}/link",
+                           {"brain_id": self.fixture.brain_id,
+                            "rel_path": "Protocols.md"})
+        refs = linked["todo"]["refs"]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["rel_path"], "Protocols.md")
+        self.assertIsNotNone(refs[0]["note_id"], "the note exists, so it resolves")
+
+    def test_rescheduling_and_editing_are_both_recorded(self):
+        todo = self.add("call the plumber")
+        moved = self.call(f"/api/todos/{todo['id']}/reschedule"
+                          f"?now={self.MONDAY}T09:00:00", {"to_day": "tomorrow"})
+        self.assertEqual(moved["todo"]["scheduled_on"], self.TUESDAY)
+
+        edited = self.call(f"/api/todos/{todo['id']}?now={self.MONDAY}T10:00:00",
+                           {"body": f"call the roofer {self.marker}"},
+                           method="PATCH")
+        self.assertIn("roofer", edited["todo"]["body"])
+
+        found = self.call(f"/api/todos/history?q=roofer+{self.marker}")
+        rows = [t for t in found["todos"] if t["id"] == todo["id"]]
+        kinds = [e["kind"] for e in rows[0]["events"]]
+        self.assertEqual(kinds, ["created", "rescheduled", "edited"])
+
+    def test_looking_at_an_earlier_day_does_not_drag_work_backwards(self):
+        todo = self.add("sweep the yard", day=self.TUESDAY)
+        # Open Monday, which is before it. Nothing should move.
+        self.call(f"/api/todos?day={self.MONDAY}&now={self.TUESDAY}T09:00:00")
+        day = self.call(f"/api/todos?day={self.TUESDAY}&now={self.TUESDAY}T09:00:00")
+        rows = [t for t in self.mine(day) if t["id"] == todo["id"]]
+        self.assertEqual(rows[0]["scheduled_on"], self.TUESDAY)
+
+    def test_an_empty_body_is_refused_and_a_missing_item_is_a_404(self):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.call("/api/todos", {"body": "   "})
+        self.assertEqual(caught.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.call("/api/todos/999999999/complete", {})
+        self.assertEqual(caught.exception.code, 404)
+
+    def test_the_configured_start_hour_reaches_the_browser(self):
+        status = self.get_status()
+        self.assertEqual(status["todo"]["day_start_hour"], 4)
+
+    def get_status(self):
+        with urllib.request.urlopen(self.base + "/api/status", timeout=30) as r:
+            return json.loads(r.read().decode())
+
+
+# ---------------------------------------------------------------------------
+# the MCP server
+# ---------------------------------------------------------------------------
+
+class McpTodoTests(unittest.TestCase):
+    """Drives `python3 -m aibrain.mcp_todo` over a pipe, as an ACP client does.
+
+    Nothing is mocked: the server talks HTTP to the same aibrain-core the
+    shelf does, which is the property worth testing — an agent and the browser
+    must be looking at one list.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus()
+        cls.marker = f"zzmcp{uuid.uuid4().hex[:8]}"
+        cls.proc = subprocess.Popen(
+            [sys.executable, "-m", "aibrain.mcp_todo"],
+            cwd=str(REPO_ROOT),
+            env={**os.environ, "AIBRAIN_CORE_URL": cls.fixture.base_url},
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        cls._id = 0
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc.poll() is None:
+            cls.proc.stdin.close()
+            try:
+                cls.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                cls.proc.kill()
+        cls.fixture.stop()
+
+    def rpc(self, method, params=None):
+        type(self)._id += 1
+        message = {"jsonrpc": "2.0", "id": self._id, "method": method}
+        if params is not None:
+            message["params"] = params
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        self.assertTrue(line, "the MCP server closed its stdout")
+        return json.loads(line)
+
+    def notify(self, method, params=None):
+        message = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+
+    def text_of(self, reply):
+        self.assertNotIn("error", reply, f"unexpected JSON-RPC error: {reply}")
+        result = reply["result"]
+        self.assertFalse(result.get("isError"), result)
+        return "\n".join(part["text"] for part in result["content"])
+
+    def test_the_handshake_then_a_round_trip_through_the_list(self):
+        hello = self.rpc("initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"},
+        })
+        self.assertIn("protocolVersion", hello["result"])
+        self.assertEqual(hello["result"]["serverInfo"]["name"], "aibrain-todo")
+        self.assertIn("tools", hello["result"]["capabilities"])
+
+        # A notification is never answered, so the next read must be the ping.
+        self.notify("notifications/initialized")
+        self.assertEqual(self.rpc("ping")["result"], {})
+
+        listed = self.rpc("tools/list")["result"]["tools"]
+        names = {tool["name"] for tool in listed}
+        self.assertEqual(names, {
+            "list_todos", "add_todo", "complete_todo", "reschedule_todo",
+            "link_todo_to_note", "search_history",
+        })
+        for tool in listed:
+            self.assertIn("inputSchema", tool)
+            self.assertTrue(tool["description"])
+
+        body = f"file the {self.marker} receipts"
+        added = self.text_of(self.rpc("tools/call", {
+            "name": "add_todo", "arguments": {"body": body, "day": "2031-07-07"},
+        }))
+        self.assertIn(self.marker, added)
+        todo_id = int(added.split("#")[1].split()[0])
+
+        shown = self.text_of(self.rpc("tools/call", {
+            "name": "list_todos", "arguments": {"day": "2031-07-07"},
+        }))
+        self.assertIn(self.marker, shown)
+        self.assertIn("[ ]", shown)
+
+        # And the browser's own route sees the very same row.
+        day = self.fixture.corpus.todos(day="2031-07-07")
+        self.assertIn(todo_id, [t["id"] for t in day["todos"]])
+
+        done = self.text_of(self.rpc("tools/call", {
+            "name": "complete_todo", "arguments": {"id": todo_id},
+        }))
+        self.assertIn("[x]", done)
+
+        history = self.text_of(self.rpc("tools/call", {
+            "name": "search_history", "arguments": {"q": self.marker},
+        }))
+        self.assertIn(self.marker, history)
+        self.assertIn("created", history)
+        self.assertIn("completed", history)
+
+    def test_bad_input_comes_back_as_a_result_not_a_broken_pipe(self):
+        reply = self.rpc("tools/call", {"name": "no_such_tool", "arguments": {}})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+
+        reply = self.rpc("tools/call", {"name": "complete_todo", "arguments": {}})
+        self.assertTrue(reply["result"]["isError"], "a missing id is a tool error")
+
+        self.assertIn("error", self.rpc("no/such/method"))
+        # Still alive after all of that.
+        self.assertEqual(self.rpc("ping")["result"], {})
+
+
+class McpProtocolTests(unittest.TestCase):
+    """The parts of the protocol that need no service behind them."""
+
+    def setUp(self):
+        from aibrain.mcp_todo import Server
+        self.server = Server(corpus=_NoCorpus())
+
+    def test_a_notification_is_never_answered(self):
+        self.assertIsNone(self.server.handle(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        self.assertTrue(self.server.initialized)
+
+    def test_a_message_that_is_not_jsonrpc_two_is_refused(self):
+        reply = self.server.handle({"id": 1, "method": "ping"})
+        self.assertEqual(reply["error"]["code"], -32600)
+
+    def test_garbage_on_the_wire_does_not_stop_the_loop(self):
+        import io
+        out = io.StringIO()
+        self.server.run(iter(["{not json", "", '{"jsonrpc":"2.0","id":9,"method":"ping"}']),
+                        out)
+        replies = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(replies[0]["error"]["code"], -32700)
+        self.assertEqual(replies[1]["id"], 9)
+
+
+class AcpRegistrationTests(unittest.TestCase):
+    """The to-do server has to reach the agent through `session/new`."""
+
+    def connection(self):
+        from aibrain.agents.acp import ACPConnection
+        return ACPConnection(["true"], "/tmp", {},
+                             core_url="http://127.0.0.1:8781")
+
+    def test_the_todo_server_is_offered_as_a_stdio_server(self):
+        servers = self.connection().mcp_servers()
+        self.assertEqual(len(servers), 1)
+        server = servers[0]
+        self.assertEqual(server["type"], "stdio")
+        self.assertEqual(server["name"], "aibrain-todo")
+        self.assertEqual(server["args"], ["-m", "aibrain.mcp_todo"])
+        self.assertTrue(server["command"])
+
+    def test_the_child_is_told_where_the_corpus_and_the_package_are(self):
+        env = {e["name"]: e["value"] for e in self.connection().mcp_servers()[0]["env"]}
+        self.assertEqual(env["AIBRAIN_CORE_URL"], "http://127.0.0.1:8781")
+        # The agent starts the child in the user's project, so the import path
+        # has to be spelled out or `-m aibrain.mcp_todo` finds nothing.
+        self.assertTrue((Path(env["PYTHONPATH"]) / "aibrain" / "mcp_todo.py").is_file())
+
+
+class _NoCorpus:
+    """Stands in for the HTTP client in tests that never reach the service."""
+
+    base_url = "http://example.invalid"
 
 
 # ---------------------------------------------------------------------------

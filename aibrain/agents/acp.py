@@ -18,6 +18,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,9 @@ from ..corpus import Corpus
 from .base import Agent, Event
 
 PROTOCOL_VERSION = 1
+# The directory `aibrain/` lives in, so `python3 -m aibrain.mcp_todo` resolves
+# from a subprocess the agent starts in someone else's project.
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 START_TIMEOUT = 45.0
 PROMPT_TIMEOUT = 600.0
 
@@ -47,10 +51,14 @@ class ACPConnection:
     """One live subprocess speaking ACP, with a reader thread behind it."""
 
     def __init__(self, command: list[str], cwd: str, env: dict[str, str],
-                 log: Any = None, roots: list[Path] | None = None):
+                 log: Any = None, roots: list[Path] | None = None,
+                 core_url: str | None = None):
         self.command = command
         self.cwd = cwd or os.getcwd()
         self.env = env
+        # Where our own MCP server should look for the corpus. Held here
+        # because `session/new` is what hands it to the agent.
+        self.core_url = core_url or ""
         # Directories the agent may read and write. The session directory is
         # always one; the vaults are added because reading the notes behind a
         # brain is the whole point of connecting a coding agent to it.
@@ -327,6 +335,26 @@ class ACPConnection:
                 self.log(f"authenticate skipped: {exc}")
         return result
 
+    def mcp_servers(self) -> list[dict]:
+        """The MCP servers the agent gets for this session.
+
+        One, for now: the day's list. It travels through the same `session/new`
+        field `additionalDirectories` does, so the adapter is already known to
+        accept it. The child is launched by the agent, not by us, so it
+        inherits none of our environment — PYTHONPATH is spelled out because
+        the agent's cwd is the user's project, not this repo.
+        """
+        env = [{"name": "PYTHONPATH", "value": str(PACKAGE_ROOT)}]
+        if self.core_url:
+            env.append({"name": "AIBRAIN_CORE_URL", "value": self.core_url})
+        return [{
+            "type": "stdio",
+            "name": "aibrain-todo",
+            "command": sys.executable or "python3",
+            "args": ["-m", "aibrain.mcp_todo"],
+            "env": env,
+        }]
+
     def new_session(self, cwd: str) -> str:
         # Tell the agent which directories are legitimately part of this
         # workspace. The vaults live outside the session cwd, so without this
@@ -335,11 +363,21 @@ class ACPConnection:
         # vaults that are not linked. Naming the roots is not a sandbox, but it
         # removes the reason to go looking.
         roots = [str(r) for r in self.roots if str(r) != cwd]
-        result = self.request(
-            "session/new",
-            {"cwd": cwd, "mcpServers": [], "additionalDirectories": roots},
-            timeout=START_TIMEOUT,
-        ) or {}
+        params = {
+            "cwd": cwd,
+            "mcpServers": self.mcp_servers(),
+            "additionalDirectories": roots,
+        }
+        try:
+            result = self.request("session/new", params, timeout=START_TIMEOUT) or {}
+        except ACPError as exc:
+            # Adapters validate this field strictly and they do not all spell
+            # a stdio server the same way. A chat that cannot start is a much
+            # worse outcome than a chat without the to-do tools, so drop them
+            # and say so rather than failing.
+            self.log(f"session/new refused our MCP servers ({exc}); retrying without them")
+            params["mcpServers"] = []
+            result = self.request("session/new", params, timeout=START_TIMEOUT) or {}
         session = result.get("sessionId")
         if not session:
             raise ACPError("agent did not return a sessionId")
@@ -429,7 +467,8 @@ class ACPAgent(Agent):
                 raise ACPError("no command configured for this ACP connection")
             cwd = self.cfg.cwd or str(Path.cwd())
             conn = ACPConnection(self.cfg.command, cwd, self.cfg.env, self._note,
-                                 roots=self.vault_roots)
+                                 roots=self.vault_roots,
+                                 core_url=self.corpus.base_url)
             conn.start()
             conn.initialize()
             conn.new_session(cwd)

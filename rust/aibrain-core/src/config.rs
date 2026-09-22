@@ -40,11 +40,19 @@ struct RawView {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawTodo {
+    #[serde(default)]
+    day_start_hour: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     brains: Vec<RawBrain>,
     #[serde(default)]
     view: Option<RawView>,
+    #[serde(default)]
+    todo: Option<RawTodo>,
     #[serde(default)]
     title: Option<String>,
 }
@@ -54,7 +62,15 @@ pub struct Config {
     pub brains: Vec<BrainSpec>,
     pub ribbon_twist: f64,
     pub title: String,
+    /// The hour a day begins. Work finished at 01:00 belongs to the evening
+    /// before, not to a new day's empty list.
+    pub todo_day_start_hour: u32,
 }
+
+/// 04:00 unless the config says otherwise: late enough that a night owl's last
+/// task lands on the day they were working, early enough that nobody is up
+/// before it.
+pub const DEFAULT_DAY_START_HOUR: u32 = 4;
 
 /// Where the config lives, honouring `AIBRAIN_HOME` the way Python does.
 pub fn default_path() -> PathBuf {
@@ -94,6 +110,14 @@ pub fn load(path: &Path) -> Result<Config> {
         brains,
         ribbon_twist: raw.view.and_then(|v| v.ribbon_twist).unwrap_or(0.25),
         title: raw.title.unwrap_or_else(|| "AI Brains".to_string()),
+        todo_day_start_hour: raw
+            .todo
+            .and_then(|t| t.day_start_hour)
+            // A nonsense hour is a typo, not an instruction; fall back rather
+            // than refuse to start.
+            .filter(|h| (0..24).contains(h))
+            .map(|h| h as u32)
+            .unwrap_or(DEFAULT_DAY_START_HOUR),
     })
 }
 
@@ -156,6 +180,19 @@ mod tests {
         let cfg = load(&path).unwrap();
         assert!(cfg.brains.is_empty());
         assert_eq!(cfg.ribbon_twist, 0.25);
+        assert_eq!(cfg.todo_day_start_hour, DEFAULT_DAY_START_HOUR);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_day_start_hour_is_read_and_a_silly_one_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("aibrain-cfg4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"todo":{"day_start_hour":6}}"#).unwrap();
+        assert_eq!(load(&path).unwrap().todo_day_start_hour, 6);
+        std::fs::write(&path, r#"{"todo":{"day_start_hour":99}}"#).unwrap();
+        assert_eq!(load(&path).unwrap().todo_day_start_hour, DEFAULT_DAY_START_HOUR);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

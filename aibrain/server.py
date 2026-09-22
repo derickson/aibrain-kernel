@@ -200,6 +200,9 @@ class Router:
     def post(self, path: str, fn: Callable) -> None:
         self.add("POST", path, fn)
 
+    def patch(self, path: str, fn: Callable) -> None:
+        self.add("PATCH", path, fn)
+
     def match(self, method: str, path: str):
         for verb, regex, fn in self.routes:
             m = regex.match(path)
@@ -284,6 +287,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._dispatch("POST")
+
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
 
     def _dispatch(self, method: str) -> None:
         path = urllib.parse.urlparse(self.path).path
@@ -374,6 +380,7 @@ def build_router(state: State) -> Router:
             ],
             "scripts": [asdict(s) for s in state.cfg.scripts],
             "view": asdict(state.cfg.view),
+            "todo": asdict(state.cfg.todo),
             "jobs": state.jobs.list()[:8],
         }
         # Whatever else the service reports about itself — the search engine
@@ -421,6 +428,63 @@ def build_router(state: State) -> Router:
     def recent(h: Handler) -> None:
         rows = state.corpus.recent(limit=int(h.query().get("limit", 24)))
         h.json({"results": [state.decorate(row) for row in rows]})
+
+    # ---- the day's list --------------------------------------------------
+    # Pure proxies. The rollover, the day boundary and the history all belong
+    # to the service; adding a second opinion here is how the two would drift.
+    def todos(h: Handler) -> None:
+        q = h.query()
+        h.json(state.corpus.todos(day=q.get("day"), now=q.get("now")))
+
+    def todo_add(h: Handler) -> None:
+        payload = h.body()
+        body = str(payload.get("body", "")).strip()
+        if not body:
+            h.fail("a to-do needs some text")
+            return
+        h.json(state.corpus.add_todo(
+            body,
+            scheduled_on=payload.get("scheduled_on"),
+            refs=payload.get("refs") or [],
+            now=h.query().get("now"),
+        ))
+
+    def todo_action(action: str) -> Callable:
+        def run(h: Handler, tid: str) -> None:
+            now = h.query().get("now")
+            payload = h.body()
+            if action == "reschedule":
+                result = state.corpus.reschedule_todo(
+                    int(tid), str(payload.get("to_day", "tomorrow")), now=now)
+            elif action == "link":
+                result = state.corpus.link_todo(
+                    int(tid), str(payload.get("brain_id", "")),
+                    str(payload.get("rel_path", "")), now=now)
+            else:
+                result = getattr(state.corpus, f"{action}_todo")(int(tid), now=now)
+            if not result:
+                h.fail("no such to-do", 404)
+                return
+            h.json(result)
+        return run
+
+    def todo_patch(h: Handler, tid: str) -> None:
+        payload = h.body()
+        result = state.corpus.update_todo(
+            int(tid),
+            body=payload.get("body"),
+            sort_order=payload.get("sort_order"),
+            now=h.query().get("now"),
+        )
+        if not result:
+            h.fail("no such to-do", 404)
+            return
+        h.json(result)
+
+    def todo_history(h: Handler) -> None:
+        q = h.query()
+        h.json(state.corpus.todo_history(q.get("q", ""),
+                                         limit=min(int(q.get("limit", 50)), 200)))
 
     # ---- chat ------------------------------------------------------------
     def chat(h: Handler) -> None:
@@ -698,6 +762,14 @@ def build_router(state: State) -> Router:
     router.get("/api/recent", recent)
     router.get("/api/note/<nid>", note)
     router.get("/api/node/<gid>", node)
+    # The history route is registered before /api/todos/<tid> so "history" is
+    # never read as an id.
+    router.get("/api/todos", todos)
+    router.post("/api/todos", todo_add)
+    router.get("/api/todos/history", todo_history)
+    router.patch("/api/todos/<tid>", todo_patch)
+    for _action in ("complete", "uncomplete", "cancel", "reschedule", "link"):
+        router.post(f"/api/todos/<tid>/{_action}", todo_action(_action))
     router.get("/api/stream/chat", chat)
     router.get("/api/chat/<agent_id>/history", chat_history)
     router.post("/api/chat/<agent_id>/clear", chat_clear)

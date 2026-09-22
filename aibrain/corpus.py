@@ -78,15 +78,15 @@ class Corpus:
     # ---- plumbing --------------------------------------------------------
     def _request(self, path: str, *, params: dict | None = None,
                  body: dict | None = None, timeout: float = READ_TIMEOUT,
-                 allow_404: bool = False) -> Any:
+                 allow_404: bool = False, method: str | None = None) -> Any:
         url = self.base_url + path
         if params:
             clean = {k: v for k, v in params.items() if v not in (None, "")}
             if clean:
                 url += "?" + urllib.parse.urlencode(clean)
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        request = urllib.request.Request(url, data=data,
-                                         method="POST" if data else "GET")
+        request = urllib.request.Request(
+            url, data=data, method=method or ("POST" if data else "GET"))
         if data:
             request.add_header("Content-Type", "application/json")
         try:
@@ -170,6 +170,65 @@ class Corpus:
     def reindex(self, force: bool = False) -> dict:
         return self._request("/reindex", body={"force": bool(force)},
                              timeout=REINDEX_TIMEOUT) or {}
+
+    # ---- the day's list --------------------------------------------------
+    # Thin on purpose. Which day an item belongs to, when a rollover happens
+    # and what gets logged are all decisions the service owns; Python only
+    # carries the question there and the answer back.
+    #
+    # `now` is honoured by the service only when it was started with
+    # AIBRAIN_TODO_TEST_CLOCK=1. Passing it otherwise is harmless.
+
+    def todos(self, day: str | None = None, now: str | None = None) -> dict:
+        return self._request("/todos", params={"day": day, "now": now}) or {}
+
+    def add_todo(self, body: str, scheduled_on: str | None = None,
+                 refs: list[dict] | None = None,
+                 now: str | None = None) -> dict:
+        payload: dict[str, Any] = {"body": body, "refs": refs or []}
+        if scheduled_on:
+            payload["scheduled_on"] = scheduled_on
+        return self._request("/todos", body=payload, params={"now": now}) or {}
+
+    def complete_todo(self, todo_id: int, now: str | None = None) -> dict:
+        return self._todo_post(todo_id, "complete", now=now)
+
+    def uncomplete_todo(self, todo_id: int, now: str | None = None) -> dict:
+        return self._todo_post(todo_id, "uncomplete", now=now)
+
+    def cancel_todo(self, todo_id: int, now: str | None = None) -> dict:
+        return self._todo_post(todo_id, "cancel", now=now)
+
+    def reschedule_todo(self, todo_id: int, to_day: str,
+                        now: str | None = None) -> dict:
+        return self._todo_post(todo_id, "reschedule", {"to_day": to_day}, now)
+
+    def link_todo(self, todo_id: int, brain_id: str, rel_path: str,
+                  now: str | None = None) -> dict:
+        return self._todo_post(todo_id, "link",
+                               {"brain_id": brain_id, "rel_path": rel_path}, now)
+
+    def update_todo(self, todo_id: int, body: str | None = None,
+                    sort_order: float | None = None,
+                    now: str | None = None) -> dict:
+        payload: dict[str, Any] = {}
+        if body is not None:
+            payload["body"] = body
+        if sort_order is not None:
+            payload["sort_order"] = sort_order
+        return self._request(f"/todos/{int(todo_id)}", body=payload,
+                             params={"now": now}, method="PATCH",
+                             allow_404=True) or {}
+
+    def todo_history(self, query: str = "", limit: int = 50) -> dict:
+        return self._request("/todos/history",
+                             params={"q": query, "limit": limit}) or {}
+
+    def _todo_post(self, todo_id: int, action: str, body: dict | None = None,
+                   now: str | None = None) -> dict:
+        # An empty body still has to be a POST, so it is `{}` not None.
+        return self._request(f"/todos/{int(todo_id)}/{action}", body=body or {},
+                             params={"now": now}, allow_404=True) or {}
 
 
 # The message a person can act on, rather than a traceback. Named here because

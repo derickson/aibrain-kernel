@@ -12,6 +12,7 @@ use sqlx::{PgPool, Row};
 use std::time::Duration;
 
 pub mod queries;
+pub mod todo;
 
 pub use queries::*;
 
@@ -53,6 +54,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     let files = [
         include_str!("migrations/0001_corpus.sql"),
         include_str!("migrations/0002_search_queue.sql"),
+        include_str!("migrations/0003_todo.sql"),
     ];
     // `pg_trgm` needs its own statement boundary and may fail without
     // superuser; the index that depends on it is optional, so a failure there

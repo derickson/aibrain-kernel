@@ -1148,6 +1148,7 @@ function wireStaticHandlers() {
     renderStatus();
     if (S.query.trim()) runSearch(S.query);
   };
+  wireShelf();              // the day's list — see the section at the bottom
   $('#open-menu').onclick = () => openDrawer();
   $('#drawer-close').onclick = closeDrawer;
   $('#drawer-scrim').onclick = closeDrawer;
@@ -1185,6 +1186,7 @@ function wireStaticHandlers() {
       else if (document.activeElement === $('#query')) { $('#query').blur(); }
       else if (S.rightOpen) closeRight();
       else if (S.leftOpen) closeChat();
+      else if (TODO.open) closeShelf();
     }
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !S.leftOpen) {
       const first = S.data?.agents?.[0];
@@ -1198,6 +1200,264 @@ function openSearch() {
   S.note = null;
   renderResults();
   setTimeout(() => $('#query').focus(), 360);
+}
+
+// ───────────────────────── the day's list (shelf) ───────────────────────
+//
+// A flex sibling ahead of the chat panel, so opening it pushes the
+// conversation right rather than covering it — the point is to see the day
+// and the answer at once.
+//
+// Everything here is additive: its own state object, its own functions, and
+// one line in wireStaticHandlers that binds the toggle. The server owns which
+// day an item belongs to and when a rollover happens; this only asks.
+
+const TODO = {
+  day: null,        // the day being shown, YYYY-MM-DD
+  today: null,      // what the server calls today, by its start hour
+  items: [],
+  open: false,
+  picking: null,    // the id whose note picker is showing
+  loading: false,
+};
+
+function openShelf() {
+  TODO.open = true;
+  $('#shelf').dataset.open = 'true';
+  loadTodos(TODO.day);
+  setTimeout(() => $('#todo-draft')?.focus(), 360);
+}
+
+function closeShelf() {
+  TODO.open = false;
+  TODO.picking = null;
+  $('#shelf').dataset.open = 'false';
+}
+
+function toggleShelf() {
+  if (TODO.open) closeShelf(); else openShelf();
+}
+
+async function loadTodos(day) {
+  TODO.loading = true;
+  try {
+    const query = day ? `?day=${encodeURIComponent(day)}` : '';
+    const data = await api(`/api/todos${query}`);
+    TODO.day = data.day;
+    TODO.today = data.today;
+    TODO.items = data.todos || [];
+    renderShelf();
+    if (data.rolled) {
+      toast(`${data.rolled} item${data.rolled === 1 ? '' : 's'} carried over`);
+    }
+  } catch (err) {
+    toast(String(err.message || err), true);
+  } finally {
+    TODO.loading = false;
+  }
+}
+
+function shiftDay(iso, days) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+/// "Today", "Yesterday", or the weekday — the calendar date is underneath it.
+function dayLabel(day, today) {
+  if (!day || !today) return 'Today';
+  if (day === today) return 'Today';
+  if (day === shiftDay(today, 1)) return 'Tomorrow';
+  if (day === shiftDay(today, -1)) return 'Yesterday';
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d))
+    .toLocaleDateString(undefined, { weekday: 'long', timeZone: 'UTC' });
+}
+
+function dayStamp(day) {
+  if (!day) return '—';
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d))
+    .toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
+    .toUpperCase();
+}
+
+function renderShelf() {
+  $('#shelf-day').textContent = dayLabel(TODO.day, TODO.today);
+  $('#shelf-date').textContent = dayStamp(TODO.day);
+  $('#shelf-today').hidden = false;
+
+  const list = $('#shelf-list');
+  list.innerHTML = '';
+  if (!TODO.items.length) {
+    list.append(el('p', { class: 'shelf-empty' },
+      TODO.day === TODO.today
+        ? 'Nothing on today yet. Add the first thing below.'
+        : 'Nothing on this day.'));
+    return;
+  }
+  for (const item of TODO.items) {
+    list.append(todoRow(item));
+    if (TODO.picking === item.id) list.append(todoPicker(item));
+  }
+  const carried = TODO.items.filter(i => i.state === 'open'
+    && i.first_scheduled_on && i.first_scheduled_on !== i.scheduled_on).length;
+  if (carried) {
+    list.append(el('div', { class: 'shelf-note' },
+      `${carried} CARRIED FROM AN EARLIER DAY`));
+  }
+}
+
+function todoRow(item) {
+  const done = item.state === 'completed';
+  const gone = item.state === 'cancelled';
+
+  const box = el('button', {
+    class: 'box',
+    title: done ? 'Mark it not done' : 'Mark it done',
+    onclick: () => todoAction(item.id, done ? 'uncomplete' : 'complete'),
+  }, done ? '✓' : gone ? '–' : '✓');
+
+  const col = el('div', { class: 'col' },
+    el('div', { class: 'body' }, item.body));
+
+  const carried = item.first_scheduled_on && item.first_scheduled_on !== item.scheduled_on;
+  if (carried && !done && !gone) {
+    col.append(el('div', { class: 'mt' }, `carried since ${dayStamp(item.first_scheduled_on)}`));
+  }
+  if (item.refs?.length) {
+    const refs = el('div', { class: 'refs' });
+    for (const ref of item.refs) {
+      refs.append(el('button', {
+        class: 'ref',
+        title: `${ref.brain_id} · ${ref.rel_path}`,
+        onclick: () => ref.note_id
+          ? openNote(ref.note_id, null)
+          : toast('That note is not in the index right now'),
+      }, ref.rel_path.split('/').pop().replace(/\.md$/, '')));
+    }
+    col.append(refs);
+  }
+
+  const acts = el('div', { class: 'acts' },
+    el('button', {
+      class: 'act', title: 'Move to tomorrow',
+      onclick: () => todoAction(item.id, 'reschedule', { to_day: 'tomorrow' }),
+    }, '»'),
+    el('button', {
+      class: 'act', title: 'Pick a day, or link a note',
+      onclick: () => { TODO.picking = TODO.picking === item.id ? null : item.id; renderShelf(); },
+    }, '⊞'),
+    el('button', {
+      class: 'act', title: 'Drop it',
+      onclick: () => todoAction(item.id, 'cancel'),
+    }, '⊘'),
+  );
+
+  return el('div', { class: 'todo', 'data-state': item.state }, box, col, acts);
+}
+
+/// Pick a day, or attach a note. The note search is the app's own search, so
+/// what you can cite is what you can link.
+function todoPicker(item) {
+  const hits = el('div', { class: 'hits' });
+  const field = el('input', {
+    type: 'search', placeholder: 'Search notes to link…', autocomplete: 'off',
+  });
+
+  const search = debounce(async text => {
+    hits.innerHTML = '';
+    if (!text.trim()) return;
+    try {
+      const data = await api(`/api/search?q=${encodeURIComponent(text)}&limit=8`);
+      for (const row of data.results) {
+        hits.append(el('button', {
+          class: 'hit',
+          onclick: () => linkNote(item.id, row.brainId || row.brain_id, row.relPath || row.rel_path),
+        }, row.name, el('small', {}, `${row.brain || ''} · ${row.source || ''}`)));
+      }
+      if (!data.results.length) hits.append(el('div', { class: 'shelf-note' }, 'NOTHING MATCHES'));
+    } catch (err) {
+      toast(String(err.message || err), true);
+    }
+  }, 180);
+  field.addEventListener('input', () => search(field.value));
+
+  const date = el('input', { type: 'date', value: item.scheduled_on || '' });
+  date.addEventListener('change', () => {
+    if (date.value) todoAction(item.id, 'reschedule', { to_day: date.value });
+  });
+
+  const picker = el('div', { class: 'todo-picker' }, date, field, hits);
+  setTimeout(() => field.focus(), 0);
+  return picker;
+}
+
+async function linkNote(id, brainId, relPath) {
+  if (!brainId || !relPath) {
+    toast('That result has no path to link', true);
+    return;
+  }
+  await todoAction(id, 'link', { brain_id: brainId, rel_path: relPath });
+}
+
+async function todoAction(id, action, body) {
+  try {
+    await api(`/api/todos/${id}/${action}`, { method: 'POST', body: body || {} });
+    TODO.picking = null;
+    await loadTodos(TODO.day);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+async function addTodo() {
+  const draft = $('#todo-draft');
+  const text = draft.value.trim();
+  if (!text) return;
+  draft.value = '';
+  draft.style.height = 'auto';
+  try {
+    await api('/api/todos', {
+      method: 'POST',
+      // Whichever day is on screen, not whichever day it is.
+      body: { body: text, scheduled_on: TODO.day },
+    });
+    await loadTodos(TODO.day);
+  } catch (err) {
+    draft.value = text;
+    toast(String(err.message || err), true);
+  }
+}
+
+function wireShelf() {
+  $('#open-todo').onclick = toggleShelf;
+  $('#shelf-close').onclick = closeShelf;
+  $('#shelf-prev').onclick = () => loadTodos(shiftDay(TODO.day || todayIso(), -1));
+  $('#shelf-next').onclick = () => loadTodos(shiftDay(TODO.day || todayIso(), 1));
+  $('#shelf-today').onclick = () => loadTodos(null);
+  $('#todo-send').onclick = addTodo;
+
+  const draft = $('#todo-draft');
+  draft.addEventListener('input', () => {
+    draft.style.height = 'auto';
+    draft.style.height = Math.min(draft.scrollHeight, 120) + 'px';
+  });
+  draft.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      addTodo();
+    }
+  });
+}
+
+/// Only a fallback for the very first navigation, before the server has told
+/// us what it considers today — its start hour is the authority, not ours.
+function todayIso() {
+  const now = new Date();
+  return new Date(now.getTime() - now.getTimezoneOffset() * 60000)
+    .toISOString().slice(0, 10);
 }
 
 boot().catch(err => {
