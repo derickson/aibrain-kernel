@@ -20,6 +20,9 @@ pub struct BrainRow {
     pub enabled: bool,
     pub note_count: i32,
     pub revision: i64,
+    /// Epoch seconds of the last scan, or None if this brain has never been
+    /// scanned. Python surfaces it as the "last built" line in the UI.
+    pub scanned_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +52,7 @@ pub struct NotePage {
     pub size: i64,
     pub degree: i32,
     pub words: i64,
+    pub excerpt: String,
     pub tags: Vec<String>,
     pub html: String,
     pub linked: Vec<NoteSummary>,
@@ -92,7 +96,8 @@ pub async fn retain_brains(pool: &PgPool, keep: &[String]) -> Result<u64> {
 
 pub async fn list_brains(pool: &PgPool) -> Result<Vec<BrainRow>> {
     let rows = sqlx::query(
-        "SELECT id, name, root, seed, enabled, note_count, revision
+        "SELECT id, name, root, seed, enabled, note_count, revision,
+                extract(epoch FROM scanned_at)::double precision AS scanned_at
            FROM brain ORDER BY name",
     )
     .fetch_all(pool)
@@ -107,6 +112,7 @@ pub async fn list_brains(pool: &PgPool) -> Result<Vec<BrainRow>> {
             enabled: r.get("enabled"),
             note_count: r.get("note_count"),
             revision: r.get("revision"),
+            scanned_at: r.try_get("scanned_at").ok().flatten(),
         })
         .collect())
 }
@@ -558,11 +564,41 @@ pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<NoteSummary>> {
         .collect())
 }
 
+/// One note, found by the path it lives at rather than by its id.
+///
+/// The ACP agent watches which files a subprocess opens, and a path is all it
+/// has to go on; without this it cannot tell a note it read from a scratch file.
+pub async fn note_by_path(
+    pool: &PgPool,
+    brain_id: &str,
+    rel_path: &str,
+) -> Result<Option<NoteSummary>> {
+    let row = sqlx::query(
+        "SELECT id, brain_id, rel_path, title, source, degree, mtime, excerpt
+           FROM note WHERE brain_id = $1 AND rel_path = $2",
+    )
+    .bind(brain_id)
+    .bind(rel_path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| NoteSummary {
+        nid: r.get("id"),
+        brain_id: r.get("brain_id"),
+        rel_path: r.get("rel_path"),
+        name: r.get("title"),
+        source: r.get("source"),
+        degree: r.get("degree"),
+        mtime: r.get("mtime"),
+        snippet: r.get::<String, _>("excerpt").chars().take(180).collect(),
+        score: None,
+    }))
+}
+
 /// One note with everything the reader needs, in a single round trip.
 pub async fn note_page(pool: &PgPool, note_id: i64) -> Result<Option<NotePage>> {
     let Some(row) = sqlx::query(
         "SELECT n.id, n.brain_id, n.rel_path, n.title, n.source, n.body, n.tags,
-                n.mtime, n.size, n.degree, b.root
+                n.excerpt, n.mtime, n.size, n.degree, b.root
            FROM note n JOIN brain b ON b.id = n.brain_id
           WHERE n.id = $1",
     )
@@ -615,6 +651,7 @@ pub async fn note_page(pool: &PgPool, note_id: i64) -> Result<Option<NotePage>> 
         size: row.get("size"),
         degree: row.get("degree"),
         words: body.split_whitespace().count() as i64,
+        excerpt: row.get("excerpt"),
         tags: text_array(&row, "tags"),
         html,
         linked: linked

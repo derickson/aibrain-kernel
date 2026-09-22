@@ -36,7 +36,7 @@ class LocalAgent(Agent):
 
         brains = Counter(self.brain_names.get(h.brain_id, h.brain_id) for h in hits)
         sources = Counter(h.source for h in hits)
-        total = self.index.count()
+        total = self._total_notes()
         spread = ", ".join(f"{name}" for name, _ in brains.most_common(3))
 
         lead = (
@@ -46,10 +46,11 @@ class LocalAgent(Agent):
         yield from _stream(lead)
 
         for i, hit in enumerate(hits, 1):
-            note = self.index.note(hit.note_id)
             brain = self.brain_names.get(hit.brain_id, hit.brain_id)
-            degree = note.degree if note else 0
-            passage = _plain(hit.snippet) or (note.excerpt[:220] if note else "")
+            degree = hit.degree
+            passage = _plain(hit.snippet)
+            if not passage:
+                passage = (self.corpus.note(hit.note_id) or {}).get("excerpt", "")[:220]
             block = (
                 f"\n{i}. {hit.title} — {brain} / {hit.source}"
                 f"{f', {degree} links' if degree else ''}\n"
@@ -73,23 +74,33 @@ class LocalAgent(Agent):
         yield Event("done")
 
     def _shared_links(self, hits) -> list[str]:
-        """Notes that more than one of the hits links to — the connective tissue."""
+        """Notes that more than one of the hits links to — the connective tissue.
+
+        `/note/:id` already carries the neighbours, so this costs one request
+        per hit rather than a query per edge.
+        """
         counter: Counter[int] = Counter()
+        titles: dict[int, str] = {}
         ids = {h.note_id for h in hits}
         for hit in hits:
-            for neighbour in self.index.neighbours(hit.note_id, limit=25):
-                if neighbour.id not in ids:
-                    counter[neighbour.id] += 1
-        shared = [nid for nid, count in counter.most_common(6) if count > 1]
-        out = []
-        for nid in shared:
-            note = self.index.note(nid)
-            if note:
-                out.append(note.title)
-        return out
+            page = self.corpus.note(hit.note_id) or {}
+            for neighbour in page.get("linked", []):
+                nid = neighbour.get("nid")
+                if nid is None or nid in ids:
+                    continue
+                counter[nid] += 1
+                titles[nid] = neighbour.get("name", "")
+        return [titles[nid] for nid, count in counter.most_common(6)
+                if count > 1 and titles.get(nid)]
+
+    def _total_notes(self) -> int:
+        try:
+            return int(self.corpus.health().get("notes", 0))
+        except Exception:
+            return 0
 
     def probe(self) -> dict:
-        return {"ok": True, "detail": f"{self.index.count():,} notes indexed"}
+        return {"ok": True, "detail": f"{self._total_notes():,} notes indexed"}
 
 
 def _stream(text: str, chunk: int = 4) -> Iterator[Event]:

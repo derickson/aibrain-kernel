@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .config import Config, DEFAULT_CONFIG_DIR
+from .corpus import Corpus, CorpusError, unreachable_message
 from .server import serve
 
 
@@ -20,7 +21,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="config file (created on first run)")
     parser.add_argument("--host", default=None, help="bind address")
     parser.add_argument("--port", type=int, default=None, help="port")
-    parser.add_argument("--no-open", action="store_true",
+    parser.add_argument("--no-open", "--no-browser", dest="no_open",
+                        action="store_true",
                         help="do not open a browser window")
     parser.add_argument("--reindex", action="store_true",
                         help="rebuild the index and exit")
@@ -34,10 +36,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.port:
         cfg.port = args.port
 
+    # Postgres and the Rust service are required now — there is no local
+    # fallback to quietly degrade to, so say so plainly instead of throwing a
+    # traceback at the first request.
+    corpus = Corpus()
+    try:
+        corpus.health()
+    except CorpusError:
+        print(unreachable_message(corpus.base_url), file=sys.stderr)
+        return 1
+
     if args.reindex:
-        from .index import Index
-        index = Index(cfg.db_path)
-        index.reindex(cfg.enabled_brains(), print, force=args.force)
+        stats = corpus.reindex(force=args.force)
+        print(
+            f"{stats.get('scanned', 0)} notes scanned — "
+            f"+{stats.get('added', 0)} added, ~{stats.get('updated', 0)} updated, "
+            f"-{stats.get('removed', 0)} removed, ={stats.get('unchanged', 0)} unchanged, "
+            f"{stats.get('links', 0)} links"
+        )
         return 0
 
     serve(cfg, open_browser=not args.no_open)

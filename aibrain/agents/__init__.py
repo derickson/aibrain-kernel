@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 
 from ..config import AgentConfig, Config
-from ..index import Index
+from ..corpus import Corpus
 from .a2a import A2AAgent
 from .acp import ACPAgent
 from .base import Agent, Citation, Event
@@ -19,9 +19,9 @@ KINDS = {"local": LocalAgent, "acp": ACPAgent, "a2a": A2AAgent}
 
 
 class Registry:
-    def __init__(self, cfg: Config, index: Index):
+    def __init__(self, cfg: Config, corpus: Corpus):
         self.cfg = cfg
-        self.index = index
+        self.corpus = corpus
         self._agents: dict[str, Agent] = {}
         self._lock = threading.Lock()
 
@@ -44,7 +44,7 @@ class Registry:
             if existing is not None:
                 existing.close()
             kls = KINDS.get(cfg.kind, LocalAgent)
-            agent = kls(cfg, self.index, self._brain_names(), self._colors())
+            agent = kls(cfg, self.corpus, self._brain_names(), self._colors())
             # An ACP agent gets file access to the vaults as well as its own
             # working directory, so it can open the notes it is asked about.
             if hasattr(agent, "vault_roots"):
