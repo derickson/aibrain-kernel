@@ -1,0 +1,1397 @@
+{
+  "app_version": "15.1.1 (1513)",
+  "migrations": [
+    "Create 'session' table",
+    "Create 'transcriptline' table",
+    "Add fullText_FTS virtual table against Sessions table",
+    "Create 'tag' table",
+    "Create 'session_tag' table",
+    "Create 'mediafile' table",
+    "Create 'dictation' table",
+    "Add fullText_FTS virtual table against Dictation table",
+    "Add dictationID column to mediafile table",
+    "Add fileExtension column to mediafile table",
+    "Add 'transcriptionDidSucceed' column to session table",
+    "Add 'transcriptionDidSucceed' column to dictation table",
+    "Create 'session_translation' table",
+    "Create 'transcriptline_translation' table",
+    "Add model+metadata columns to session",
+    "Add more transcription metadata to session",
+    "Create 'speaker' table",
+    "Create 'session_speaker' join table",
+    "Add speakerID to transcriptline",
+    "Add missing indexes for performance",
+    "Add sourceAppBundleID to session",
+    "Add aiSummaryShort column to session table",
+    "Rename session_translation table to session_fulltexttranslation",
+    "Create 'recordedmeeting' table",
+    "Add recordedMeetingID to mediafile table",
+    "Add recordedMeetingID to session table",
+    "Rename MediaFileType 'regular' to 'original'",
+    "Add playbackType column to mediafile table",
+    "Add isStub column to speaker table",
+    "Add photoData column to speaker table",
+    "Create 'systemaudiorecording' table",
+    "Add systemAudioRecordingID to session table",
+    "Add systemAudioRecordingID to mediafile table",
+    "Add isTransient column to session table",
+    "Create 'voicememos' table",
+    "Add voiceMemoID to mediafile table",
+    "Add voiceMemoID to session table",
+    "Add speakerID to transcriptline_translation",
+    "Create 'podcast' table",
+    "Add podcastID to session table",
+    "Add podcastID and speakerID to mediafile table",
+    "Add AI prompt tracking columns to dictation table",
+    "Remove redundant aiProviderName column from dictation table",
+    "Add aiService columns to dictation table",
+    "Add importedFromDefaults column to session table",
+    "Add isBeingRetranscribed column to session table",
+    "Add dateRetranscribed column to session table",
+    "Create 'downloadmetadata' table",
+    "Add downloadMetadataID to session table",
+    "Add wordsJson column to transcriptline table",
+    "Add targetAppBundleID column to dictation table",
+    "Add targetAppLocalizedName column to dictation table",
+    "Add matchedCalendarTitle column to recordedmeeting table",
+    "Clear default 'Meeting' titles in recordedmeeting table",
+    "Add aiTitle column to session table",
+    "Rename displayName to userChosenTitle in session table",
+    "Add originalFileHash column to session table",
+    "Add soft delete columns",
+    "Backfill transcriptionDidSucceed for dictations with text",
+    "Add transcriptionError and processingError columns to dictation table",
+    "Add wasImportedFromWhisperFile column to session table",
+    "Add orderIndex column to transcriptline table",
+    "Add startsNewParagraph column to transcriptline table",
+    "Restrict soft-delete indexes to deleted rows",
+    "Index aiTitle and aiSummaryShort in sessionFTS",
+    "Add isIncomingLiveStream column to session table",
+    "Add isConfirmed column to transcriptline table",
+    "Create speakermergerule table",
+    "Add hasUserAssignedSpeaker column to transcriptline table",
+    "Index originalFilename in sessionFTS",
+    "Create 'spotlightSyncQueue' table and triggers",
+    "Watch isIncomingLiveStream in the spotlightSyncQueue session trigger",
+    "Add virtual library folders"
+  ],
+  "tables": {
+    "dictation": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "transcribedText",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "processedText",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "mediaFileID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "transcriptionDidSucceed",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "aiPromptID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "aiPromptName",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "aiServiceName",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "aiServiceID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "targetAppBundleID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "targetAppLocalizedName",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateDeleted",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "transcriptionError",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "processingError",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "sql": "CREATE TABLE \"dictation\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"transcribedText\" TEXT, \"processedText\" TEXT, \"mediaFileID\" BLOB, \"transcriptionDidSucceed\" BOOLEAN, \"aiPromptID\" BLOB, \"aiPromptName\" TEXT, \"aiServiceName\" TEXT, \"aiServiceID\" BLOB, \"targetAppBundleID\" TEXT, \"targetAppLocalizedName\" TEXT, \"dateDeleted\" DOUBLE, \"transcriptionError\" TEXT, \"processingError\" TEXT)"
+    },
+    "dictationFTS": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "transcribedText",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "processedText",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "sql": "CREATE VIRTUAL TABLE \"dictationFTS\" USING fts5(id, transcribedText, processedText, content='dictation')"
+    },
+    "dictationFTS_config": {
+      "columns": [
+        {
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "sql": "CREATE TABLE 'dictationFTS_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "dictationFTS_data": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE 'dictationFTS_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "dictationFTS_docsize": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE 'dictationFTS_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "dictationFTS_idx": {
+      "columns": [
+        {
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "sql": "CREATE TABLE 'dictationFTS_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "downloadmetadata": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "sourceURL",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "youtubeVideoID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "youtubeTitle",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "youtubeThumbnailURL",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "youtubeDescription",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "sql": "CREATE TABLE \"downloadmetadata\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"sourceURL\" TEXT NOT NULL, \"youtubeVideoID\" TEXT, \"youtubeTitle\" TEXT, \"youtubeThumbnailURL\" TEXT, \"youtubeDescription\" TEXT)"
+    },
+    "grdb_migrations": {
+      "columns": [
+        {
+          "name": "identifier",
+          "notnull": 1,
+          "pk": 1,
+          "type": "TEXT"
+        }
+      ],
+      "sql": "CREATE TABLE grdb_migrations (identifier TEXT NOT NULL PRIMARY KEY)"
+    },
+    "library_folder": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "parentID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "position",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "sql": "CREATE TABLE \"library_folder\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"name\" TEXT NOT NULL, \"parentID\" BLOB REFERENCES \"library_folder\"(\"id\") ON DELETE CASCADE, \"position\" INTEGER NOT NULL DEFAULT 0)"
+    },
+    "library_folder_meeting": {
+      "columns": [
+        {
+          "name": "itemID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "folderID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"library_folder_meeting\" (\"itemID\" BLOB PRIMARY KEY NOT NULL REFERENCES \"recordedmeeting\"(\"id\") ON DELETE CASCADE, \"folderID\" BLOB NOT NULL REFERENCES \"library_folder\"(\"id\") ON DELETE CASCADE)"
+    },
+    "library_folder_podcast": {
+      "columns": [
+        {
+          "name": "itemID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "folderID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"library_folder_podcast\" (\"itemID\" BLOB PRIMARY KEY NOT NULL REFERENCES \"podcast\"(\"id\") ON DELETE CASCADE, \"folderID\" BLOB NOT NULL REFERENCES \"library_folder\"(\"id\") ON DELETE CASCADE)"
+    },
+    "library_folder_session": {
+      "columns": [
+        {
+          "name": "itemID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "folderID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"library_folder_session\" (\"itemID\" BLOB PRIMARY KEY NOT NULL REFERENCES \"session\"(\"id\") ON DELETE CASCADE, \"folderID\" BLOB NOT NULL REFERENCES \"library_folder\"(\"id\") ON DELETE CASCADE)"
+    },
+    "library_folder_systemAudioRecording": {
+      "columns": [
+        {
+          "name": "itemID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "folderID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"library_folder_systemAudioRecording\" (\"itemID\" BLOB PRIMARY KEY NOT NULL REFERENCES \"systemaudiorecording\"(\"id\") ON DELETE CASCADE, \"folderID\" BLOB NOT NULL REFERENCES \"library_folder\"(\"id\") ON DELETE CASCADE)"
+    },
+    "library_folder_voiceMemo": {
+      "columns": [
+        {
+          "name": "itemID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "folderID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"library_folder_voiceMemo\" (\"itemID\" BLOB PRIMARY KEY NOT NULL REFERENCES \"voicememos\"(\"id\") ON DELETE CASCADE, \"folderID\" BLOB NOT NULL REFERENCES \"library_folder\"(\"id\") ON DELETE CASCADE)"
+    },
+    "mediafile": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "sessionID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "filename",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "type",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dictationID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "fileExtension",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "recordedMeetingID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "playbackType",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "systemAudioRecordingID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "voiceMemoID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "podcastID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "speakerID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"mediafile\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"sessionID\" BLOB, \"filename\" TEXT NOT NULL, \"type\" TEXT NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dictationID\" BLOB, \"fileExtension\" TEXT, \"recordedMeetingID\" BLOB, \"playbackType\" TEXT NOT NULL DEFAULT 'audioOnly', \"systemAudioRecordingID\" BLOB, \"voiceMemoID\" BLOB, \"podcastID\" BLOB, \"speakerID\" BLOB, FOREIGN KEY (\"sessionID\") REFERENCES \"session\"(\"id\") ON DELETE CASCADE)"
+    },
+    "podcast": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "title",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateDeleted",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        }
+      ],
+      "sql": "CREATE TABLE \"podcast\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"title\" TEXT, \"dateCreated\" DATETIME NOT NULL, \"dateDeleted\" DOUBLE)"
+    },
+    "recordedmeeting": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "date",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "title",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "bundleIdentifier",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "appName",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "duration",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateUpdated",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "matchedCalendarTitle",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateDeleted",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        }
+      ],
+      "sql": "CREATE TABLE \"recordedmeeting\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"date\" DATETIME NOT NULL, \"title\" TEXT, \"bundleIdentifier\" TEXT NOT NULL, \"appName\" TEXT NOT NULL, \"duration\" DOUBLE, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"matchedCalendarTitle\" TEXT, \"dateDeleted\" DOUBLE)"
+    },
+    "session": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateUpdated",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateLastOpened",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "textPreview",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "aiSummary",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "fullText",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "userChosenTitle",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "transcriptionDidSucceed",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "modelEngine",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "modelIdentifer",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "modelInputLanguage",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "hasBeenDiarized",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "detectedLanguage",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "isMergedFromMultipleTracks",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "isFromYoutube",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "originalFilename",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "originalExtension",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "startTimeOffset",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "wasTranslatedToEnglishDuringTranscription",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "timeTakenToTranscribe",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "playbackDuration",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sourceAppBundleID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "aiSummaryShort",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "recordedMeetingID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "systemAudioRecordingID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "isTransient",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "voiceMemoID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "podcastID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "importedFromDefaults",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "isBeingRetranscribed",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "dateRetranscribed",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "downloadMetadataID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "aiTitle",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "originalFileHash",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateDeleted",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "wasImportedFromWhisperFile",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "isIncomingLiveStream",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        }
+      ],
+      "sql": "CREATE TABLE \"session\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"dateLastOpened\" DATETIME, \"textPreview\" TEXT, \"aiSummary\" TEXT, \"fullText\" TEXT, \"userChosenTitle\" TEXT, \"transcriptionDidSucceed\" BOOLEAN, \"modelEngine\" TEXT, \"modelIdentifer\" TEXT, \"modelInputLanguage\" TEXT, \"hasBeenDiarized\" BOOLEAN NOT NULL DEFAULT 0, \"detectedLanguage\" TEXT, \"isMergedFromMultipleTracks\" BOOLEAN NOT NULL DEFAULT 0, \"isFromYoutube\" BOOLEAN NOT NULL DEFAULT 0, \"originalFilename\" TEXT, \"originalExtension\" TEXT, \"startTimeOffset\" DOUBLE NOT NULL DEFAULT 0.0, \"wasTranslatedToEnglishDuringTranscription\" BOOLEAN NOT NULL DEFAULT 0, \"timeTakenToTranscribe\" DOUBLE, \"playbackDuration\" DOUBLE, \"sourceAppBundleID\" TEXT, \"aiSummaryShort\" TEXT, \"recordedMeetingID\" BLOB, \"systemAudioRecordingID\" BLOB, \"isTransient\" BOOLEAN NOT NULL DEFAULT 0, \"voiceMemoID\" BLOB, \"podcastID\" BLOB, \"importedFromDefaults\" BOOLEAN NOT NULL DEFAULT 0, \"isBeingRetranscribed\" BOOLEAN NOT NULL DEFAULT 0, \"dateRetranscribed\" DATETIME, \"downloadMetadataID\" BLOB, \"aiTitle\" TEXT, \"originalFileHash\" TEXT, \"dateDeleted\" DOUBLE, \"wasImportedFromWhisperFile\" BOOLEAN NOT NULL DEFAULT 0, \"isIncomingLiveStream\" BOOLEAN NOT NULL DEFAULT 0)"
+    },
+    "sessionFTS": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "fullText",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "aiSummary",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "userChosenTitle",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "aiTitle",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "aiSummaryShort",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "name": "originalFilename",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "sql": "CREATE VIRTUAL TABLE \"sessionFTS\" USING fts5(id, fullText, aiSummary, userChosenTitle, aiTitle, aiSummaryShort, originalFilename, content='session')"
+    },
+    "sessionFTS_config": {
+      "columns": [
+        {
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "sql": "CREATE TABLE 'sessionFTS_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "sessionFTS_data": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE 'sessionFTS_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "sessionFTS_docsize": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE 'sessionFTS_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "sessionFTS_idx": {
+      "columns": [
+        {
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "sql": "CREATE TABLE 'sessionFTS_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "session_fulltexttranslation": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "sessionID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "languageCode",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "fullText",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateUpdated",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        }
+      ],
+      "sql": "CREATE TABLE \"session_fulltexttranslation\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"sessionID\" BLOB NOT NULL, \"languageCode\" TEXT NOT NULL, \"fullText\" TEXT NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, FOREIGN KEY (\"sessionID\") REFERENCES \"session\"(\"id\") ON DELETE CASCADE)"
+    },
+    "session_speaker": {
+      "columns": [
+        {
+          "name": "sessionID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "speakerID",
+          "notnull": 1,
+          "pk": 2,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"session_speaker\" (\"sessionID\" BLOB NOT NULL, \"speakerID\" BLOB NOT NULL, PRIMARY KEY (\"sessionID\", \"speakerID\"), FOREIGN KEY (\"sessionID\") REFERENCES \"session\"(\"id\") ON DELETE CASCADE, FOREIGN KEY (\"speakerID\") REFERENCES \"speaker\"(\"id\") ON DELETE CASCADE)"
+    },
+    "session_tag": {
+      "columns": [
+        {
+          "name": "sessionID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "tagID",
+          "notnull": 1,
+          "pk": 2,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"session_tag\" (\"sessionID\" BLOB NOT NULL, \"tagID\" BLOB NOT NULL, PRIMARY KEY (\"sessionID\", \"tagID\"), FOREIGN KEY (\"sessionID\") REFERENCES \"session\"(\"id\") ON DELETE CASCADE, FOREIGN KEY (\"tagID\") REFERENCES \"tag\"(\"id\") ON DELETE CASCADE)"
+    },
+    "speaker": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "color",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "isStub",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "photoData",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"speaker\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"name\" TEXT NOT NULL, \"color\" TEXT, \"isStub\" BOOLEAN NOT NULL DEFAULT 0, \"photoData\" BLOB)"
+    },
+    "speakermergerule": {
+      "columns": [
+        {
+          "name": "sessionID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "sourceSpeakerID",
+          "notnull": 1,
+          "pk": 2,
+          "type": "BLOB"
+        },
+        {
+          "name": "targetSpeakerID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"speakermergerule\" (\"sessionID\" BLOB NOT NULL REFERENCES \"session\"(\"id\") ON DELETE CASCADE, \"sourceSpeakerID\" BLOB NOT NULL, \"targetSpeakerID\" BLOB NOT NULL REFERENCES \"speaker\"(\"id\") ON DELETE CASCADE, PRIMARY KEY (\"sessionID\", \"sourceSpeakerID\"))"
+    },
+    "spotlightSyncQueue": {
+      "columns": [
+        {
+          "name": "sessionID",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "dateQueued",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "revision",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "sql": "CREATE TABLE \"spotlightSyncQueue\" (\"sessionID\" BLOB PRIMARY KEY NOT NULL, \"dateQueued\" DATETIME NOT NULL, \"revision\" INTEGER NOT NULL DEFAULT 1)"
+    },
+    "systemaudiorecording": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "date",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "title",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "bundleIdentifier",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "appName",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "duration",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateUpdated",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateDeleted",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        }
+      ],
+      "sql": "CREATE TABLE \"systemaudiorecording\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"date\" DATETIME NOT NULL, \"title\" TEXT, \"bundleIdentifier\" TEXT, \"appName\" TEXT NOT NULL, \"duration\" DOUBLE, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"dateDeleted\" DOUBLE)"
+    },
+    "tag": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "color",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "sql": "CREATE TABLE \"tag\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"name\" TEXT NOT NULL UNIQUE, \"color\" TEXT NOT NULL)"
+    },
+    "transcriptline": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateUpdated",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "text",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "start",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "name": "end",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "name": "isFavorite",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "sessionId",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "speakerID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "wordsJson",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "orderIndex",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "name": "startsNewParagraph",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "isConfirmed",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "name": "hasUserAssignedSpeaker",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
+        }
+      ],
+      "sql": "CREATE TABLE \"transcriptline\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"text\" TEXT NOT NULL, \"start\" INTEGER NOT NULL, \"end\" INTEGER NOT NULL, \"isFavorite\" BOOLEAN NOT NULL, \"sessionId\" BLOB NOT NULL REFERENCES \"session\"(\"id\") ON DELETE CASCADE ON UPDATE CASCADE, \"speakerID\" BLOB, \"wordsJson\" TEXT, \"orderIndex\" INTEGER, \"startsNewParagraph\" BOOLEAN NOT NULL DEFAULT 0, \"isConfirmed\" BOOLEAN NOT NULL DEFAULT 1, \"hasUserAssignedSpeaker\" BOOLEAN NOT NULL DEFAULT 0)"
+    },
+    "transcriptline_translation": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "sessionID",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "languageCode",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "text",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "start",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "name": "end",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "dateUpdated",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "speakerID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "sql": "CREATE TABLE \"transcriptline_translation\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"sessionID\" BLOB NOT NULL, \"languageCode\" TEXT NOT NULL, \"text\" TEXT NOT NULL, \"start\" INTEGER NOT NULL, \"end\" INTEGER NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"speakerID\" BLOB, FOREIGN KEY (\"sessionID\") REFERENCES \"session\"(\"id\") ON DELETE CASCADE)"
+    },
+    "voicememos": {
+      "columns": [
+        {
+          "name": "id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "BLOB"
+        },
+        {
+          "name": "dateCreated",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATETIME"
+        },
+        {
+          "name": "mediaFileID",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        },
+        {
+          "name": "title",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "dateDeleted",
+          "notnull": 0,
+          "pk": 0,
+          "type": "DOUBLE"
+        }
+      ],
+      "sql": "CREATE TABLE \"voicememos\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"mediaFileID\" BLOB, \"title\" TEXT, \"dateDeleted\" DOUBLE)"
+    }
+  },
+  "user_version": 0
+}
