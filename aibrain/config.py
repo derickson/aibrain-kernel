@@ -1,0 +1,412 @@
+"""Configuration for the AI Brain kernel.
+
+The config lives in a single JSON file so it can be edited by hand or through
+the UI. It is created on first run by discovering Obsidian vaults in the usual
+places, so a fresh checkout starts with something to look at.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_DIR = Path(
+    os.environ.get("AIBRAIN_HOME", Path.home() / ".aibrain")
+).expanduser()
+
+# Palette lifted from the design concept: one hue per source ribbon.
+SOURCE_COLORS = [
+    "#4db3f0",  # blue
+    "#f06aa6",  # pink
+    "#f0c030",  # amber
+    "#3ecf9a",  # green
+    "#9b7cf0",  # violet
+    "#f2952d",  # orange
+    "#4fd6d0",  # teal
+    "#e0637a",  # rose
+    "#7fd8e8",  # cyan
+    "#c0d05a",  # lime
+]
+
+AGENT_COLORS = ["#b48cff", "#ffb347", "#ff7a59", "#6ee7b7", "#7fd8e8"]
+
+# Agents with no saved position are placed by the graph builder, which knows
+# how big the galaxies turned out; dragging one in the UI pins it here.
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+@dataclass
+class BrainConfig:
+    """One Obsidian vault rendered as one galaxy."""
+
+    id: str
+    name: str
+    path: str
+    enabled: bool = True
+    # Grid slot is resolved at build time; an explicit center pins it.
+    center: list[float] | None = None
+    radius: float | None = None
+    seed: int | None = None
+    max_nodes: int = 2200
+    exclude: list[str] = field(
+        default_factory=lambda: [".obsidian", ".trash", ".git", "ZZ-Attachments",
+                                 "ZZ-Attachements", "assets", "scans", "Excalidraw"]
+    )
+
+    def resolved_path(self) -> Path:
+        return Path(self.path).expanduser()
+
+
+@dataclass
+class AgentConfig:
+    """A conversational endpoint shown as a star in the universe.
+
+    kind:
+      local  -- built-in retrieval agent, answers from the index itself
+      acp    -- Agent Client Protocol over stdio (Claude Code, Codex, ...)
+      a2a    -- Agent2Agent over HTTP (Elasticsearch Agent Builder, ...)
+    """
+
+    id: str
+    name: str
+    kind: str = "local"
+    color: str = "#b48cff"
+    protocol: str = ""
+    intro: str = ""
+    suggestions: list[str] = field(default_factory=list)
+    pos: list[float] | None = None
+    enabled: bool = True
+
+    # acp
+    command: list[str] = field(default_factory=list)
+    cwd: str = ""
+    env: dict[str, str] = field(default_factory=dict)
+
+    # a2a
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+
+    # retrieval context handed to remote agents
+    context_notes: int = 6
+    context_chars: int = 1200
+    brains: list[str] = field(default_factory=list)  # empty == all
+
+    def label(self) -> str:
+        if self.protocol:
+            return self.protocol
+        return {"local": "LOCAL", "acp": "ACP", "a2a": "A2A"}.get(self.kind, self.kind.upper())
+
+
+@dataclass
+class ScriptConfig:
+    """A maintenance script the UI can run and stream output from."""
+
+    id: str
+    name: str
+    description: str = ""
+    command: list[str] = field(default_factory=list)
+    cwd: str = ""
+    args_hint: str = ""
+    # Optional named toggles, e.g. {"Dry run": ["--dry-run"]}
+    options: dict[str, list[str]] = field(default_factory=dict)
+    reindex_after: bool = False
+
+
+@dataclass
+class ViewOptions:
+    rotation_speed: float = 0.35
+    link_opacity: float = 0.24
+    show_all_labels: bool = False
+    ribbon_twist: float = 0.25
+
+
+@dataclass
+class Config:
+    brains: list[BrainConfig] = field(default_factory=list)
+    agents: list[AgentConfig] = field(default_factory=list)
+    scripts: list[ScriptConfig] = field(default_factory=list)
+    view: ViewOptions = field(default_factory=ViewOptions)
+    host: str = "127.0.0.1"
+    port: int = 8760
+    title: str = "Dave Brain"
+
+    path: Path = field(default=DEFAULT_CONFIG_DIR / "config.json", repr=False)
+
+    # ---- persistence -----------------------------------------------------
+    @classmethod
+    def load(cls, path: Path | None = None) -> "Config":
+        path = Path(path or DEFAULT_CONFIG_DIR / "config.json").expanduser()
+        if not path.exists():
+            cfg = default_config()
+            cfg.path = path
+            cfg.save()
+            return cfg
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        cfg = cls.from_dict(raw)
+        cfg.path = path
+        # The symlink folder is the source of truth for which vaults exist, so
+        # a link added or removed on disk takes effect on the next start
+        # without anyone editing config.json.
+        if reconcile_brains(cfg):
+            cfg.save()
+        return cfg
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "Config":
+        def build(kls, items):
+            fields = {f for f in kls.__dataclass_fields__}
+            return [kls(**{k: v for k, v in it.items() if k in fields}) for it in items]
+
+        view_raw = raw.get("view", {}) or {}
+        view = ViewOptions(
+            **{k: v for k, v in view_raw.items() if k in ViewOptions.__dataclass_fields__}
+        )
+        return cls(
+            brains=build(BrainConfig, raw.get("brains", [])),
+            agents=build(AgentConfig, raw.get("agents", [])),
+            scripts=build(ScriptConfig, raw.get("scripts", [])),
+            view=view,
+            host=raw.get("host", "127.0.0.1"),
+            port=int(raw.get("port", 8760)),
+            title=raw.get("title", "Dave Brain"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "host": self.host,
+            "port": self.port,
+            "view": asdict(self.view),
+            "brains": [asdict(b) for b in self.brains],
+            "agents": [asdict(a) for a in self.agents],
+            "scripts": [asdict(s) for s in self.scripts],
+        }
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+
+    # ---- lookups ---------------------------------------------------------
+    def brain(self, bid: str) -> BrainConfig | None:
+        return next((b for b in self.brains if b.id == bid), None)
+
+    def agent(self, aid: str) -> AgentConfig | None:
+        return next((a for a in self.agents if a.id == aid), None)
+
+    def script(self, sid: str) -> ScriptConfig | None:
+        return next((s for s in self.scripts if s.id == sid), None)
+
+    def enabled_brains(self) -> list[BrainConfig]:
+        return [b for b in self.brains if b.enabled and b.resolved_path().is_dir()]
+
+    def enabled_agents(self) -> list[AgentConfig]:
+        return [a for a in self.agents if a.enabled]
+
+    @property
+    def db_path(self) -> Path:
+        return self.path.parent / "index.sqlite3"
+
+
+# ---------------------------------------------------------------------------
+# which vaults exist
+# ---------------------------------------------------------------------------
+
+# The symlink folder is the allowlist, not a hint. A vault is visible to this
+# app if, and only if, it is linked from here — so adding one is `ln -s`, and
+# removing one is `rm`, with no way for a scan to volunteer a vault you did not
+# ask for.
+VAULT_LINK_DIR = REPO_ROOT / "obsidian_vaults"
+
+
+def discover_vaults() -> list[Path]:
+    """Vaults linked from `obsidian_vaults/`, de-duplicated by real path.
+
+    Broken links are skipped rather than reported, because the caller only ever
+    wants the ones it can actually read; `link_problems()` explains the rest.
+    """
+    found: dict[Path, Path] = {}
+    base = VAULT_LINK_DIR
+    if not base.is_dir():
+        return []
+    for child in sorted(base.iterdir()):
+        try:
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            real = child.resolve()
+            if real in found:
+                continue
+            found[real] = child
+        except (OSError, PermissionError):
+            continue
+    return list(found.values())
+
+
+def link_problems() -> list[tuple[str, str]]:
+    """Entries in `obsidian_vaults/` that do not resolve, as (name, reason).
+
+    A dangling symlink is silent otherwise — the vault simply never appears —
+    so the UI surfaces these instead of leaving you to wonder.
+    """
+    out: list[tuple[str, str]] = []
+    if not VAULT_LINK_DIR.is_dir():
+        return out
+    for child in sorted(VAULT_LINK_DIR.iterdir()):
+        if child.name.startswith("."):
+            continue
+        if child.is_dir():
+            continue
+        if child.is_symlink():
+            out.append((child.name, f"link points at {os.readlink(child)}, "
+                                    f"which does not exist"))
+        else:
+            out.append((child.name, "not a directory"))
+    return out
+
+
+def reconcile_brains(cfg: "Config") -> bool:
+    """Make the brain list match the symlinks, keeping per-brain settings.
+
+    Settings are merged back by id, so unlinking a vault and relinking it later
+    restores how it was configured rather than resetting it. Returns whether
+    anything changed, so the caller knows to save.
+    """
+    linked = discover_vaults()
+    by_id: dict[str, BrainConfig] = {}
+    for i, path in enumerate(linked):
+        bid = slugify(path.name)
+        prior = cfg.brain(bid)
+        if prior is not None:
+            prior.path = str(path)
+            by_id[bid] = prior
+        else:
+            by_id[bid] = BrainConfig(
+                id=bid, name=path.name, path=str(path), seed=7 + i * 13)
+
+    changed = [b.id for b in cfg.brains] != list(by_id)
+    if not changed:
+        changed = any(cfg.brain(b).path != by_id[b].path for b in by_id)
+    cfg.brains = list(by_id.values())
+    return changed
+
+
+def slugify(name: str) -> str:
+    out = "".join(c.lower() if c.isalnum() else "-" for c in name).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out or "brain"
+
+
+def _on_path(name: str) -> bool:
+    import shutil
+    return shutil.which(name) is not None
+
+
+def default_agents() -> list[AgentConfig]:
+    # An adapter that is already installed is almost certainly meant to be used,
+    # so turn those on; the rest stay listed but dark until they are configured.
+    return [
+        AgentConfig(
+            id="kernel",
+            name="Kernel",
+            kind="local",
+            color="#b48cff",
+            protocol="LOCAL RETRIEVAL",
+            intro=(
+                "Kernel reads straight from the index. Ask it anything and it will "
+                "pull the notes that answer it, ranked, with the passage that matched."
+            ),
+            suggestions=[
+                "What do I know about agent protocols?",
+                "Find every note mentioning Claude Code",
+                "Which notes link to my journal the most?",
+            ],
+        ),
+        AgentConfig(
+            id="claude-code",
+            name="Claude Code",
+            kind="acp",
+            color="#ff7a59",
+            protocol="ACP",
+            intro=(
+                "Connected over the Agent Client Protocol. Reads the markdown behind "
+                "your brains and can edit or link the files directly."
+            ),
+            suggestions=[
+                "Summarize what changed in my vault this week",
+                "Which notes are orphaned?",
+                "Draft a note linking my open projects",
+            ],
+            command=["claude-agent-acp"],
+            cwd=str(REPO_ROOT),
+            enabled=_on_path("claude-agent-acp"),
+        ),
+        AgentConfig(
+            id="codex",
+            name="Codex",
+            kind="acp",
+            color="#4fd6d0",
+            protocol="ACP",
+            intro=(
+                "Connected over the Agent Client Protocol via the Codex CLI. Reads "
+                "the same retrieved passages and the files behind them."
+            ),
+            suggestions=[
+                "Explain how the exporter script works",
+                "Where does the index get built?",
+                "What are the oldest notes in my vault about?",
+            ],
+            command=["codex-acp"],
+            cwd=str(REPO_ROOT),
+            enabled=_on_path("codex-acp"),
+        ),
+        AgentConfig(
+            id="elastic",
+            name="Elasticsearch Agent Builder",
+            kind="a2a",
+            color="#ffb347",
+            protocol="A2A",
+            intro=(
+                "Connected over Agent2Agent. Runs hybrid search over the indexed "
+                "notes and returns ranked passages."
+            ),
+            suggestions=[
+                "Search meetings about pricing",
+                "Show notes I saved last month",
+            ],
+            url="http://localhost:9000",
+            enabled=False,
+        ),
+    ]
+
+
+def default_scripts() -> list[ScriptConfig]:
+    return [
+        ScriptConfig(
+            id="macwhisper",
+            name="MacWhisper transcripts",
+            description=(
+                "Tail MacWhisper's database and mirror new transcripts into the "
+                "vault's raw_transcript/ folder. Quits and relaunches MacWhisper."
+            ),
+            command=["python3", str(REPO_ROOT / "scripts/macwhisper/macwhisper_export.py")],
+            cwd=str(REPO_ROOT),
+            options={"Dry run": ["--dry-run"], "Verbose": ["--verbose"]},
+            reindex_after=True,
+        ),
+    ]
+
+
+def default_config() -> Config:
+    cfg = Config(agents=default_agents(), scripts=default_scripts())
+    reconcile_brains(cfg)
+    return cfg

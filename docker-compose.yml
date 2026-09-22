@@ -1,0 +1,70 @@
+# Postgres is the only thing containerised in dev, on purpose.
+#
+# The watcher has to see FSEvents for files on your Mac, and a container does
+# not: podman and Docker Desktop both mount host paths over virtiofs, which
+# does not forward filesystem events into the VM. A watcher running in here
+# would sit silent while you edited notes. So `docker compose up -d db` gives
+# you the database, and the Rust service and the Python app run natively
+# alongside it.
+#
+# The `full` profile exists for a host where the vault lives in the container's
+# own filesystem, where that constraint does not apply:
+#
+#   docker compose up -d db              # dev: database only
+#   docker compose --profile full up -d  # everything
+
+name: aibrain
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: aibrain-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aibrain
+      POSTGRES_PASSWORD: aibrain
+      POSTGRES_DB: aibrain
+      # The corpus is regenerable from the vaults, so durability matters less
+      # than ingest speed on a full rescan of a few thousand notes.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=32MB
+      - -c
+      - synchronous_commit=off
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibrain -d aibrain"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  watcher:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: rust/Dockerfile
+    container_name: aibrain-watcher
+    restart: unless-stopped
+    environment:
+      AIBRAIN_DATABASE_URL: postgres://aibrain:aibrain@db:5432/aibrain
+      AIBRAIN_BIND: 0.0.0.0:8781
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8781:8781"
+    volumes:
+      # Read-only: this process never writes to a vault.
+      - ./obsidian_vaults:/vaults:ro
+      - ./config:/config
+
+volumes:
+  pgdata:

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//Users/dave/Documents/ObsidianVaults/AgentKnowledge/**)",
+      "Read(//Users/dave/Documents/ObsidianVaults/Elastic/**)",
+      "Read(//Users/dave/Documents/ObsidianVaults/Home/**)",
+      "Read(//Users/dave/Documents/ObsidianVaults/grognard/**)",
+      "Read(//Users/dave/.ssh/**)",
+      "Read(//Users/dave/.aws/**)",
+      "Read(//Users/dave/.gnupg/**)",
+      "Read(//Users/dave/.config/gh/**)",
+      "Read(//Users/dave/Library/Keychains/**)"
+    ]
+  }
+}

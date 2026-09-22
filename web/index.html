@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI Brains</title>
+<link rel="stylesheet" href="/fonts/fonts.css">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='none' stroke='%237fd8e8' stroke-width='2'/><circle cx='16' cy='16' r='3' fill='%23b48cff'/></svg>">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ─────────────────────────── left: agent chat ─────────────────────── -->
+  <aside class="panel panel-left" id="left" data-open="false">
+    <div class="panel-inner">
+      <header class="chat-head">
+        <span class="dot" id="agent-dot"></span>
+        <div class="chat-title">
+          <div class="name" id="agent-name">Agent</div>
+          <div class="meta mono" id="agent-meta">READY</div>
+        </div>
+        <button class="icon-btn" id="chat-clear" title="Clear this conversation">⟲</button>
+        <button class="icon-btn" id="chat-close" title="Close">×</button>
+      </header>
+
+      <div class="chat-log" id="chat-log">
+        <div class="chat-empty" id="chat-empty">
+          <p class="intro" id="agent-intro"></p>
+          <div class="label mono">TRY ASKING</div>
+          <div class="suggestions" id="suggestions"></div>
+        </div>
+      </div>
+
+      <footer class="composer">
+        <div class="composer-box">
+          <textarea id="draft" rows="1" placeholder="Message…"></textarea>
+          <button class="send" id="send" title="Send">↑</button>
+        </div>
+        <div class="composer-hint mono">ENTER TO SEND · CITATIONS OPEN NOTES ON THE RIGHT</div>
+      </footer>
+    </div>
+  </aside>
+
+  <!-- ─────────────────────────── centre: universe ─────────────────────── -->
+  <main class="center">
+    <div class="canvas" id="canvas"></div>
+
+    <div class="boot" id="boot">
+      <div class="boot-inner">
+        <div class="spinner"></div>
+        <div class="boot-text mono" id="boot-text">READING YOUR BRAINS</div>
+        <div class="boot-sub" id="boot-sub">Indexing the vaults. This only takes a moment.</div>
+      </div>
+    </div>
+
+    <div class="topbar">
+      <div class="brand">
+        <span class="dot brand-dot"></span>
+        <span class="brand-name" id="brand">AI Brains</span>
+      </div>
+      <div class="chips" id="chips"></div>
+      <div class="topbar-right">
+        <button class="search-btn" id="open-search">
+          <span class="glyph">⌕</span>
+          <span class="txt">Search notes</span>
+          <span class="kbd mono">/</span>
+        </button>
+        <button class="icon-btn" id="reset-view" title="Reset view">⊕</button>
+        <button class="icon-btn" id="open-menu" title="Brains, agents and tools">☰</button>
+      </div>
+    </div>
+
+    <div class="hints mono">
+      <span>DRAG TO ORBIT · SCROLL TO ZOOM</span>
+      <span>DOUBLE-CLICK AN AGENT TO CHAT · DRAG IT TO MOVE</span>
+      <span>CLICK A NOTE TO READ IT</span>
+    </div>
+
+    <div class="status">
+      <span class="dot" id="status-dot"></span>
+      <span class="mono" id="status-label">…</span>
+    </div>
+
+    <div class="agent-rail" id="agent-rail"></div>
+  </main>
+
+  <!-- ─────────────────────────── right: notes ─────────────────────────── -->
+  <aside class="panel panel-right" id="right" data-open="false">
+    <div class="panel-inner">
+      <header class="search-head">
+        <div class="search-field">
+          <span class="glyph">⌕</span>
+          <input id="query" placeholder="Search notes across all brains…" autocomplete="off" spellcheck="false">
+          <button class="clear-q" id="clear-q" hidden>×</button>
+        </div>
+        <button class="icon-btn" id="right-close" title="Close">×</button>
+      </header>
+
+      <div class="right-body" id="right-body">
+
+        <section id="note-view" hidden>
+          <div class="note-nav">
+            <button class="back" id="back-results" hidden>← Back to results</button>
+            <div class="crumb">
+              <span class="dot" id="note-dot"></span>
+              <span id="note-crumb"></span>
+            </div>
+          </div>
+          <div class="note-meta mono" id="note-meta"></div>
+          <article class="note" id="note-body"></article>
+          <div class="label mono" id="linked-label">LINKED NOTES</div>
+          <div class="linked" id="linked"></div>
+        </section>
+
+        <section id="results-view" hidden>
+          <div class="label mono" id="results-label"></div>
+          <div class="results" id="results"></div>
+        </section>
+
+        <section id="empty-view">
+          <div class="label mono">NOTES</div>
+          <p class="empty-copy">
+            Search across every brain, click a note in the universe, or follow a
+            citation from an agent.
+          </p>
+          <div class="label mono" style="margin-top:22px">RECENTLY CHANGED</div>
+          <div class="results" id="recent"></div>
+        </section>
+
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- ─────────────────────────── control drawer ───────────────────────────── -->
+<div class="drawer-scrim" id="drawer-scrim" hidden></div>
+<section class="drawer" id="drawer" hidden aria-label="Control panel">
+  <header class="drawer-head">
+    <nav class="tabs" id="drawer-tabs">
+      <button data-tab="brains" class="on">Brains</button>
+      <button data-tab="agents">Agents</button>
+      <button data-tab="tools">Tools</button>
+      <button data-tab="view">View</button>
+    </nav>
+    <button class="icon-btn" id="drawer-close" title="Close">×</button>
+  </header>
+  <div class="drawer-body">
+    <div class="tab-panel" data-panel="brains" id="panel-brains"></div>
+    <div class="tab-panel" data-panel="agents" id="panel-agents" hidden></div>
+    <div class="tab-panel" data-panel="tools" id="panel-tools" hidden></div>
+    <div class="tab-panel" data-panel="view" id="panel-view" hidden></div>
+  </div>
+</section>
+
+<div class="toast-stack" id="toasts"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -4,3 +4,12 @@ __pycache__/
 obsidian_vaults
 graft
 .DS_Store
+
+# rust build output
+rust/target/
+
+# local state written by the app
+.aibrain/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

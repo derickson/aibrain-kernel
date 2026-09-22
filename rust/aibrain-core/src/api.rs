@@ -1,0 +1,188 @@
+//! The HTTP surface Python talks to.
+//!
+//! Coarse on purpose. The previous design exposed fourteen fine-grained
+//! queries that Python looped over — one search per wikilink to render a note,
+//! twenty-five round trips to build the universe. In-process that was free.
+//! Across a socket it would be fatal, so each route here answers a whole
+//! question: give me this note *and* its neighbours *and* its rendered HTML.
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::json;
+use sqlx::PgPool;
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::db;
+use crate::graph;
+
+pub struct Ctx {
+    pub pool: PgPool,
+    pub config_path: std::path::PathBuf,
+    /// Bumped whenever ingest changes anything, so clients can poll cheaply.
+    pub revision: std::sync::atomic::AtomicI64,
+}
+
+impl Ctx {
+    pub fn config(&self) -> anyhow::Result<Config> {
+        crate::config::load(&self.config_path)
+    }
+}
+
+type Shared = Arc<Ctx>;
+
+/// Anything that goes wrong becomes JSON, never an empty 500.
+pub struct ApiError(anyhow::Error);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        tracing::error!("{:#}", self.0);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{:#}", self.0) })),
+        )
+            .into_response()
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for ApiError {
+    fn from(err: E) -> Self {
+        ApiError(err.into())
+    }
+}
+
+type ApiResult<T> = std::result::Result<T, ApiError>;
+
+pub fn router(ctx: Shared) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/status", get(status))
+        .route("/universe", get(universe))
+        .route("/search", get(search))
+        .route("/note/:id", get(note))
+        .route("/notes/recent", get(recent))
+        .route("/reindex", post(reindex))
+        .with_state(ctx)
+}
+
+async fn health(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+    // Touch the database rather than just reporting that the process is alive;
+    // "up but cannot reach Postgres" is the failure worth catching.
+    let notes = db::count_notes(&ctx.pool).await?;
+    Ok(Json(json!({ "ok": true, "notes": notes })))
+}
+
+async fn status(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+    let cfg = ctx.config()?;
+    let brains = db::list_brains(&ctx.pool).await?;
+    Ok(Json(json!({
+        "title": cfg.title,
+        "notes": db::count_notes(&ctx.pool).await?,
+        "links": db::count_links(&ctx.pool).await?,
+        "revision": ctx.revision.load(std::sync::atomic::Ordering::Relaxed),
+        "brains": brains,
+    })))
+}
+
+async fn universe(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+    let cfg = ctx.config()?;
+    Ok(Json(graph::build(&ctx.pool, &cfg).await?))
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    #[serde(default)]
+    brains: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    /// `any=1` ORs the terms. A question needs this; a search box does not.
+    #[serde(default)]
+    any: Option<String>,
+}
+
+async fn search(
+    State(ctx): State<Shared>,
+    Query(params): Query<SearchParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let query = params.q.unwrap_or_default();
+    let brains: Vec<String> = params
+        .brains
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let limit = params.limit.unwrap_or(60).clamp(1, 500);
+    let any = matches!(params.any.as_deref(), Some("1") | Some("true"));
+
+    let mut results = db::search(&ctx.pool, &query, &brains, limit, any).await?;
+    // A question whose every term must match usually matches nothing. Widen
+    // once rather than returning an empty answer that looks like "no such note".
+    if results.is_empty() && !any && query.split_whitespace().count() > 1 {
+        results = db::search(&ctx.pool, &query, &brains, limit, true).await?;
+    }
+    Ok(Json(json!({
+        "query": query,
+        "count": results.len(),
+        "results": results,
+    })))
+}
+
+async fn note(
+    State(ctx): State<Shared>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    match db::note_page(&ctx.pool, id).await? {
+        Some(page) => Ok(Json(page).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such note" })),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecentParams {
+    limit: Option<i64>,
+}
+
+async fn recent(
+    State(ctx): State<Shared>,
+    Query(params): Query<RecentParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let limit = params.limit.unwrap_or(20).clamp(1, 200);
+    Ok(Json(json!({ "results": db::recent(&ctx.pool, limit).await? })))
+}
+
+#[derive(Deserialize)]
+struct ReindexBody {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn reindex(
+    State(ctx): State<Shared>,
+    Json(body): Json<ReindexBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let cfg = ctx.config()?;
+    let stats =
+        crate::ingest::reindex(&ctx.pool, &cfg.brains, body.force, |line| tracing::info!("{line}"))
+            .await?;
+    if stats.changed() {
+        ctx.revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(Json(json!({
+        "scanned": stats.scanned,
+        "added": stats.added,
+        "updated": stats.updated,
+        "removed": stats.removed,
+        "unchanged": stats.unchanged,
+        "links": stats.links,
+    })))
+}
