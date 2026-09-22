@@ -97,6 +97,26 @@ button { cursor: pointer; background: none; border: none; }
 }
 .icon-btn:hover { color: #fff; border-color: var(--line-strong); background: rgba(127, 216, 232, .07); }
 
+/* A tab clipped to the left edge, so the day's list can be pulled open
+   without eating space in the topbar. Hidden once the shelf is open — the
+   shelf's own × closes it from there. */
+.shelf-tab {
+  position: fixed;
+  left: 0; top: 50%; transform: translateY(-50%);
+  z-index: 25;
+  width: 26px; height: 68px;
+  display: grid; place-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: none;
+  border-radius: 0 10px 10px 0;
+  color: var(--fg-dim);
+  font-size: 15px; line-height: 1;
+  transition: color .15s, border-color .15s, background .15s, opacity .2s, width .15s;
+}
+.shelf-tab:hover { color: #fff; width: 30px; border-color: var(--line-strong); background: rgba(127, 216, 232, .07); }
+#shelf[data-open="true"] ~ .shelf-tab { opacity: 0; pointer-events: none; }
+
 .label { font-size: 10px; letter-spacing: .18em; color: var(--fg-mute); }
 
 /* ───────────────────────────── chat (left) ────────────────────────────── */
@@ -252,16 +272,22 @@ button { cursor: pointer; background: none; border: none; }
 
 .topbar {
   position: absolute; top: 0; left: 0; right: 0;
-  display: flex; align-items: center; gap: 16px;
+  /* Equal 1fr flanks put the middle column at the true center of the bar,
+     regardless of how wide the brand or the right-hand controls are. */
+  display: grid; grid-template-columns: 1fr minmax(0, auto) 1fr; align-items: center;
+  gap: 16px;
   padding: 16px 20px; pointer-events: none;
   background: linear-gradient(180deg, rgba(4, 6, 11, .85), transparent);
 }
 .topbar > * { pointer-events: auto; }
-.brand { display: flex; align-items: center; gap: 10px; flex: none; }
+.brand { display: flex; align-items: center; gap: 10px; justify-self: start; }
 .brand-dot { width: 10px; height: 10px; background: var(--accent); }
 .brand-name { font-size: 14px; font-weight: 700; letter-spacing: -.01em; }
 
-.chips { display: flex; gap: 6px; flex: 1; min-width: 0; overflow-x: auto; padding: 2px; }
+.chips {
+  display: flex; gap: 6px; overflow-x: auto; padding: 2px;
+  justify-self: center; max-width: 100%;
+}
 .chips::-webkit-scrollbar { height: 0; }
 .chip {
   display: flex; align-items: center; gap: 8px; flex: none;
@@ -279,7 +305,7 @@ button { cursor: pointer; background: none; border: none; }
   font: 500 9px 'JetBrains Mono', monospace; letter-spacing: .1em; color: var(--fg-faint);
 }
 
-.topbar-right { display: flex; align-items: center; gap: 8px; flex: none; }
+.topbar-right { display: flex; align-items: center; gap: 8px; justify-self: end; }
 .search-btn {
   display: flex; align-items: center; gap: 9px;
   padding: 7px 10px 7px 12px; border-radius: 10px;
@@ -693,6 +719,60 @@ button { cursor: pointer; background: none; border: none; }
 }
 
 .shelf-add { padding: 12px 14px 14px; border-top: 1px solid var(--line); flex: none; }
+
+/* Folders: a persistent backlog, always last, exempt from rollover. */
+.shelf-folders {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.shelf-folder { border-radius: 9px; }
+.shelf-folder-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 6px; border-radius: 9px;
+  border: 1px solid transparent;
+  transition: border-color .15s, background .15s;
+}
+.shelf-folder-head:hover { border-color: rgba(127, 216, 232, .2); background: rgba(127, 216, 232, .045); }
+.shelf-folder-head .chevron {
+  width: 18px; height: 18px; flex: none; color: var(--fg-dim);
+  font-size: 14px; display: grid; place-items: center;
+}
+.shelf-folder-head .nm {
+  flex: 1; min-width: 0; font: 600 13px Manrope, system-ui, sans-serif; color: #dbe4ee;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text;
+}
+.shelf-folder-head .count {
+  font-size: 9px; color: var(--fg-mute); letter-spacing: .1em;
+}
+.shelf-folder-head .act { opacity: 0; transition: opacity .15s; }
+.shelf-folder-head:hover .act { opacity: 1; }
+.shelf-folder-body {
+  margin-left: 22px; padding: 2px 0 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  border-radius: 9px;
+}
+.shelf-folder-body .shelf-empty { padding: 4px 6px 8px; font-size: 12px; }
+
+.shelf-folder-name-input {
+  flex: 1; min-width: 0; padding: 2px 6px; border-radius: 6px;
+  border: 1px solid var(--line-strong); background: rgba(4, 6, 11, .6);
+  font: 600 13px Manrope, system-ui, sans-serif; color: #fff; outline: none;
+}
+
+.shelf-folder-new {
+  align-self: flex-start; padding: 6px 8px; border-radius: 7px;
+  font: 500 11px 'JetBrains Mono', monospace; letter-spacing: .08em;
+  color: var(--fg-mute); transition: color .15s, background .15s;
+}
+.shelf-folder-new:hover { color: #fff; background: rgba(127, 216, 232, .07); }
+
+/* Shared by every folder drop target — the header, the body, and a row
+   being reordered against inside a folder. */
+.shelf-folder-head.drag-over,
+.shelf-folder-body.drag-over,
+.todo.drag-over {
+  border-color: var(--line-strong); background: rgba(127, 216, 232, .12);
+}
 
 /* ───────────────────────────── toasts ────────────────────────────────── */
 

@@ -55,6 +55,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         include_str!("migrations/0001_corpus.sql"),
         include_str!("migrations/0002_search_queue.sql"),
         include_str!("migrations/0003_todo.sql"),
+        include_str!("migrations/0004_todo_folders.sql"),
     ];
     // `pg_trgm` needs its own statement boundary and may fail without
     // superuser; the index that depends on it is optional, so a failure there

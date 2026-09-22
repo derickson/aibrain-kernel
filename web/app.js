@@ -1330,10 +1330,18 @@ const TODO = {
   day: null,        // the day being shown, YYYY-MM-DD
   today: null,      // what the server calls today, by its start hour
   items: [],
+  folders: [],      // the persistent backlog, always rendered last
   open: false,
   picking: null,    // the id whose note picker is showing
+  editingFolder: null,  // the folder id whose name is a text field right now
+  addingFolder: false,  // whether the "new folder" input is showing
   loading: false,
 };
+
+// The id of whatever `.todo` is being dragged, so any drop target — a folder
+// header, a folder's body, another row to reorder against — can read it
+// without smuggling state through dataTransfer.
+let dragTodoId = null;
 
 function openShelf() {
   TODO.open = true;
@@ -1360,6 +1368,7 @@ async function loadTodos(day) {
     TODO.day = data.day;
     TODO.today = data.today;
     TODO.items = data.todos || [];
+    TODO.folders = data.folders || [];
     renderShelf();
     if (data.rolled) {
       toast(`${data.rolled} item${data.rolled === 1 ? '' : 's'} carried over`);
@@ -1404,26 +1413,147 @@ function renderShelf() {
 
   const list = $('#shelf-list');
   list.innerHTML = '';
+  // The whole list is the drop target for taking an item back out of a
+  // folder; each folder's own header/body stops the event before it bubbles
+  // here, so this only fires for a drop that landed outside every folder.
+  list.ondragover = event => { event.preventDefault(); };
+  list.ondrop = event => {
+    event.preventDefault();
+    if (dragTodoId != null) fileTodo(dragTodoId, null);
+  };
+
   if (!TODO.items.length) {
     list.append(el('p', { class: 'shelf-empty' },
       TODO.day === TODO.today
         ? 'Nothing on today yet. Add the first thing below.'
         : 'Nothing on this day.'));
-    return;
+  } else {
+    for (const item of TODO.items) {
+      list.append(todoRow(item));
+      if (TODO.picking === item.id) list.append(todoPicker(item));
+    }
+    const carried = TODO.items.filter(i => i.state === 'open'
+      && i.first_scheduled_on && i.first_scheduled_on !== i.scheduled_on).length;
+    if (carried) {
+      list.append(el('div', { class: 'shelf-note' },
+        `${carried} CARRIED FROM AN EARLIER DAY`));
+    }
   }
-  for (const item of TODO.items) {
-    list.append(todoRow(item));
-    if (TODO.picking === item.id) list.append(todoPicker(item));
-  }
-  const carried = TODO.items.filter(i => i.state === 'open'
-    && i.first_scheduled_on && i.first_scheduled_on !== i.scheduled_on).length;
-  if (carried) {
-    list.append(el('div', { class: 'shelf-note' },
-      `${carried} CARRIED FROM AN EARLIER DAY`));
+
+  if (TODO.folders.length || TODO.addingFolder) {
+    const wrap = el('div', { class: 'shelf-folders' });
+    for (const folder of TODO.folders) wrap.append(folderSection(folder));
+    wrap.append(folderAddRow());
+    list.append(wrap);
+  } else {
+    list.append(el('button', {
+      class: 'shelf-folder-new', title: 'Group tasks into a folder',
+      onclick: () => { TODO.addingFolder = true; renderShelf(); },
+    }, '+ New folder'));
   }
 }
 
-function todoRow(item) {
+function folderSection(folder) {
+  const open = !folder.collapsed;
+  const body = el('div', { class: 'shelf-folder-body' });
+  if (!folder.todos.length) {
+    body.append(el('p', { class: 'shelf-empty' }, 'Drag tasks in.'));
+  } else {
+    for (const item of folder.todos) body.append(todoRow(item, folder));
+  }
+  body.hidden = !open;
+  dropZone(body, folder);
+
+  const nameNode = TODO.editingFolder === folder.id
+    ? folderNameInput(folder)
+    : el('span', {
+        class: 'nm',
+        title: 'Click to rename',
+        onclick: event => { event.stopPropagation(); TODO.editingFolder = folder.id; renderShelf(); },
+      }, folder.name);
+
+  const head = el('div', { class: 'shelf-folder-head' },
+    el('button', {
+      class: 'chevron', title: open ? 'Collapse' : 'Expand',
+      onclick: () => patchFolder(folder.id, { collapsed: open }),
+    }, open ? '▾' : '▸'),
+    nameNode,
+    el('span', { class: 'count mono' }, String(folder.todos.length)),
+    el('span', { style: 'flex:1' }),
+    el('button', {
+      class: 'act', title: 'Delete this folder',
+      onclick: () => {
+        if (folder.todos.length && !confirm(`Delete “${folder.name}”? Its ${folder.todos.length} task${folder.todos.length === 1 ? '' : 's'} will land back on today's list.`)) return;
+        deleteFolder(folder.id);
+      },
+    }, '×'),
+  );
+  dropZone(head, folder);
+
+  return el('div', { class: 'shelf-folder' }, head, body);
+}
+
+function folderNameInput(folder) {
+  const input = el('input', {
+    class: 'shelf-folder-name-input', value: folder.name,
+    onclick: event => event.stopPropagation(),
+    onkeydown: event => {
+      if (event.key === 'Enter') { event.preventDefault(); input.blur(); }
+      if (event.key === 'Escape') { TODO.editingFolder = null; renderShelf(); }
+    },
+    onblur: () => {
+      const name = input.value.trim();
+      TODO.editingFolder = null;
+      if (name && name !== folder.name) renameFolder(folder.id, name);
+      else renderShelf();
+    },
+  });
+  setTimeout(() => { input.focus(); input.select(); }, 0);
+  return input;
+}
+
+function folderAddRow() {
+  if (!TODO.addingFolder) {
+    return el('button', {
+      class: 'shelf-folder-new', title: 'Group tasks into a folder',
+      onclick: () => { TODO.addingFolder = true; renderShelf(); },
+    }, '+ New folder');
+  }
+  const input = el('input', {
+    class: 'shelf-folder-name-input', placeholder: 'Folder name…',
+    onkeydown: event => {
+      if (event.key === 'Enter') { event.preventDefault(); input.blur(); }
+      if (event.key === 'Escape') { TODO.addingFolder = false; renderShelf(); }
+    },
+    onblur: () => {
+      const name = input.value.trim();
+      TODO.addingFolder = false;
+      if (name) createFolder(name);
+      else renderShelf();
+    },
+  });
+  setTimeout(() => input.focus(), 0);
+  return input;
+}
+
+/// Wires a folder header or body as a drop target: dropping a dragged task
+/// files it into this folder, at the end unless it lands on a specific row
+/// (see `todoRow`'s own drop handler, which stops the event here).
+function dropZone(node, folder) {
+  node.addEventListener('dragover', event => {
+    event.preventDefault();
+    node.classList.add('drag-over');
+  });
+  node.addEventListener('dragleave', () => node.classList.remove('drag-over'));
+  node.addEventListener('drop', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    node.classList.remove('drag-over');
+    if (dragTodoId != null) fileTodo(dragTodoId, folder.id);
+  });
+}
+
+function todoRow(item, folder) {
   const done = item.state === 'completed';
   const gone = item.state === 'cancelled';
 
@@ -1455,10 +1585,15 @@ function todoRow(item) {
   }
 
   const acts = el('div', { class: 'acts' },
-    el('button', {
-      class: 'act', title: 'Move to tomorrow',
-      onclick: () => todoAction(item.id, 'reschedule', { to_day: 'tomorrow' }),
-    }, '»'),
+    folder
+      ? el('button', {
+          class: 'act', title: 'Take out of the folder',
+          onclick: () => fileTodo(item.id, null),
+        }, '⇤')
+      : el('button', {
+          class: 'act', title: 'Move to tomorrow',
+          onclick: () => todoAction(item.id, 'reschedule', { to_day: 'tomorrow' }),
+        }, '»'),
     el('button', {
       class: 'act', title: 'Pick a day, or link a note',
       onclick: () => { TODO.picking = TODO.picking === item.id ? null : item.id; renderShelf(); },
@@ -1469,7 +1604,40 @@ function todoRow(item) {
     }, '⊘'),
   );
 
-  return el('div', { class: 'todo', 'data-state': item.state }, box, col, acts);
+  const row = el('div', {
+    // Not `true` — el()'s generic boolean handling would set draggable="",
+    // and unlike other boolean attributes, an empty value is invalid for
+    // `draggable` and falls back to "auto" (not draggable for a <div>). The
+    // spec requires the literal string "true".
+    class: 'todo', 'data-state': item.state, draggable: 'true',
+    ondragstart: event => {
+      dragTodoId = item.id;
+      event.dataTransfer.effectAllowed = 'move';
+    },
+    ondragend: () => { dragTodoId = null; },
+  }, box, col, acts);
+
+  // Dropping on another row inside the same folder reorders against it;
+  // outside a folder, or crossing folders, the folder/list drop zones above
+  // handle it instead (this one only wins when both sides share `folder`).
+  if (folder) {
+    row.addEventListener('dragover', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      row.classList.add('drag-over');
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      row.classList.remove('drag-over');
+      if (dragTodoId != null && dragTodoId !== item.id) {
+        reorderInFolder(dragTodoId, folder, item.id);
+      }
+    });
+  }
+
+  return row;
 }
 
 /// Pick a day, or attach a note. The note search is the app's own search, so
@@ -1520,6 +1688,63 @@ async function todoAction(id, action, body) {
   try {
     await api(`/api/todos/${id}/${action}`, { method: 'POST', body: body || {} });
     TODO.picking = null;
+    await loadTodos(TODO.day);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+/// File a task into a folder, or (`folderId: null`) take it back out onto
+/// the day's list — the service handles both through the same endpoint.
+async function fileTodo(id, folderId) {
+  await todoAction(id, 'file', { folder_id: folderId });
+}
+
+/// Drop `id` just above `beforeId` within `folder`, filing it in first if it
+/// isn't already a member. `sort_order` has no meaning outside its folder or
+/// day, so a plain midpoint between neighbours is all reordering needs.
+async function reorderInFolder(id, folder, beforeId) {
+  const items = folder.todos;
+  const at = items.findIndex(t => t.id === beforeId);
+  const prev = items[at - 1];
+  const order = prev && prev.id !== id ? (prev.sort_order + items[at].sort_order) / 2
+                                        : items[at].sort_order - 1;
+  try {
+    if (!items.some(t => t.id === id)) {
+      await api(`/api/todos/${id}/file`, { method: 'POST', body: { folder_id: folder.id } });
+    }
+    await api(`/api/todos/${id}`, { method: 'PATCH', body: { sort_order: order } });
+    await loadTodos(TODO.day);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+async function createFolder(name) {
+  try {
+    await api('/api/todos/folders', { method: 'POST', body: { name } });
+    await loadTodos(TODO.day);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+async function renameFolder(id, name) {
+  await patchFolder(id, { name });
+}
+
+async function patchFolder(id, patch) {
+  try {
+    await api(`/api/todos/folders/${id}`, { method: 'PATCH', body: patch });
+    await loadTodos(TODO.day);
+  } catch (err) {
+    toast(String(err.message || err), true);
+  }
+}
+
+async function deleteFolder(id) {
+  try {
+    await api(`/api/todos/folders/${id}/delete`, { method: 'POST', body: {} });
     await loadTodos(TODO.day);
   } catch (err) {
     toast(String(err.message || err), true);

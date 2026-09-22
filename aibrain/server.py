@@ -704,6 +704,10 @@ def build_router(state: State) -> Router:
                 result = state.corpus.link_todo(
                     todo_id, str(payload.get("brain_id", ""))[:200],
                     str(payload.get("rel_path", ""))[:1024], now=now)
+            elif action == "file":
+                folder_id = payload.get("folder_id")
+                result = state.corpus.file_todo(
+                    todo_id, int(folder_id) if folder_id is not None else None, now=now)
             else:
                 result = getattr(state.corpus, f"{action}_todo")(todo_id, now=now)
             if not result:
@@ -729,6 +733,34 @@ def build_router(state: State) -> Router:
         q = h.query()
         h.json(state.corpus.todo_history(q.get("q", "")[:2000],
                                          limit=h.int_query("limit", 50, 1, 200)))
+
+    # ---- to-do folders -----------------------------------------------------
+    def folder_add(h: Handler) -> None:
+        name = str(h.body().get("name", "")).strip()[:200]
+        if not name:
+            h.fail("a folder needs a name")
+            return
+        h.json(state.corpus.create_folder(name))
+
+    def folder_patch(h: Handler, fid: str) -> None:
+        payload = h.body()
+        name = payload.get("name")
+        ok = state.corpus.update_folder(
+            _int_id(fid, "folder id"),
+            name=str(name).strip()[:200] if name is not None else None,
+            collapsed=payload.get("collapsed"),
+            sort_order=payload.get("sort_order"),
+        )
+        if not ok:
+            h.fail("no such folder", 404)
+            return
+        h.json({"ok": True})
+
+    def folder_delete(h: Handler, fid: str) -> None:
+        if not state.corpus.delete_folder(_int_id(fid, "folder id")):
+            h.fail("no such folder", 404)
+            return
+        h.json({"ok": True})
 
     # ---- chat ------------------------------------------------------------
     def chat(h: Handler) -> None:
@@ -1047,8 +1079,11 @@ def build_router(state: State) -> Router:
     router.post("/api/todos", todo_add)
     router.get("/api/todos/history", todo_history)
     router.patch("/api/todos/<tid>", todo_patch)
-    for _action in ("complete", "uncomplete", "cancel", "reschedule", "link"):
+    for _action in ("complete", "uncomplete", "cancel", "reschedule", "link", "file"):
         router.post(f"/api/todos/<tid>/{_action}", todo_action(_action))
+    router.post("/api/todos/folders", folder_add)
+    router.patch("/api/todos/folders/<fid>", folder_patch)
+    router.post("/api/todos/folders/<fid>/delete", folder_delete)
     router.get("/api/stream/chat", chat)
     router.get("/api/chat/<agent_id>/history", chat_history)
     router.post("/api/chat/<agent_id>/clear", chat_clear)

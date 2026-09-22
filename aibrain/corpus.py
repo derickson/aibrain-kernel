@@ -290,6 +290,34 @@ class Corpus:
         return self._request("/todos/history",
                              params={"q": query, "limit": limit}) or {}
 
+    def file_todo(self, todo_id: int, folder_id: int | None,
+                  now: str | None = None) -> dict:
+        return self._todo_post(todo_id, "file", {"folder_id": folder_id}, now)
+
+    # ---- to-do folders -----------------------------------------------------
+    # A persistent backlog beside the day's list — see the service's own
+    # doc-comments in db/todo.rs for why folders are exempt from rollover.
+
+    def create_folder(self, name: str) -> dict:
+        return self._request("/todos/folders", body={"name": name}) or {}
+
+    def update_folder(self, folder_id: int, name: str | None = None,
+                      collapsed: bool | None = None,
+                      sort_order: float | None = None) -> bool:
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if collapsed is not None:
+            payload["collapsed"] = collapsed
+        if sort_order is not None:
+            payload["sort_order"] = sort_order
+        return bool(self._request(f"/todos/folders/{int(folder_id)}", body=payload,
+                                  method="PATCH", allow_404=True))
+
+    def delete_folder(self, folder_id: int) -> bool:
+        return bool(self._request(f"/todos/folders/{int(folder_id)}/delete",
+                                  body={}, allow_404=True))
+
     def _todo_post(self, todo_id: int, action: str, body: dict | None = None,
                    now: str | None = None) -> dict:
         # An empty body still has to be a POST, so it is `{}` not None.

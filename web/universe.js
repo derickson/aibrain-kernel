@@ -367,6 +367,19 @@ export function createUniverse(container, cfg) {
     core.scale.setScalar(R * 1.4 * clamp(9 / R, 0.5, 1));
     group.add(core);
 
+    // A faceted wireframe at dead center, tinted the same color as this
+    // brain's chip in the picker — without it the cloud has no anchor to
+    // read as "a brain" from, just a haze with no shape underneath.
+    const coreShape = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(R * 0.3, 0),
+      new THREE.MeshBasicMaterial({
+        color: b.sources?.[0]?.color || '#7fd8e8',
+        wireframe: true, transparent: true, opacity: 0.6, depthWrite: false,
+      })
+    );
+    coreShape.rotation.set(rand() * Math.PI, rand() * Math.PI, 0);
+    group.add(coreShape);
+
     const ripples = [];
     const ripple = li => {
       const s = new THREE.Sprite(new THREE.SpriteMaterial({
@@ -849,6 +862,7 @@ export function createUniverse(container, cfg) {
     dragging = false; dragAgent = -1;
     el.style.cursor = hover >= 0 || hoverAgent >= 0 ? 'pointer' : 'grab';
   };
+  const panRight = new THREE.Vector3(), panUp = new THREE.Vector3(), panFwd = new THREE.Vector3();
   const onMove = e => {
     setMouse(e);
     if (dragging) {
@@ -860,6 +874,22 @@ export function createUniverse(container, cfg) {
         if (raycaster.ray.intersectPlane(dragPlane, hitPt)) {
           agents[dragAgent].group.position.copy(hitPt);
         }
+        return;
+      }
+      if (e.shiftKey) {
+        // A pinned or focused target would otherwise snap tTarget back to
+        // itself every frame, silently eating the pan.
+        if (cam.pinned != null || brainFocus != null) {
+          cam.pinned = null;
+          brainFocus = null;
+          recomputeTargets();
+        }
+        // Scaled by distance so a drag covers the same apparent ground
+        // whether the camera is close in or pulled all the way back.
+        const panScale = cam.dist * 0.0015;
+        camera.matrixWorld.extractBasis(panRight, panUp, panFwd);
+        cam.tTarget.addScaledVector(panRight, -dx * panScale);
+        cam.tTarget.addScaledVector(panUp, dy * panScale);
         return;
       }
       cam.tyaw -= dx * 0.005;

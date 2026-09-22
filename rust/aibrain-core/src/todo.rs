@@ -145,6 +145,10 @@ pub fn routes() -> Router<Shared> {
         .route("/todos/:id/cancel", post(cancel))
         .route("/todos/:id/reschedule", post(reschedule))
         .route("/todos/:id/link", post(link))
+        .route("/todos/:id/file", post(file_todo))
+        .route("/todos/folders", post(create_folder))
+        .route("/todos/folders/:id", patch(edit_folder))
+        .route("/todos/folders/:id/delete", post(delete_folder))
 }
 
 #[derive(Deserialize, Default)]
@@ -183,6 +187,9 @@ async fn list(
         until.with_timezone(&Utc),
     )
     .await?;
+    // Folders aren't day-scoped — they show on every day's view, always at
+    // the bottom, so the shelf loads them in the same round trip.
+    let folders = db::todo::list_folders(&ctx.pool).await?;
 
     Ok(Json(json!({
         "day": day.to_string(),
@@ -192,6 +199,7 @@ async fn list(
         "start_hour": hour,
         "rolled": rolled,
         "todos": todos,
+        "folders": folders,
     })))
 }
 
@@ -341,6 +349,81 @@ async fn link(
         return Ok(not_found());
     }
     one(&ctx, id).await
+}
+
+#[derive(Deserialize)]
+struct FileBody {
+    #[serde(default)]
+    folder_id: Option<i64>,
+}
+
+async fn file_todo(
+    State(ctx): State<Shared>,
+    Path(id): Path<i64>,
+    Query(params): Query<DayParams>,
+    Json(input): Json<FileBody>,
+) -> ApiResult<Response> {
+    let now = resolve_now(params.now.as_ref());
+    if !db::todo::file_todo(&ctx.pool, id, input.folder_id, now.with_timezone(&Utc)).await? {
+        return Ok(not_found());
+    }
+    one(&ctx, id).await
+}
+
+fn not_found_folder() -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "no such folder" }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct CreateFolderBody {
+    name: String,
+}
+
+async fn create_folder(
+    State(ctx): State<Shared>,
+    Json(input): Json<CreateFolderBody>,
+) -> ApiResult<Response> {
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "a folder needs a name" })),
+        )
+            .into_response());
+    }
+    let id = db::todo::create_folder(&ctx.pool, &name).await?;
+    Ok(Json(json!({ "id": id, "name": name })).into_response())
+}
+
+#[derive(Deserialize)]
+struct EditFolderBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    collapsed: Option<bool>,
+    #[serde(default)]
+    sort_order: Option<f64>,
+}
+
+async fn edit_folder(
+    State(ctx): State<Shared>,
+    Path(id): Path<i64>,
+    Json(input): Json<EditFolderBody>,
+) -> ApiResult<Response> {
+    let name = input.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let changed = db::todo::update_folder(&ctx.pool, id, name, input.collapsed, input.sort_order)
+        .await?;
+    if !changed {
+        return Ok(not_found_folder());
+    }
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+async fn delete_folder(State(ctx): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
+    if !db::todo::delete_folder(&ctx.pool, id).await? {
+        return Ok(not_found_folder());
+    }
+    Ok(Json(json!({ "ok": true })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -515,7 +598,16 @@ mod integration {
     use super::*;
     use crate::db::todo as store;
 
-    async fn pool() -> Option<sqlx::PgPool> {
+    /// `roll_over` sweeps the whole table by date, with no per-test marker to
+    /// scope it — a test using a later "today" would otherwise reach back and
+    /// carry forward another test's still-open rows if both ran at once,
+    /// which is exactly how `cargo test`'s default parallelism runs them.
+    /// Every integration test takes this before touching the database, so
+    /// only one is ever inside a `roll_over` sweep at a time.
+    static ROLLOVER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn pool() -> Option<(sqlx::PgPool, tokio::sync::MutexGuard<'static, ()>)> {
+        let guard = ROLLOVER_LOCK.lock().await;
         let url = std::env::var("AIBRAIN_TEST_DATABASE_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -525,7 +617,7 @@ mod integration {
             return None;
         };
         match crate::db::connect(&url).await {
-            Ok(pool) => Some(pool),
+            Ok(pool) => Some((pool, guard)),
             Err(err) => {
                 eprintln!("skipping todo integration: {err:#}");
                 None
@@ -558,7 +650,7 @@ mod integration {
 
     #[tokio::test]
     async fn a_day_rolls_over_completes_and_stays_in_history() {
-        let Some(pool) = pool().await else { return };
+        let Some((pool, _guard)) = pool().await else { return };
 
         let marker = format!("zzmarker{}", std::process::id());
         let monday = parse_day("2026-03-02").unwrap();
@@ -661,6 +753,96 @@ mod integration {
 
         sqlx::query("DELETE FROM todo WHERE id = ANY($1)")
             .bind(vec![carried, finished])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foldered_items_sit_out_the_daily_rotation() {
+        let Some((pool, _guard)) = pool().await else { return };
+
+        let marker = format!("zzfolder{}", std::process::id());
+        // A different week from the other integration test's: roll_over acts
+        // on the whole table, not just one test's rows, so sharing a date
+        // with a test running concurrently would make either's count racy.
+        let monday = parse_day("2026-04-06").unwrap();
+        let tuesday = parse_day("2026-04-07").unwrap();
+
+        let folder_id = store::create_folder(&pool, &format!("{marker} backlog"))
+            .await
+            .unwrap();
+        let item_a = store::create(&pool, &format!("{marker} a"), monday, instant(monday, 9), &[])
+            .await
+            .unwrap();
+        let item_b = store::create(&pool, &format!("{marker} b"), monday, instant(monday, 9), &[])
+            .await
+            .unwrap();
+
+        // Filed on Monday, still scheduled on Monday underneath: it must not
+        // show on Monday's own list, and roll_over must not touch it either.
+        store::file_todo(&pool, item_a, Some(folder_id), instant(monday, 10))
+            .await
+            .unwrap();
+        let (from, until) = window(monday);
+        let list = store::for_day(&pool, monday, from, until).await.unwrap();
+        assert_eq!(count_mine(&list, &marker), 1, "only the unfiled item shows");
+        assert_eq!(find(&list, item_b).id, item_b);
+
+        let moved = store::roll_over(&pool, tuesday, instant(tuesday, 8)).await.unwrap();
+        let plant = store::get(&pool, item_a).await.unwrap().unwrap();
+        assert_eq!(plant.scheduled_on, "2026-04-06", "a foldered item never rolls");
+        assert!(moved >= 1, "the unfiled item still rolls forward as normal");
+
+        // The folder groups its member, in order, and the day list stays
+        // ignorant of it.
+        let folders = store::list_folders(&pool).await.unwrap();
+        let backlog = folders.iter().find(|f| f.id == folder_id).unwrap();
+        assert_eq!(backlog.todos.len(), 1);
+        assert_eq!(backlog.todos[0].id, item_a);
+
+        // Unfiling leaves scheduled_on alone — it is Monday's stale date that
+        // makes the *next* roll_over pick it up, with no special-casing.
+        store::file_todo(&pool, item_a, None, instant(tuesday, 9)).await.unwrap();
+        let plant = store::get(&pool, item_a).await.unwrap().unwrap();
+        assert!(plant.folder_id.is_none());
+        assert_eq!(plant.scheduled_on, "2026-04-06", "still stale, on purpose");
+        let wednesday = tuesday.succ_opt().unwrap();
+        store::roll_over(&pool, wednesday, instant(wednesday, 8)).await.unwrap();
+        let plant = store::get(&pool, item_a).await.unwrap().unwrap();
+        assert_eq!(plant.scheduled_on, "2026-04-08", "picked up by the very next rollover");
+
+        // Folder metadata: rename, collapse, and reordering a member.
+        store::file_todo(&pool, item_b, Some(folder_id), instant(wednesday, 9))
+            .await
+            .unwrap();
+        store::patch(&pool, item_b, None, Some(-5.0), instant(wednesday, 9))
+            .await
+            .unwrap();
+        let folders = store::list_folders(&pool).await.unwrap();
+        let backlog = folders.iter().find(|f| f.id == folder_id).unwrap();
+        assert_eq!(backlog.todos[0].id, item_b, "the lower sort_order sorts first");
+
+        assert!(store::update_folder(&pool, folder_id, Some("renamed"), Some(true), None)
+            .await
+            .unwrap());
+        let folders = store::list_folders(&pool).await.unwrap();
+        let backlog = folders.iter().find(|f| f.id == folder_id).unwrap();
+        assert_eq!(backlog.name, "renamed");
+        assert!(backlog.collapsed);
+
+        assert!(!store::update_folder(&pool, -1, Some("x"), None, None).await.unwrap());
+        assert!(!store::file_todo(&pool, -1, Some(folder_id), instant(wednesday, 9)).await.unwrap());
+
+        // Deleting the folder un-files its members via ON DELETE SET NULL,
+        // rather than deleting the append-only todo rows.
+        assert!(store::delete_folder(&pool, folder_id).await.unwrap());
+        assert!(!store::delete_folder(&pool, folder_id).await.unwrap(), "already gone");
+        let item_b_row = store::get(&pool, item_b).await.unwrap().unwrap();
+        assert!(item_b_row.folder_id.is_none());
+
+        sqlx::query("DELETE FROM todo WHERE id = ANY($1)")
+            .bind(vec![item_a, item_b])
             .execute(&pool)
             .await
             .unwrap();
