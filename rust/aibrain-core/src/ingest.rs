@@ -93,6 +93,18 @@ async fn write_note(
     )
     .await?;
     db::set_link_targets(pool, note_id, &parsed.targets).await?;
+    // Queue the note for Elasticsearch even when no cluster is configured.
+    // An insert is cheap, and a queue kept while the feature was off is what
+    // lets it be switched on later without rescanning the vaults.
+    db::enqueue_note(
+        pool,
+        &brain.id,
+        &brain.name,
+        Some(note_id),
+        &parsed.rel_path,
+        "upsert",
+    )
+    .await?;
     Ok(note_id)
 }
 

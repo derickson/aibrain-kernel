@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::db;
+use crate::es;
 use crate::graph;
 
 pub struct Ctx {
@@ -25,6 +26,8 @@ pub struct Ctx {
     pub config_path: std::path::PathBuf,
     /// Bumped whenever ingest changes anything, so clients can poll cheaply.
     pub revision: std::sync::atomic::AtomicI64,
+    /// `None` when no cluster is configured; search then answers from Postgres.
+    pub es: Option<Arc<es::Es>>,
 }
 
 impl Ctx {
@@ -66,6 +69,7 @@ pub fn router(ctx: Shared) -> Router {
         .route("/note/:id", get(note))
         .route("/notes/recent", get(recent))
         .route("/reindex", post(reindex))
+        .route("/search/resync", post(resync_search))
         .with_state(ctx)
 }
 
@@ -79,12 +83,26 @@ async fn health(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>>
 async fn status(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
     let cfg = ctx.config()?;
     let brains = db::list_brains(&ctx.pool).await?;
+    let search = match &ctx.es {
+        None => json!({ "engine": "postgres" }),
+        Some(es) => {
+            let indices: Vec<String> =
+                brains.iter().map(|b| es.index_for(&b.name)).collect();
+            json!({
+                "engine": "elasticsearch",
+                "inference_id": es.cfg.inference_id,
+                "queue": db::queue_stats(&ctx.pool).await?,
+                "indices": indices,
+            })
+        }
+    };
     Ok(Json(json!({
         "title": cfg.title,
         "notes": db::count_notes(&ctx.pool).await?,
         "links": db::count_links(&ctx.pool).await?,
         "revision": ctx.revision.load(std::sync::atomic::Ordering::Relaxed),
         "brains": brains,
+        "search": search,
     })))
 }
 
@@ -120,16 +138,53 @@ async fn search(
     let limit = params.limit.unwrap_or(60).clamp(1, 500);
     let any = matches!(params.any.as_deref(), Some("1") | Some("true"));
 
-    let mut results = db::search(&ctx.pool, &query, &brains, limit, any).await?;
-    // A question whose every term must match usually matches nothing. Widen
-    // once rather than returning an empty answer that looks like "no such note".
-    if results.is_empty() && !any && query.split_whitespace().count() > 1 {
-        results = db::search(&ctx.pool, &query, &brains, limit, true).await?;
+    // Elasticsearch when it is there, Postgres when it is not — and Postgres
+    // again when Elasticsearch answers with an error, because a search box
+    // that goes blank because a cluster hiccuped is worse than a lexical one.
+    let mut engine = "postgres";
+    let mut results = None;
+    if let Some(es) = &ctx.es {
+        match es::search::run(&ctx.pool, es, &query, &brains, limit).await {
+            Ok(hits) => {
+                engine = "elasticsearch";
+                results = Some(hits);
+            }
+            Err(err) => tracing::warn!("elasticsearch search failed, using postgres: {err:#}"),
+        }
     }
+
+    let results = match results {
+        Some(hits) => hits,
+        None => {
+            let mut hits = db::search(&ctx.pool, &query, &brains, limit, any).await?;
+            // A question whose every term must match usually matches nothing.
+            // Widen once rather than returning an empty answer that looks like
+            // "no such note".
+            if hits.is_empty() && !any && query.split_whitespace().count() > 1 {
+                hits = db::search(&ctx.pool, &query, &brains, limit, true).await?;
+            }
+            hits
+        }
+    };
+
     Ok(Json(json!({
         "query": query,
         "count": results.len(),
+        "engine": engine,
         "results": results,
+    })))
+}
+
+/// Queue every note for reindexing.
+///
+/// The backfill path: a database whose notes were ingested before any of this
+/// existed has no queue rows, and nothing else would ever create them.
+async fn resync_search(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+    let enqueued = db::enqueue_all(&ctx.pool, None).await?;
+    tracing::info!("resync queued {enqueued} note(s) for search indexing");
+    Ok(Json(json!({
+        "enqueued": enqueued,
+        "engine": if ctx.es.is_some() { "elasticsearch" } else { "postgres" },
     })))
 }
 

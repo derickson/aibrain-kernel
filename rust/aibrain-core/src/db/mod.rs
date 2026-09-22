@@ -49,17 +49,24 @@ pub async fn connect(url: &str) -> Result<PgPool> {
 /// Apply the schema. Every statement is idempotent, so this runs on every
 /// start rather than tracking versions in a table.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let sql = include_str!("migrations/0001_corpus.sql");
+    // Order matters only in that later files may depend on earlier ones.
+    let files = [
+        include_str!("migrations/0001_corpus.sql"),
+        include_str!("migrations/0002_search_queue.sql"),
+    ];
     // `pg_trgm` needs its own statement boundary and may fail without
     // superuser; the index that depends on it is optional, so a failure there
     // degrades search rather than stopping startup.
-    for statement in split_statements(sql) {
-        if let Err(err) = sqlx::query(&statement).execute(pool).await {
-            if statement.contains("pg_trgm") || statement.contains("gin_trgm_ops") {
-                tracing::warn!("skipping trigram index: {err}");
-                continue;
+    for sql in files {
+        for statement in split_statements(sql) {
+            if let Err(err) = sqlx::query(&statement).execute(pool).await {
+                if statement.contains("pg_trgm") || statement.contains("gin_trgm_ops") {
+                    tracing::warn!("skipping trigram index: {err}");
+                    continue;
+                }
+                return Err(err)
+                    .context(format!("migration failed on: {}", first_line(&statement)));
             }
-            return Err(err).context(format!("migration failed on: {}", first_line(&statement)));
         }
     }
     Ok(())
@@ -135,6 +142,19 @@ mod tests {
                 "statement does not terminate: {}",
                 first_line(statement)
             );
+        }
+    }
+
+    #[test]
+    fn the_queue_migration_splits_cleanly() {
+        let out = split_statements(include_str!("migrations/0002_search_queue.sql"));
+        assert_eq!(out.len(), 3, "table plus two indexes");
+        // The CHECK constraint's parenthesised list must survive intact — a
+        // splitter that broke on it would create a table with no constraint.
+        assert!(out[0].contains("CHECK (op IN ('upsert', 'delete'))"));
+        assert!(out[0].contains("UNIQUE (brain_id, rel_path)"));
+        for statement in &out {
+            assert!(statement.trim_end().ends_with(';'));
         }
     }
 
