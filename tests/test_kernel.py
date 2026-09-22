@@ -246,22 +246,23 @@ class ServerTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Registered as each piece comes up, not gathered into tearDownClass,
+        # so a failure partway through setUpClass (a bad rebuild, a port
+        # already taken) still stops what did start rather than leaking the
+        # aibrain-core process or the HTTP server past this test.
         cls.fixture = start_corpus()
+        cls.addClassCleanup(cls.fixture.stop)
         cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        cls.addClassCleanup(cls.state.close)
         cls.state.universe(rebuild=True)
 
         handler = type("H", (Handler,),
                        {"state": cls.state, "router": build_router(cls.state)})
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.addClassCleanup(cls.httpd.shutdown)
         cls.httpd.daemon_threads = True
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.state.close()
-        cls.fixture.stop()
 
     # ---- helpers ---------------------------------------------------------
     def get(self, path):
@@ -353,6 +354,28 @@ class ServerTests(unittest.TestCase):
 
         # The universe id round-trips back to the same note.
         self.assertEqual(self.get(f"/api/node/{note['gid']}")["nid"], note["nid"])
+
+    def test_search_open_note_and_chat_citation_agree_on_the_same_note(self):
+        """The full user journey: find it, read it, then watch an answer cite it.
+
+        Search, the note reader and the citation matcher are three separate
+        code paths — Postgres full-text search, `db::note_page`, and
+        `cites_from_text` matching a wikilink back to a supplied hit. They are
+        only trustworthy together if all three agree on which note "Protocols"
+        actually is.
+        """
+        found = self.get("/api/search?q=protocols")
+        top = next(r for r in found["results"] if r["brain"] == "Test")
+
+        note = self.get(f"/api/note/{top['nid']}")
+        self.assertEqual(note["name"], "Protocols")
+
+        events = self.sse("/api/stream/chat?agent=kernel&q=protocols")
+        cites = next(e for e in events if e["type"] == "cites")["cites"]
+        self.assertTrue(cites)
+        self.assertEqual(
+            cites[0]["nid"], top["nid"],
+            "the note the agent cited is the same note search and /api/note agree on")
 
     def test_search_can_be_scoped_to_one_brain(self):
         mine = self.get(f"/api/search?q=protocols&brains={self.fixture.brain_id}")
@@ -539,20 +562,17 @@ class LiveUpdateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = start_corpus()
+        cls.addClassCleanup(cls.fixture.stop)
         cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        cls.addClassCleanup(cls.state.close)
         cls.state.universe(rebuild=True)
         handler = type("H", (Handler,),
                        {"state": cls.state, "router": build_router(cls.state)})
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.addClassCleanup(cls.httpd.shutdown)
         cls.httpd.daemon_threads = True
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.state.close()
-        cls.fixture.stop()
 
     # ---- helpers ---------------------------------------------------------
     def universe(self, if_none_match: str | None = None, rebuild: bool = False):
@@ -684,13 +704,10 @@ class CitationTests(unittest.TestCase):
         # something to be ambiguous about.
         cls.fixture = start_corpus({"Other": {
             "Recipes/Ramen.md": "# Ramen\n\nA copy.\n"}})
+        cls.addClassCleanup(cls.fixture.stop)
         cls.corpus = cls.fixture.corpus
         cls.brain_id = cls.fixture.brain_id
         cls.other_id = cls.fixture.extra_ids["Other"]
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.fixture.stop()
 
     def setUp(self):
         self.agent = LocalAgent(
@@ -797,7 +814,13 @@ class StartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.json"
             env = {**os.environ,
-                   "AIBRAIN_CORE_URL": f"http://127.0.0.1:{free_port()}"}
+                   "AIBRAIN_CORE_URL": f"http://127.0.0.1:{free_port()}",
+                   # Config.load() reconciles brains against whatever real
+                   # obsidian_vaults/ this checkout has, which — unlike the
+                   # rest of this file — this subprocess never gets a chance
+                   # to patch away. Left on, a run against a checkout with
+                   # linked vaults would rewrite its real .claude/settings.json.
+                   "AIBRAIN_MANAGE_DENY_RULES": "0"}
             result = subprocess.run(
                 [sys.executable, "-m", "aibrain", "--config", str(config),
                  "--no-browser"],
@@ -1132,27 +1155,24 @@ class TodoTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = start_corpus()
+        cls.addClassCleanup(cls.fixture.stop)
         cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        cls.addClassCleanup(cls.state.close)
         handler = type("H", (Handler,),
                        {"state": cls.state, "router": build_router(cls.state)})
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.addClassCleanup(cls.httpd.shutdown)
         cls.httpd.daemon_threads = True
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        # Nothing is deleted, by design — there is no route that would. Every
+        # row these tests write carries a unique marker instead, so a shared
+        # test database stays usable.
 
     def setUp(self):
         # Per test, not per class: the list is one shared thing, so a test
         # that counted the class's rows would count its siblings' too.
         self.marker = f"zzpy{uuid.uuid4().hex[:8]}"
-
-    @classmethod
-    def tearDownClass(cls):
-        # Nothing is deleted, by design — there is no route that would. Every
-        # row these tests write carries a unique marker instead, so a shared
-        # test database stays usable.
-        cls.httpd.shutdown()
-        cls.state.close()
-        cls.fixture.stop()
 
     # ---- helpers ---------------------------------------------------------
     def call(self, path, body=None, method=None):
@@ -1279,6 +1299,7 @@ class McpTodoTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = start_corpus()
+        cls.addClassCleanup(cls.fixture.stop)
         cls.marker = f"zzmcp{uuid.uuid4().hex[:8]}"
         cls.proc = subprocess.Popen(
             [sys.executable, "-m", "aibrain.mcp_todo"],
@@ -1287,17 +1308,17 @@ class McpTodoTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1,
         )
+        cls.addClassCleanup(cls._stop_proc)
         cls._id = 0
 
     @classmethod
-    def tearDownClass(cls):
+    def _stop_proc(cls):
         if cls.proc.poll() is None:
             cls.proc.stdin.close()
             try:
                 cls.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 cls.proc.kill()
-        cls.fixture.stop()
 
     def rpc(self, method, params=None):
         type(self)._id += 1

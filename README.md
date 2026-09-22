@@ -389,41 +389,63 @@ Thin proxies over the Rust routes above, plus what only Python knows about
 
 ## Tests
 
-Three kinds:
+One command runs everything:
 
 ```sh
-cd rust && cargo test                       # Rust: 108 tests
-python3 -m unittest tests.test_kernel       # Python: 61 tests
-node tests/test_edges.mjs                   # edge-brightness math
+scripts/test.sh
 ```
 
-`scripts/test.sh` runs all three in one go.
+It runs four stages in order, each with its own header, and prints a summary
+at the end naming every stage that passed, failed or was skipped (and why):
 
-Most Rust tests are pure unit tests and always run. A few are gated behind a
-real Postgres and skip with a printed reason, rather than failing, when it is
-unreachable:
+1. **Rust unit tests** — `cargo test` with Postgres and Elasticsearch both
+   switched off, so every gated test takes its own "no credentials" early
+   return.
+2. **Rust integration tests (Postgres)** — the same `cargo test`, this time
+   against a real database. The script looks for the `aibrain-db` container,
+   creates the `aibrain_test` database on it if missing, and skips this stage
+   with a printed reason if no container answers.
+3. **Python suite** — every `tests/test_*.py`, discovered
+   (`python3 -m unittest discover -s tests -p 'test_*.py'`). Its
+   corpus-backed test classes build the `rust/aibrain-core` debug binary (if
+   not already built) and start it against `aibrain_test` on an ephemeral
+   port, skipping with a message rather than failing if Postgres is
+   unreachable. `tests/test_edges.mjs`, a plain Node script with no test
+   runner of its own, runs inside this stage (`EdgeShadingTests`) and skips if
+   `node` is not installed.
+4. **Rust integration tests (Elasticsearch)** — `cargo test es::integration`,
+   which additionally needs `ELASTICSEARCH_URL` and `ELASTICSEARCH_API_KEY`.
+   The script reads them from the environment, or from a repo-root `.env` if
+   the environment does not already have them. It indexes under an
+   `aibrain-test-<pid>-` prefix and deletes those indices itself when it
+   finishes, so a real `aibrain-*` index is never touched. Skipped with a
+   reason when no credentials are found.
+
+The script exits non-zero if any stage that ran failed. It never rewrites
+`.claude/settings.json`: every corpus-backed test class points
+`aibrain.config` at a private temp file, and the one path that does not (the
+`StartupTests` subprocess, which runs the real `python3 -m aibrain` entry
+point) sets `AIBRAIN_MANAGE_DENY_RULES=0` in its own environment rather than
+the script's, so `DenyRuleTests` — which tests that rewrite — still runs with
+the real behaviour on.
+
+Run a stage by hand with the same environment variables `scripts/test.sh`
+looks for:
 
 ```sh
 AIBRAIN_TEST_DATABASE_URL=postgres://aibrain:aibrain@127.0.0.1:5433/aibrain_test \
-  cargo test
+  cargo test                                  # stage 2, by hand
+python3 -m unittest discover -s tests -p 'test_*.py'   # stage 3, by hand
+node tests/test_edges.mjs                     # just the edge-brightness math
 ```
-
-Elasticsearch-gated tests additionally need `ELASTICSEARCH_URL` and
-`ELASTICSEARCH_API_KEY` set (the repo's `.env`, or the environment); without
-them those tests skip too.
 
 `tests/test_kernel.py` covers the seam Python still owns — the `/api/*` HTTP
 surface, citation tiers, vault discovery, the job runner — since parsing,
-layout and rendering all moved to Rust and are tested there. Its
-corpus-backed test classes build the `rust/aibrain-core` debug binary (if it
-is not already built) and start it against the `aibrain_test` database on an
-ephemeral port; if Postgres is not reachable there, they skip with a
-message rather than failing. Set `AIBRAIN_TEST_ELASTICSEARCH=1` to let those
-tests talk to the real Elasticsearch cluster instead of running with search
-forced off; leave it unset on a laptop with no cluster.
-
-`tests/test_edges.mjs` is a plain Node script (no test runner) that
-`test_kernel.py` also runs, skipping if `node` is not installed.
+layout and rendering all moved to Rust and are tested there. Set
+`AIBRAIN_TEST_ELASTICSEARCH=1` to let its corpus-backed tests talk to the real
+Elasticsearch cluster instead of running with search forced off; leave it
+unset on a laptop with no cluster (this is separate from, and off by default
+even when, `scripts/test.sh`'s stage 4 runs the Rust Elasticsearch tests).
 
 ## Troubleshooting
 
