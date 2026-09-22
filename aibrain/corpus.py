@@ -26,6 +26,9 @@ DEFAULT_URL = "http://127.0.0.1:8781"
 HEALTH_TIMEOUT = 2.0
 READ_TIMEOUT = 30.0
 REINDEX_TIMEOUT = 1800.0
+# The service pings every 15 s, so anything longer than that without a byte
+# means the connection is gone rather than merely quiet.
+EVENT_TIMEOUT = 45.0
 
 
 class CorpusError(RuntimeError):
@@ -131,6 +134,64 @@ class Corpus:
     def universe(self) -> dict:
         # A big corpus makes this the slowest read, so it gets its own budget.
         return self._request("/universe", timeout=120.0) or {}
+
+    # ---- live updates ----------------------------------------------------
+    # The service keeps a revision per brain and a packed layout keyed by it,
+    # so an unchanged corpus is a 304 rather than four seconds of geometry.
+    # Both of these stay raw: the ETag has to survive the trip to the browser
+    # unchanged, and the event stream has to arrive event by event.
+
+    def universe_with_etag(self, if_none_match: str | None = None
+                           ) -> tuple[dict | None, str]:
+        """`(payload, etag)`. The payload is None when the service said 304."""
+        request = urllib.request.Request(self.base_url + "/universe")
+        if if_none_match:
+            request.add_header("If-None-Match", if_none_match)
+        try:
+            with urllib.request.urlopen(request, timeout=120.0) as response:
+                etag = response.headers.get("ETag", "")
+                return json.loads(response.read().decode("utf-8") or "null"), etag
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304:
+                return None, exc.headers.get("ETag", "") or (if_none_match or "")
+            raise CorpusError(self._explain("/universe", exc)) from exc
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise CorpusError(
+                f"could not reach aibrain-core at {self.base_url} ({exc}) — "
+                f"is it running?"
+            ) from exc
+
+    def stream_events(self, timeout: float = EVENT_TIMEOUT):
+        """The service's change feed, one decoded event at a time.
+
+        A `data:` frame is yielded as the dict it carries; the service's
+        keep-alive comment becomes `{"type": "ping"}` so the proxy downstream
+        has something to write and the browser's connection stays warm too.
+        Ends quietly when either side hangs up.
+        """
+        request = urllib.request.Request(self.base_url + "/events")
+        request.add_header("Accept", "text/event-stream")
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            raise CorpusError(
+                f"could not open the event stream at {self.base_url} ({exc})"
+            ) from exc
+        try:
+            for raw in response:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line.startswith(":"):
+                    yield {"type": "ping"}
+                elif line.startswith("data:"):
+                    try:
+                        yield json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+        except (TimeoutError, OSError):
+            # A dead socket ends the stream; the browser reconnects.
+            return
+        finally:
+            response.close()
 
     def search_raw(self, query: str, limit: int = 60,
                    brain_ids: list[str] | None = None,

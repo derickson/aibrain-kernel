@@ -4,9 +4,12 @@ mod api;
 mod config;
 mod db;
 mod es;
+mod events;
 mod graph;
 mod ingest;
 mod layout;
+#[cfg(test)]
+mod live;
 mod todo;
 mod vault;
 mod watch;
@@ -121,6 +124,7 @@ async fn main() -> Result<()> {
                 config_path: config_path.clone(),
                 revision: std::sync::atomic::AtomicI64::new(0),
                 es: search.clone(),
+                events: events::Bus::new(),
             });
 
             // A cold database is useless to the UI, so fill it before listening

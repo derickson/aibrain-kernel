@@ -265,7 +265,7 @@ async fn run(h: &Harness) -> anyhow::Result<()> {
         h.dir.join("Notes").join("Garden.md"),
         "# Garden\n\nThe zucchini glut arrives in August and nobody is ready for it.\n",
     )?;
-    assert!(ingest::ingest_one(&h.pool, &h.brain, "Notes/Garden.md").await?);
+    assert!(ingest::ingest_one(&h.pool, &h.brain, "Notes/Garden.md").await?.is_some());
     drain_all(h).await;
     h.es.refresh(&h.index()).await?;
     let edited = titles(h, "zucchini glut").await;
@@ -273,7 +273,7 @@ async fn run(h: &Harness) -> anyhow::Result<()> {
 
     // A deletion leaves Elasticsearch too.
     std::fs::remove_file(h.dir.join("Notes").join("Sailing.md"))?;
-    assert!(ingest::ingest_one(&h.pool, &h.brain, "Notes/Sailing.md").await?);
+    assert!(ingest::ingest_one(&h.pool, &h.brain, "Notes/Sailing.md").await?.is_some());
     drain_all(h).await;
     h.es.refresh(&h.index()).await?;
     assert_eq!(

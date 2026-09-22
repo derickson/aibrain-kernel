@@ -86,6 +86,8 @@ const S = {
   statusText: null,
   drawerTab: 'brains',
   jobStreams: new Map(),
+  etag: '',            // what /api/universe last handed us
+  live: null,          // the /api/events subscription, while it is open
 };
 
 // ───────────────────────────── boot ─────────────────────────────────────
@@ -107,6 +109,7 @@ async function boot() {
     await followIndexJob();
   }
   await loadUniverse();
+  subscribeEvents();
 }
 
 function bootText(title, sub) {
@@ -132,8 +135,21 @@ async function followIndexJob() {
   }
 }
 
+/** GET /api/universe, conditionally. `null` means the server said 304. */
+async function fetchUniverse(rebuild = false) {
+  const headers = {};
+  if (!rebuild && S.etag) headers['If-None-Match'] = S.etag;
+  const response = await fetch(`/api/universe${rebuild ? '?rebuild=1' : ''}`, { headers });
+  if (response.status === 304) return null;
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `${response.status} /api/universe`);
+  S.etag = response.headers.get('ETag') || '';
+  return data;
+}
+
 async function loadUniverse(rebuild = false) {
-  const data = await api(`/api/universe${rebuild ? '?rebuild=1' : ''}`);
+  S.etag = '';
+  const data = await fetchUniverse(rebuild);
   S.data = data;
 
   if (S.universe) S.universe.dispose();
@@ -180,6 +196,104 @@ async function loadUniverse(rebuild = false) {
   renderStatus();
   loadRecent();
   if (S.agentId) renderChat();
+}
+
+// ───────────────────────────── live updates ─────────────────────────────
+//
+// The server knows the moment a note on disk changes; before this the browser
+// found out by being reloaded. /api/events carries one frame per change, and
+// the response to it is not a rebuild but a conditional GET: an unchanged
+// corpus is a 304, and a changed one patches only the vaults whose revision
+// moved, leaving the camera, the selection and the open note exactly as they
+// were.
+
+/** Longest we wait between reconnection attempts. */
+const LIVE_MAX_BACKOFF = 15000;
+/** A burst of saves is one refetch, not one per file. */
+const LIVE_SETTLE = 250;
+
+let liveBackoff = 500;
+let liveTimer = null;
+let livePending = null;
+let liveBurst = null;
+let liveGeneration = 0;
+
+function subscribeEvents() {
+  // Aborting the old stream fires its close handler asynchronously, after the
+  // new one is already in hand — so a stale handler has to know to say nothing
+  // rather than clear the subscription that replaced it.
+  const mine = ++liveGeneration;
+  S.live?.();
+  S.live = streamSSE('/api/events', onLiveEvent, () => {
+    if (mine !== liveGeneration) return;
+    S.live = null;
+    // The stream ends on a server restart, a proxy timeout, or a laptop
+    // waking up. Keep trying, but back off so a service that is down does
+    // not get hammered.
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(subscribeEvents, liveBackoff);
+    liveBackoff = Math.min(liveBackoff * 2, LIVE_MAX_BACKOFF);
+  });
+}
+
+function onLiveEvent(event) {
+  // A ping is the stream saying it is still there; an error frame is the
+  // reader's own, and the close handler is about to reconnect anyway.
+  if (!event || event.type === 'ping') { liveBackoff = 500; return; }
+  if (event.type === 'error') return;
+  liveBackoff = 500;
+  // A save arrives as one `note` frame then a `brain` frame; the first is the
+  // one that can say which note, so it is the one worth keeping.
+  if (!liveBurst || (event.kind === 'note' && liveBurst.kind !== 'note')) liveBurst = event;
+  clearTimeout(livePending);
+  livePending = setTimeout(() => {
+    const burst = liveBurst;
+    liveBurst = null;
+    refreshUniverse(burst).catch(() => {});
+  }, LIVE_SETTLE);
+}
+
+async function refreshUniverse(event) {
+  const data = await fetchUniverse();
+  if (!data) return;                       // 304: nothing moved after all
+  const previous = S.data;
+  S.data = data;
+
+  // `update` patches the galaxies whose revision moved and keeps everything
+  // else; it declines when a vault was added, removed or changed size, and
+  // then there is no way around building the scene again.
+  if (!S.universe || !S.universe.update(data)) {
+    S.data = previous;
+    await loadUniverse();
+    return;
+  }
+
+  renderChips();
+  renderStatus();
+  loadRecent();
+  refreshStatus().then(renderStatus).catch(() => {});
+  // The results list holds titles and snippets that may have just changed.
+  if (S.query.trim()) runSearch(S.query);
+  if (S.note && event?.note_id === S.note.nid) openNote(S.note.nid, S.noteFrom);
+  pulseStatus(event);
+}
+
+/** A two-second note in the status bar. Quieter than a toast on purpose:
+ *  a vault being watched should feel like weather, not like an alert. */
+let pulseTimer = null;
+function pulseStatus(event) {
+  const brain = S.data?.brains?.find(b => b.id === event?.brain_id);
+  S.statusText = event?.kind === 'note' && brain
+    ? `${brain.name} · a note just changed`
+    : 'updated';
+  renderStatus();
+  clearTimeout(pulseTimer);
+  pulseTimer = setTimeout(() => {
+    if (S.statusText === 'updated' || S.statusText?.endsWith('a note just changed')) {
+      S.statusText = null;
+      renderStatus();
+    }
+  }, 2000);
 }
 
 // ───────────────────────────── universe chrome ──────────────────────────

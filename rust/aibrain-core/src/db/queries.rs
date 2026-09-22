@@ -9,6 +9,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
+use std::collections::BTreeMap;
+
 use super::text_array;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,8 +405,13 @@ pub async fn rebuild_links(pool: &PgPool) -> Result<i64> {
     .execute(&mut *tx)
     .await?;
 
+    // The revision is deliberately not touched here. This runs on every
+    // ingest, changed or not, and bumping every brain's revision from it made
+    // the number useless as a cache key — one note edited in one vault
+    // invalidated all of them. `bump_revisions` moves exactly the brains the
+    // caller found to have changed.
     sqlx::query(
-        "UPDATE brain b SET note_count = c.n, revision = b.revision + 1, scanned_at = now()
+        "UPDATE brain b SET note_count = c.n, scanned_at = now()
            FROM (SELECT brain_id, count(*) AS n FROM note GROUP BY brain_id) c
           WHERE b.id = c.brain_id",
     )
@@ -502,6 +509,7 @@ pub async fn edges_across(pool: &PgPool, limit: i64) -> Result<Vec<(i64, i64)>> 
            JOIN note s ON s.id = l.src_id
            JOIN note d ON d.id = l.dst_id
           WHERE s.brain_id <> d.brain_id
+          ORDER BY a, b
           LIMIT $1",
     )
     .bind(limit)
@@ -1059,6 +1067,113 @@ pub async fn summaries_by_path(
             )
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// revisions and the layout cache
+// ---------------------------------------------------------------------------
+
+/// What each brain currently holds, as one comparable pair per brain.
+///
+/// Used to answer "did this vault actually change?" across a whole ingest.
+/// The note count catches an added or removed file, and the degree sum catches
+/// a link resolving — including one made from *another* vault, which moves
+/// this one's geometry without a byte of it changing.
+pub async fn brain_fingerprints(pool: &PgPool) -> Result<BTreeMap<String, (i64, i64)>> {
+    let rows = sqlx::query(
+        "SELECT b.id AS id, count(n.id) AS n, coalesce(sum(n.degree), 0)::bigint AS d
+           FROM brain b LEFT JOIN note n ON n.brain_id = b.id
+          GROUP BY b.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("id"), (r.get::<i64, _>("n"), r.get::<i64, _>("d"))))
+        .collect())
+}
+
+/// Move the revision of exactly these brains, returning what each became.
+///
+/// One statement rather than one per brain, so a rescan of twenty vaults is
+/// still a single round trip.
+pub async fn bump_revisions(pool: &PgPool, ids: &[String]) -> Result<Vec<(String, i64)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "UPDATE brain SET revision = revision + 1
+          WHERE id = ANY($1)
+      RETURNING id, revision",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("id"), r.get::<i64, _>("revision")))
+        .collect())
+}
+
+/// One brain's revision, or None when it is not in the database yet.
+pub async fn brain_revision(pool: &PgPool, brain_id: &str) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT revision FROM brain WHERE id = $1")
+        .bind(brain_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get::<i64, _>("revision")))
+}
+
+/// A cached block of packed geometry, exactly as it was stored.
+#[derive(Debug, Clone)]
+pub struct CachedGraph {
+    pub revision: i64,
+    pub geometry: Vec<u8>,
+    pub meta: serde_json::Value,
+}
+
+pub async fn graph_cache_get(pool: &PgPool, brain_id: &str) -> Result<Option<CachedGraph>> {
+    let row = sqlx::query("SELECT revision, geometry, meta FROM graph_cache WHERE brain_id = $1")
+        .bind(brain_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| CachedGraph {
+        revision: r.get("revision"),
+        geometry: r.get("geometry"),
+        meta: r.get("meta"),
+    }))
+}
+
+pub async fn graph_cache_put(
+    pool: &PgPool,
+    brain_id: &str,
+    revision: i64,
+    node_count: i32,
+    edge_count: i32,
+    geometry: &[u8],
+    meta: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO graph_cache
+             (brain_id, revision, node_count, edge_count, geometry, meta, built_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (brain_id) DO UPDATE
+            SET revision = EXCLUDED.revision,
+                node_count = EXCLUDED.node_count,
+                edge_count = EXCLUDED.edge_count,
+                geometry = EXCLUDED.geometry,
+                meta = EXCLUDED.meta,
+                built_at = now()",
+    )
+    .bind(brain_id)
+    .bind(revision)
+    .bind(node_count)
+    .bind(edge_count)
+    .bind(geometry)
+    .bind(meta)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

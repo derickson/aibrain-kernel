@@ -415,6 +415,148 @@ class ServerTests(unittest.TestCase):
         self.assertAlmostEqual(self.get("/api/status")["view"]["link_opacity"], 0.42)
 
 
+class LiveUpdateTests(unittest.TestCase):
+    """The change feed and the conditional universe.
+
+    Both halves of the same promise: the browser is told the moment something
+    changes, and asking again when nothing did costs a 304 rather than a
+    whole corpus of geometry.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus()
+        cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        cls.state.universe(rebuild=True)
+        handler = type("H", (Handler,),
+                       {"state": cls.state, "router": build_router(cls.state)})
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.httpd.daemon_threads = True
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.state.close()
+        cls.fixture.stop()
+
+    # ---- helpers ---------------------------------------------------------
+    def universe(self, if_none_match: str | None = None, rebuild: bool = False):
+        """`(status, etag, payload)` — payload is None on a 304."""
+        path = "/api/universe" + ("?rebuild=1" if rebuild else "")
+        request = urllib.request.Request(self.base + path)
+        if if_none_match:
+            request.add_header("If-None-Match", if_none_match)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return (response.status, response.headers.get("ETag"),
+                        json.loads(response.read().decode()))
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers.get("ETag"), None
+
+    def open_stream(self):
+        return urllib.request.urlopen(self.base + "/api/events", timeout=30)
+
+    @staticmethod
+    def read_event(stream, deadline: float = 30.0):
+        """The next `data:` frame, decoded. None if the stream went quiet."""
+        stop = time.time() + deadline
+        while time.time() < stop:
+            line = stream.readline()
+            if not line:
+                return None
+            text = line.decode("utf-8", "replace")
+            if text.startswith("data:"):
+                return json.loads(text[5:])
+        return None
+
+    # ---- tests -----------------------------------------------------------
+    def test_the_stream_opens_with_a_ping(self):
+        # The ping is what proves the connection is open before anything has
+        # happened — without it a browser cannot tell "quiet" from "broken".
+        with self.open_stream() as stream:
+            self.assertEqual(self.read_event(stream, 20), {"type": "ping"})
+
+    def test_an_unchanged_universe_is_a_304(self):
+        status, etag, payload = self.universe()
+        self.assertEqual(status, 200)
+        self.assertTrue(etag, "the universe must carry a tag")
+        self.assertTrue(payload["brains"])
+
+        status, again, payload = self.universe(if_none_match=etag)
+        self.assertEqual(status, 304)
+        self.assertIsNone(payload)
+        self.assertEqual(again, etag)
+
+    def test_status_reports_a_revision_per_brain(self):
+        with urllib.request.urlopen(self.base + "/api/status", timeout=30) as r:
+            status = json.loads(r.read().decode())
+        brain = status["brains"][0]
+        self.assertGreater(brain["revision"], 0, "ingest set it")
+        _, _, universe = self.universe()
+        self.assertEqual(universe["brains"][0]["revision"], brain["revision"])
+
+    def test_a_tag_we_never_issued_is_not_honoured(self):
+        status, _, payload = self.universe(if_none_match='"not-a-real-tag"')
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(payload)
+
+    def test_an_explicit_rebuild_ignores_the_conditional(self):
+        _, etag, _ = self.universe()
+        status, _, payload = self.universe(if_none_match=etag, rebuild=True)
+        self.assertEqual(status, 200, "?rebuild=1 means send it anyway")
+        self.assertIsNotNone(payload)
+
+    def test_a_rescan_reaches_the_stream_and_moves_the_tag(self):
+        _, etag, before = self.universe()
+        revision_before = before["brains"][0]["revision"]
+
+        with self.open_stream() as stream:
+            self.assertEqual(self.read_event(stream, 20), {"type": "ping"})
+
+            note = self.fixture.vault / "Agents.md"
+            note.write_text(
+                note.read_text(encoding="utf-8") + "\nAnd a new line.\n",
+                encoding="utf-8")
+            self.fixture.reindex()
+
+            change = None
+            for _ in range(8):
+                event = self.read_event(stream, 20)
+                if event is None:
+                    break
+                if event.get("type") != "ping":
+                    change = event
+                    break
+            self.assertIsNotNone(change, "the edit should have been announced")
+            self.assertEqual(change["brain_id"], self.fixture.brain_id)
+            self.assertIn(change["kind"], ("note", "brain", "reindex"))
+
+        status, fresh, after = self.universe(if_none_match=etag)
+        self.assertEqual(status, 200, "the old tag is stale now")
+        self.assertNotEqual(fresh, etag)
+        self.assertGreater(after["brains"][0]["revision"], revision_before)
+
+    def test_a_second_rescan_that_found_nothing_leaves_the_tag_alone(self):
+        self.fixture.reindex()
+        _, etag, _ = self.universe()
+        self.fixture.reindex()
+        status, again, _ = self.universe(if_none_match=etag)
+        self.assertEqual(status, 304, "nothing changed, so nothing moved")
+        self.assertEqual(again, etag)
+
+    def test_moving_an_agent_moves_the_tag_too(self):
+        # The agents are Python's own addition to the payload, so a tag that
+        # only described Rust's half would hand the browser a stale one.
+        _, etag, payload = self.universe()
+        agent_id = payload["agents"][0]["id"]
+        agent = self.state.cfg.agent(agent_id)
+        agent.pos = [round(agent.pos[0] + 3.0, 3) if agent.pos else 3.0, 1.0, 2.0]
+        _, moved, _ = self.universe(rebuild=True)
+        self.assertNotEqual(moved, etag)
+
+
 class CitationTests(unittest.TestCase):
     """A citation must mean the agent used the note. Nothing else earns a pill.
 
@@ -779,6 +921,9 @@ class JobTests(unittest.TestCase):
 
             def universe(self):
                 return {"noteIds": [], "brains": [], "stats": {}}
+
+            def universe_with_etag(self, if_none_match=None):
+                return self.universe(), '"fake"'
 
         state = State(Config(), FakeCorpus())
         lines: list[str] = []
