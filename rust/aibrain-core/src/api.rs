@@ -71,6 +71,9 @@ pub fn router(ctx: Shared) -> Router {
         .route("/notes/recent", get(recent))
         .route("/reindex", post(reindex))
         .route("/search/resync", post(resync_search))
+        // The day's list keeps its own module; merged before the state so it
+        // shares this one Ctx.
+        .merge(crate::todo::routes())
         .with_state(ctx)
 }
 

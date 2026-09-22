@@ -7,6 +7,7 @@ mod es;
 mod graph;
 mod ingest;
 mod layout;
+mod todo;
 mod vault;
 mod watch;
 
@@ -33,6 +34,9 @@ Environment:
   AIBRAIN_ES_INDEX_PREFIX  default {es_default_prefix}
   AIBRAIN_ES_BATCH         documents per bulk (default {es_default_batch})
   AIBRAIN_ES_POLL_MS       idle poll interval (default {es_default_poll})
+  AIBRAIN_TODO_TEST_CLOCK  1 lets every /todos route take `?now=<timestamp>`
+                           instead of the wall clock, so a test can roll the
+                           day forward. Unset in normal use.
 
 A .env in this directory or any parent is loaded first; real environment
 variables win over it.

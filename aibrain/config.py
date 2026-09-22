@@ -128,11 +128,23 @@ class ViewOptions:
 
 
 @dataclass
+class TodoOptions:
+    """Settings for the day's list. Python writes them; Rust reads them.
+
+    04:00 rather than midnight so that finishing something at one in the
+    morning lands on the day you were working, not on an empty new one.
+    """
+
+    day_start_hour: int = 4
+
+
+@dataclass
 class Config:
     brains: list[BrainConfig] = field(default_factory=list)
     agents: list[AgentConfig] = field(default_factory=list)
     scripts: list[ScriptConfig] = field(default_factory=list)
     view: ViewOptions = field(default_factory=ViewOptions)
+    todo: TodoOptions = field(default_factory=TodoOptions)
     host: str = "127.0.0.1"
     port: int = 8760
     title: str = "Dave Brain"
@@ -168,11 +180,18 @@ class Config:
         view = ViewOptions(
             **{k: v for k, v in view_raw.items() if k in ViewOptions.__dataclass_fields__}
         )
+        todo_raw = raw.get("todo", {}) or {}
+        todo = TodoOptions(
+            **{k: v for k, v in todo_raw.items() if k in TodoOptions.__dataclass_fields__}
+        )
+        if not 0 <= todo.day_start_hour <= 23:
+            todo.day_start_hour = TodoOptions().day_start_hour
         return cls(
             brains=build(BrainConfig, raw.get("brains", [])),
             agents=build(AgentConfig, raw.get("agents", [])),
             scripts=build(ScriptConfig, raw.get("scripts", [])),
             view=view,
+            todo=todo,
             host=raw.get("host", "127.0.0.1"),
             port=int(raw.get("port", 8760)),
             title=raw.get("title", "Dave Brain"),
@@ -184,6 +203,7 @@ class Config:
             "host": self.host,
             "port": self.port,
             "view": asdict(self.view),
+            "todo": asdict(self.todo),
             "brains": [asdict(b) for b in self.brains],
             "agents": [asdict(a) for a in self.agents],
             "scripts": [asdict(s) for s in self.scripts],
