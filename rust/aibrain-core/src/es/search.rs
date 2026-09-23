@@ -77,27 +77,27 @@ pub fn build_request(query: &str, limit: i64) -> Value {
 
 /// Which indices a `brains=` parameter points at.
 ///
-/// The parameter carries brain **ids**, as it always has; the index name comes
-/// from the brain's display name, so the two have to be mapped through the
-/// brain table. An id nobody knows contributes nothing rather than widening
-/// the search to everything.
-pub fn target_indices(es: &Es, brains: &[String], known: &[(String, String)]) -> String {
+/// The parameter carries brain **ids**; `known` maps each id to the index name
+/// recorded for it (`None` until the worker has provisioned one). No brains
+/// means every live index, through the search alias rather than a wildcard, so
+/// a stray or retiring index under the prefix is never searched. An id nobody
+/// knows contributes nothing rather than widening the search to everything.
+pub fn target_indices(es: &Es, brains: &[String], known: &[(String, Option<String>)]) -> String {
     if brains.is_empty() {
-        return es.wildcard();
+        return es.search_alias();
     }
     let mut names: Vec<String> = Vec::new();
     for id in brains {
-        if let Some((_, name)) = known.iter().find(|(known_id, _)| known_id == id) {
-            let index = es.index_for(name);
-            if !names.contains(&index) {
-                names.push(index);
+        if let Some((_, Some(index))) = known.iter().find(|(known_id, _)| known_id == id) {
+            if !names.contains(index) {
+                names.push(index.clone());
             }
         }
     }
     if names.is_empty() {
         // Ask for an index that cannot exist rather than silently searching
         // every brain when the caller asked for one.
-        return format!("{}none-", es.cfg.index_prefix);
+        return format!("{}_none", es.cfg.index_prefix);
     }
     names.join(",")
 }
@@ -123,10 +123,10 @@ pub async fn run(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let known: Vec<(String, String)> = db::list_brains(pool)
+    let known: Vec<(String, Option<String>)> = db::brain_indices(pool)
         .await?
         .into_iter()
-        .map(|b| (b.id, b.name))
+        .map(|b| (b.id, b.index_name))
         .collect();
     let indices = target_indices(es, brains, &known);
     let response = es.search(&indices, &build_request(query, limit)).await?;
@@ -281,20 +281,21 @@ mod tests {
     fn brain_ids_become_index_names() {
         let es = es();
         let known = vec![
-            ("v1".to_string(), "Grognard".to_string()),
-            ("v2".to_string(), "Obsidian Cloud Home".to_string()),
+            ("v1".to_string(), Some("aibrain-grognard".to_string())),
+            ("v2".to_string(), Some("aibrain-3f9c0a".to_string())),
+            ("v3".to_string(), None),
         ];
-        assert_eq!(target_indices(&es, &[], &known), "aibrain-*");
-        assert_eq!(
-            target_indices(&es, &["v1".into()], &known),
-            "aibrain-grognard"
-        );
+        // Unscoped searches go through the alias, never a wildcard that would
+        // also reach retiring or foreign indices.
+        assert_eq!(target_indices(&es, &[], &known), "aibrain-_search");
+        assert_eq!(target_indices(&es, &["v1".into()], &known), "aibrain-grognard");
         assert_eq!(
             target_indices(&es, &["v1".into(), "v2".into()], &known),
-            "aibrain-grognard,aibrain-obsidian-cloud-home"
+            "aibrain-grognard,aibrain-3f9c0a"
         );
-        // An unknown id narrows to nothing rather than widening to everything.
-        assert_eq!(target_indices(&es, &["nope".into()], &known), "aibrain-none-");
+        // Unknown, or known but not provisioned yet: nothing, not everything.
+        assert_eq!(target_indices(&es, &["nope".into()], &known), "aibrain-_none");
+        assert_eq!(target_indices(&es, &["v3".into()], &known), "aibrain-_none");
     }
 
     #[test]

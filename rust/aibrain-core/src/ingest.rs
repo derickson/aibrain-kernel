@@ -27,6 +27,8 @@ pub struct Stats {
     /// Every brain whose revision this run moved, and what it moved to.
     /// Empty when the scan found nothing to do, which is the usual case.
     pub bumped: Vec<(String, i64)>,
+    /// Brains this run retired because the config no longer lists them.
+    pub retired: Vec<String>,
 }
 
 impl Stats {
@@ -68,16 +70,34 @@ pub async fn reindex(
     let mut total = Stats::default();
     let before = db::brain_fingerprints(pool).await?;
 
+    // A brain the config no longer lists is retired the same way the Remove
+    // button retires one: rows, queue and index together. This is the
+    // fallback for a removal the service did not hear about directly.
     let keep: Vec<String> = brains.iter().map(|b| b.id.clone()).collect();
-    let dropped = db::retain_brains(pool, &keep).await?;
-    if dropped > 0 {
-        progress(&format!("dropped {dropped} brain(s) no longer linked"));
+    for id in db::brains_not_in(pool, &keep).await? {
+        if db::retire_brain(pool, &id).await?.is_some() {
+            total.retired.push(id);
+        }
+    }
+    if !total.retired.is_empty() {
+        progress(&format!("retired {} brain(s) no longer linked", total.retired.len()));
     }
 
     let mut touched: BTreeSet<String> = BTreeSet::new();
     for brain in brains {
+        // Held across the scan so a removal cannot interleave with it. Taken
+        // before looking at the disk: the caller's config may be stale, and a
+        // vault unlinked since then must not be written back in.
+        let lock = db::BrainLock::shared(pool, &brain.id).await?;
+        if !Path::new(&brain.root).is_dir() {
+            progress(&format!("skipping {}: {} is no longer linked", brain.name, brain.root));
+            lock.release().await?;
+            continue;
+        }
         db::upsert_brain(pool, &brain.id, &brain.name, &brain.root, brain.seed).await?;
-        let stats = ingest_brain(pool, brain, force, &mut progress).await?;
+        let stats = ingest_brain(pool, brain, force, &mut progress).await;
+        lock.release().await?;
+        let stats = stats?;
         if stats.changed() {
             touched.insert(brain.id.clone());
         }
@@ -134,7 +154,6 @@ async fn write_note(
     db::enqueue_note(
         pool,
         &brain.id,
-        &brain.name,
         Some(note_id),
         &parsed.rel_path,
         "upsert",

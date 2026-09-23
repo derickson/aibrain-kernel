@@ -141,6 +141,8 @@ pub fn router(ctx: Shared) -> Router {
         .route("/notes/recent", get(recent))
         .route("/reindex", post(reindex))
         .route("/search/resync", post(resync_search))
+        .route("/search/status", get(search_status))
+        .route("/brains/:id/retire", post(retire_brain))
         .route("/render", post(render_markdown))
         // The day's list keeps its own module; merged before the state so it
         // shares this one Ctx.
@@ -162,19 +164,7 @@ async fn health(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>>
 async fn status(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
     let cfg = ctx.config()?;
     let brains = db::list_brains(&ctx.pool).await?;
-    let search = match &ctx.es {
-        None => json!({ "engine": "postgres" }),
-        Some(es) => {
-            let indices: Vec<String> =
-                brains.iter().map(|b| es.index_for(&b.name)).collect();
-            json!({
-                "engine": "elasticsearch",
-                "inference_id": es.cfg.inference_id,
-                "queue": db::queue_stats(&ctx.pool).await?,
-                "indices": indices,
-            })
-        }
-    };
+    let search = search_report(&ctx).await?;
     Ok(Json(json!({
         "title": cfg.title,
         "notes": db::count_notes(&ctx.pool).await?,
@@ -319,6 +309,66 @@ async fn search(
 ///
 /// The backfill path: a database whose notes were ingested before any of this
 /// existed has no queue rows, and nothing else would ever create them.
+/// What the search side is doing: cluster health, queue per brain, pending
+/// index retirements, dead letters, and what reconcile last found.
+async fn search_report(ctx: &Ctx) -> anyhow::Result<serde_json::Value> {
+    let Some(es) = &ctx.es else {
+        return Ok(json!({ "engine": "postgres" }));
+    };
+    let health = es.health.lock().unwrap().clone();
+    let by_brain = db::queue_by_brain(&ctx.pool).await?;
+    let indices: Vec<String> = by_brain.iter().filter_map(|b| b.index_name.clone()).collect();
+    Ok(json!({
+        "engine": "elasticsearch",
+        "inference_id": es.cfg.inference_id,
+        "health": health,
+        "queue": db::queue_stats(&ctx.pool).await?,
+        "queue_by_brain": by_brain,
+        "dead_letter": db::dead_letter_count(&ctx.pool).await?,
+        "retirements": db::pending_retirements(&ctx.pool).await?,
+        "indices": indices,
+    }))
+}
+
+async fn search_status(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(search_report(&ctx).await?))
+}
+
+/// Remove a brain whose vault has been unlinked.
+///
+/// Python calls this right after removing the symlink. Postgres forgets the
+/// brain at once — notes, links, queued writes — and its index is recorded for
+/// the worker to drop, now or whenever Elasticsearch is next reachable.
+/// Refused while the vault is still linked: that would only be undone by the
+/// next rescan, after paying to embed every note again.
+async fn retire_brain(
+    State(ctx): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let cfg = ctx.config()?;
+    if let Some(brain) = cfg.brains.iter().find(|b| b.id == id) {
+        if std::path::Path::new(&brain.root).is_dir() {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "that vault is still linked; unlink it first" })),
+            )
+                .into_response());
+        }
+    }
+    let retired = db::retire_brain(&ctx.pool, &id).await?;
+    if retired.is_some() {
+        ctx.revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ctx.events.publish(Change::removed(&id));
+        tracing::info!("retired brain {id}");
+    }
+    Ok(Json(json!({
+        "retired": retired.is_some(),
+        "index": retired.and_then(|r| r.index_name),
+        "search": if ctx.es.is_some() { "elasticsearch" } else { "postgres" },
+    }))
+    .into_response())
+}
+
 async fn resync_search(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
     let enqueued = db::enqueue_all(&ctx.pool, None).await?;
     tracing::info!("resync queued {enqueued} note(s) for search indexing");
@@ -421,11 +471,12 @@ async fn reindex(
     let stats =
         crate::ingest::reindex(&ctx.pool, &cfg.brains, body.force, |line| tracing::info!("{line}"))
             .await?;
-    if stats.changed() {
+    if stats.changed() || !stats.retired.is_empty() {
         ctx.revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     ctx.events.publish_all(
-        stats.bumped.iter().map(|(id, rev)| Change::reindex(id, *rev)),
+        stats.bumped.iter().map(|(id, rev)| Change::reindex(id, *rev))
+            .chain(stats.retired.iter().map(Change::removed)),
     );
     Ok(Json(json!({
         "scanned": stats.scanned,
@@ -434,6 +485,7 @@ async fn reindex(
         "removed": stats.removed,
         "unchanged": stats.unchanged,
         "links": stats.links,
+        "retired": stats.retired,
         // Which vaults moved, so a caller that is not watching /events still
         // learns what to invalidate.
         "bumped": stats.bumped.iter()

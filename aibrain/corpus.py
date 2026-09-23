@@ -249,6 +249,12 @@ class Corpus:
         payload = self._request("/notes/recent", params={"limit": limit}) or {}
         return payload.get("results", [])
 
+    def retire_brain(self, brain_id: str) -> dict:
+        """Forget a brain whose link is gone, and schedule its index for
+        deletion. Waits out a rescan of that brain if one is running."""
+        return self._request(f"/brains/{urllib.parse.quote(brain_id, safe='')}/retire",
+                             body={}, timeout=REINDEX_TIMEOUT) or {}
+
     def reindex(self, force: bool = False) -> dict:
         return self._request("/reindex", body={"force": bool(force)},
                              timeout=REINDEX_TIMEOUT) or {}

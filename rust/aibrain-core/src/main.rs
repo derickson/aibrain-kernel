@@ -81,6 +81,19 @@ async fn main() -> Result<()> {
 
     let pool = db::connect(&url).await?;
 
+    // Brains that predate uid-named indices keep the index the old code named
+    // after them. Recorded before any command can retire one, so a removal
+    // always knows which index to drop. Needs only the prefix, not the cluster.
+    if let Some(es_cfg) = es::EsConfig::from_env() {
+        let adopted = db::assign_legacy_index_names(&pool, |name| {
+            es::legacy_index_name(&es_cfg.index_prefix, name)
+        })
+        .await?;
+        if adopted > 0 {
+            tracing::info!("recorded {adopted} existing index name(s) for adoption");
+        }
+    }
+
     match command {
         "reindex" => {
             let cfg = config::load(&config_path)?;
@@ -135,9 +148,8 @@ async fn main() -> Result<()> {
             }
 
             if let Some(search) = &search {
-                if let Err(err) = es::worker::reconcile(&pool, search).await {
-                    tracing::warn!("could not reconcile with elasticsearch: {err:#}");
-                }
+                // Reconciles first, then provisions, retires and drains; an
+                // unreachable cluster only pauses it.
                 es::worker::spawn(pool.clone(), search.clone());
             }
 

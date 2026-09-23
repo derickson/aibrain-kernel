@@ -19,7 +19,8 @@ const CAPACITY: usize = 256;
 /// One thing that changed.
 ///
 /// `kind` is `note` for a single file the watcher saw, `brain` for a vault
-/// whose revision moved, and `reindex` for a whole rescan.
+/// whose revision moved, `reindex` for a whole rescan, and `brain_removed`
+/// for a vault that was unlinked and retired.
 #[derive(Debug, Clone, Serialize)]
 pub struct Change {
     pub kind: &'static str,
@@ -45,6 +46,10 @@ impl Change {
 
     pub fn reindex(brain_id: impl Into<String>, revision: i64) -> Self {
         Change { kind: "reindex", brain_id: brain_id.into(), revision, note_id: None }
+    }
+
+    pub fn removed(brain_id: impl Into<String>) -> Self {
+        Change { kind: "brain_removed", brain_id: brain_id.into(), revision: 0, note_id: None }
     }
 
     /// What a subscriber that fell behind is sent. No brain, so a client reads

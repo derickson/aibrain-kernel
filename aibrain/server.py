@@ -1009,7 +1009,13 @@ def build_router(state: State) -> Router:
         h.json({"ok": True, "id": slugify(link.name), "needsReindex": True})
 
     def remove_brain(h: Handler, brain_id: str) -> None:
-        """Remove the symlink. The vault itself is never touched."""
+        """Remove the symlink, then retire the brain in aibrain-core.
+
+        The vault itself is never touched. Retiring drops the brain's notes
+        from Postgres at once and schedules its search index for deletion,
+        which happens whenever Elasticsearch is reachable. If aibrain-core is
+        down, the next rescan retires it instead.
+        """
         brain = state.cfg.brain(brain_id)
         if brain is None:
             h.fail("unknown brain", 404)
@@ -1029,7 +1035,14 @@ def build_router(state: State) -> Router:
 
         reconcile_brains(state.cfg)
         state.cfg.save()
-        h.json({"ok": True, "needsReindex": True})
+        try:
+            retired = state.corpus.retire_brain(brain_id)
+        except CorpusError as exc:
+            print(f"  could not retire {brain_id} now ({exc}); the next rescan will")
+            h.json({"ok": True, "retired": False, "needsReindex": True})
+            return
+        h.json({"ok": True, "retired": bool(retired.get("retired")),
+                "index": retired.get("index"), "needsReindex": False})
 
     def discover(h: Handler) -> None:
         """What is linked, and what is linked but broken."""

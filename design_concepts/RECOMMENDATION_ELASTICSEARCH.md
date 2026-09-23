@@ -1,6 +1,8 @@
 # Recommendation — Elasticsearch index lifecycle
 
-Written 2026-09-23. A proposal, not yet built. It covers how a brain's
+Written 2026-09-23, and **implemented the same day** — see
+[Implementation notes](#implementation-notes) at the end for where the build
+differs from the proposal. It covers how a brain's
 Elasticsearch index is named, created, written to, and removed, and what
 should change so that removing a vault is immediate, cheap, and cannot be
 undone by a late write.
@@ -315,3 +317,60 @@ missing document.
 4. §4 health gate and dead-letter.
 5. §5 continuous reconcile with `_meta` ownership checks.
 6. §6 watcher follow-up, status endpoint, `indexed_at`, schema versioning.
+
+## Implementation notes
+
+Built as proposed, with these differences, each for a reason found while
+building it:
+
+- **Migration** is `0006_index_lifecycle.sql` (`0005` was taken by work in
+  progress on the todo shelf). Besides `uid` and `index_name`, `brain` gained
+  `index_ready_at` (set once provisioning finishes; `claim_queue` only claims
+  rows for brains that have it, so the worker never writes before an index
+  exists) and `adopt_legacy` (true only for brains that existed when the
+  migration ran).
+- **Alias names** are `<prefix>_w-<uid>` and `<prefix>_search`, not
+  `aibrain-w-<uid>`. `sanitize_index_name` strips a leading `_` from any vault
+  name, so no index can ever be named into an alias.
+- **Queue rows do not carry `index_name`.** `claim_queue` reads the brain's
+  `uid` (the write alias) and `index_name` in the same statement. Because a
+  brain's queue rows cascade away with it and a re-added brain is a new row
+  with a new uid, this is as stable as copying the name onto each row, and
+  it saves a column.
+- **No "refuse a retired uid" in `upsert_brain`.** A re-added brain is a new
+  row, so there was never a uid to refuse. Instead, `reindex` takes the
+  per-brain shared lock and then re-checks that the vault's link still exists
+  before writing anything. The retire endpoint also answers `409` while the
+  vault is still linked, because the next rescan would only put it back after
+  re-embedding everything.
+- **Adopting legacy indices.** At startup, before anything can retire a brain,
+  `assign_legacy_index_names` records the old name-derived index for every
+  `adopt_legacy` brain. When the worker provisions one it adds the `_meta`
+  stamp and aliases in place, and it removes other vaults' documents with
+  `_delete_by_query` (the old naming let folded names share an index). If two
+  old names fold to the same index, the first keeps it and the second gets a
+  new uid index.
+- **Re-adopting after a Postgres rebuild** matches `_meta.aibrain.brain_id`,
+  not the uid, because the uid is lost with the database. An index with a
+  pending retirement, or one another brain claims, is never adopted.
+- **`_meta` records the prefix too.** The live prefix `aibrain-` also matches
+  the test suite's `aibrain-test-…` indices by wildcard. The live service
+  treats an index as its own only when the stamp carries its own prefix.
+- **UI.** A removed brain disappears from the Brains panel at once, so there
+  is no per-brain "Removing…" card. The Index card shows one line instead,
+  and only when there is something to say: the cluster is unreachable,
+  retirements are pending (with the last error), or documents are in the
+  dead-letter table.
+- **Tests.** All tests in `es::integration` share one test database and the
+  worker acts on every brain in it, so the tests are serialised and each
+  cluster test clears the brain table first.
+
+Not built, and still worth doing:
+
+- The `indexed_at`-based checksum in §5. Documents already carry
+  `indexed_at`; reconcile still compares counts only.
+- Moving an index to a new generation when `_meta.schema` is behind
+  `SCHEMA_VERSION`. The version is stamped, but nothing acts on it yet.
+- Moving adopted brains from their legacy names to uid names (step 3 of the
+  migration). It is optional, and first needs confirming that `_reindex` on
+  Serverless keeps the stored embeddings.

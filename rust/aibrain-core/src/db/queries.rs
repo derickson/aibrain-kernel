@@ -87,33 +87,17 @@ pub async fn upsert_brain(
     Ok(())
 }
 
-/// Forget every brain that is no longer linked. Cascades to its notes.
+/// Brains in the database that the config no longer lists.
 ///
-/// The notes are queued for deletion from Elasticsearch first, while the brain
-/// row (and so its name, which the index name is derived from) still exists.
-/// The index itself is left in place: it is empty afterwards, and dropping an
-/// index outright is the one move that cannot be undone by a resync.
-pub async fn retain_brains(pool: &PgPool, keep: &[String]) -> Result<u64> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
-         SELECT n.brain_id, b.name, n.id, n.rel_path, 'delete'
-           FROM note n JOIN brain b ON b.id = n.brain_id
-          WHERE NOT (n.brain_id = ANY($1))
-         ON CONFLICT (brain_id, rel_path) DO UPDATE
-            SET op = 'delete', note_id = EXCLUDED.note_id,
-                brain_name = EXCLUDED.brain_name, enqueued_at = now(),
-                attempts = 0, last_error = NULL, locked_until = NULL",
-    )
-    .bind(keep)
-    .execute(&mut *tx)
-    .await?;
-    let result = sqlx::query("DELETE FROM brain WHERE NOT (id = ANY($1))")
+/// The caller retires each one through `retire_brain`, which is what drops its
+/// index and purges its queue. This used to delete the rows directly and queue
+/// one Elasticsearch delete per note, leaving an empty index behind forever.
+pub async fn brains_not_in(pool: &PgPool, keep: &[String]) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT id FROM brain WHERE NOT (id = ANY($1)) ORDER BY id")
         .bind(keep)
-        .execute(&mut *tx)
+        .fetch_all(pool)
         .await?;
-    tx.commit().await?;
-    Ok(result.rows_affected())
+    Ok(rows.into_iter().map(|r| r.get("id")).collect())
 }
 
 pub async fn list_brains(pool: &PgPool) -> Result<Vec<BrainRow>> {
@@ -246,10 +230,12 @@ pub async fn delete_notes(pool: &PgPool, ids: &[i64]) -> Result<()> {
         let note_ids: Vec<i64> = gone.iter().map(|r| r.get("id")).collect();
         sqlx::query(
             "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
-             SELECT w.brain_id, COALESCE(b.name, ''), w.note_id, w.rel_path, 'delete'
+             SELECT w.brain_id, b.name, w.note_id, w.rel_path, 'delete'
                FROM unnest($1::text[], $2::text[], $3::bigint[])
                     AS w(brain_id, rel_path, note_id)
-               LEFT JOIN brain b ON b.id = w.brain_id
+               -- An inner join: a brain that is gone has no index to delete
+               -- from, and the foreign key would refuse the row anyway.
+               JOIN brain b ON b.id = w.brain_id
              ON CONFLICT (brain_id, rel_path) DO UPDATE
                 SET op = 'delete', note_id = EXCLUDED.note_id,
                     brain_name = EXCLUDED.brain_name, enqueued_at = now(),
@@ -776,6 +762,11 @@ pub struct QueueItem {
     pub id: i64,
     pub brain_id: String,
     pub brain_name: String,
+    /// The brain's uid, which names the write alias every document goes
+    /// through. Read from `brain` at claim time; it never changes for a row.
+    pub uid: String,
+    /// The concrete index behind that alias, for logs and tests.
+    pub index_name: String,
     pub note_id: Option<i64>,
     pub rel_path: String,
     /// `upsert` or `delete`.
@@ -787,24 +778,27 @@ pub struct QueueItem {
 }
 
 /// One note changed. The latest operation wins; earlier edits coalesce away.
+///
+/// Selected from `brain` rather than inserted outright, so a brain that has
+/// been retired — or is being retired in a concurrent transaction — gets
+/// nothing queued. The foreign key would refuse the row anyway; this makes it
+/// a no-op instead of an error.
 pub async fn enqueue_note(
     pool: &PgPool,
     brain_id: &str,
-    brain_name: &str,
     note_id: Option<i64>,
     rel_path: &str,
     op: &str,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO search_queue (brain_id, brain_name, note_id, rel_path, op)
-         VALUES ($1, $2, $3, $4, $5)
+         SELECT b.id, b.name, $2, $3, $4 FROM brain b WHERE b.id = $1
          ON CONFLICT (brain_id, rel_path) DO UPDATE
             SET op = EXCLUDED.op, note_id = EXCLUDED.note_id,
                 brain_name = EXCLUDED.brain_name, enqueued_at = now(),
                 attempts = 0, last_error = NULL, locked_until = NULL",
     )
     .bind(brain_id)
-    .bind(brain_name)
     .bind(note_id)
     .bind(rel_path)
     .bind(op)
@@ -832,21 +826,27 @@ pub async fn enqueue_all(pool: &PgPool, brain_id: Option<&str>) -> Result<u64> {
 }
 
 /// Take up to `limit` items, leasing them so a second worker skips them.
+///
+/// Only rows whose brain has a provisioned index are eligible: the worker never
+/// writes to an index it has not created, so a brand-new brain's rows wait
+/// here until provisioning has run.
 pub async fn claim_queue(pool: &PgPool, limit: i64, lease_secs: i64) -> Result<Vec<QueueItem>> {
     let rows = sqlx::query(
         "WITH ready AS (
-             SELECT id FROM search_queue
-              WHERE locked_until IS NULL OR locked_until < now()
-              ORDER BY enqueued_at, id
+             SELECT q.id FROM search_queue q
+               JOIN brain b ON b.id = q.brain_id
+              WHERE (q.locked_until IS NULL OR q.locked_until < now())
+                AND b.index_ready_at IS NOT NULL
+              ORDER BY q.enqueued_at, q.id
               LIMIT $1
-              FOR UPDATE SKIP LOCKED
+              FOR UPDATE OF q SKIP LOCKED
          )
          UPDATE search_queue q
             SET locked_until = now() + make_interval(secs => $2::double precision)
-           FROM ready
-          WHERE q.id = ready.id
-      RETURNING q.id, q.brain_id, q.brain_name, q.note_id, q.rel_path, q.op,
-                q.attempts, q.enqueued_at",
+           FROM ready, brain b
+          WHERE q.id = ready.id AND b.id = q.brain_id
+      RETURNING q.id, q.brain_id, q.brain_name, b.uid, b.index_name, q.note_id,
+                q.rel_path, q.op, q.attempts, q.enqueued_at",
     )
     .bind(limit)
     .bind(lease_secs as f64)
@@ -858,6 +858,8 @@ pub async fn claim_queue(pool: &PgPool, limit: i64, lease_secs: i64) -> Result<V
             id: r.get("id"),
             brain_id: r.get("brain_id"),
             brain_name: r.get("brain_name"),
+            uid: r.get("uid"),
+            index_name: r.try_get::<Option<String>, _>("index_name").ok().flatten().unwrap_or_default(),
             note_id: r.try_get("note_id").ok(),
             rel_path: r.get("rel_path"),
             op: r.get("op"),
@@ -890,7 +892,29 @@ pub async fn finish_queue(pool: &PgPool, done: &[QueueItem]) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// How many times a document may be refused before it is set aside.
+pub const MAX_ATTEMPTS: i32 = 10;
+
+/// Give leased rows back without counting an attempt against them.
+///
+/// For failures that say nothing about the document — the cluster was
+/// unreachable, or its alias had gone and is being reprovisioned. Charging
+/// those to the row would make `attempts` measure the outage.
+pub async fn release_queue(pool: &PgPool, ids: &[i64]) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query("UPDATE search_queue SET locked_until = NULL WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Record a failure and back the row off. 2^attempts seconds, capped at an hour.
+///
+/// A row refused `MAX_ATTEMPTS` times moves to `search_dead_letter` instead of
+/// retrying hourly forever.
 pub async fn fail_queue(pool: &PgPool, failures: &[(i64, String)]) -> Result<()> {
     if failures.is_empty() {
         return Ok(());
@@ -911,6 +935,25 @@ pub async fn fail_queue(pool: &PgPool, failures: &[(i64, String)]) -> Result<()>
     )
     .bind(&ids)
     .bind(&reasons)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "WITH dead AS (
+             DELETE FROM search_queue
+              WHERE id = ANY($1) AND attempts >= $2
+          RETURNING id, brain_id, brain_name, note_id, rel_path, op, enqueued_at,
+                    attempts, last_error
+         )
+         INSERT INTO search_dead_letter
+                (id, brain_id, brain_name, note_id, rel_path, op, enqueued_at,
+                 attempts, last_error)
+         SELECT * FROM dead
+         ON CONFLICT (id) DO UPDATE
+            SET attempts = EXCLUDED.attempts, last_error = EXCLUDED.last_error,
+                dead_at = now()",
+    )
+    .bind(&ids)
+    .bind(MAX_ATTEMPTS)
     .execute(pool)
     .await?;
     Ok(())
