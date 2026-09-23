@@ -373,7 +373,7 @@ class ACPConnection:
     def mcp_servers(self) -> list[dict]:
         """The MCP servers the agent gets for this session.
 
-        One, for now: the day's list. It travels through the same `session/new`
+        One, for now: the to-do list. It travels through the same `session/new`
         field `additionalDirectories` does, so the adapter is already known to
         accept it. The child is launched by the agent, not by us, so it
         inherits none of our environment — PYTHONPATH is spelled out because

@@ -1,11 +1,14 @@
-//! The day's list: the HTTP surface, and the one place that decides which day
+//! The to-do list: the HTTP surface, and the one place that decides which day
 //! an instant belongs to.
 //!
-//! Two things make that decision non-obvious. A day does not start at
-//! midnight — `todo.day_start_hour` in `config.json` defaults to 04:00, so
-//! finishing something at 01:00 counts as the evening before. And rollover is
-//! lazy: opening day D is what migrates everything still open from before it,
-//! because a cron job cannot run on a laptop that was asleep at midnight.
+//! The list is a single list, not a calendar — an item may carry a due date,
+//! but nothing is filed under a day and nothing rolls over. Days still matter
+//! in two places: resolving "today"/"tomorrow" for a due date, and deciding
+//! how long a finished item lingers, struck through, before it drops off.
+//!
+//! Neither starts at midnight — `todo.day_start_hour` in `config.json`
+//! defaults to 04:00, so finishing something at 01:00 counts as the evening
+//! before, and "tomorrow" at 01:00 is still the calendar's today.
 //!
 //! Every function that needs "now" takes it as an argument, so all of this is
 //! testable without waiting for tomorrow. In production "now" is the clock; in
@@ -77,13 +80,16 @@ fn instant_at<Tz: TimeZone>(day: NaiveDate, hour: u32, tz: &Tz) -> DateTime<Tz> 
     tz.from_utc_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight always exists"))
 }
 
-/// Whether opening `day` should drag stale open items onto it.
-///
-/// Only forwards. Looking back at last Tuesday is reading history, and
-/// history that rewrites itself when you look at it is not history — without
-/// this guard, paging back a day would pull today's unfinished work into it.
-pub fn should_roll(day: NaiveDate, today: NaiveDate) -> bool {
-    day >= today
+/// A due date as a person or a model writes it: `YYYY-MM-DD`, `today` or
+/// `tomorrow`, resolved against the start hour rather than the calendar.
+/// `Ok(None)` is an explicit "no date"; `Err` is text that is none of these.
+pub fn parse_due(text: Option<&str>, today: NaiveDate) -> Result<Option<NaiveDate>, ()> {
+    match text.map(str::trim) {
+        None | Some("") | Some("none") => Ok(None),
+        Some("today") => Ok(Some(today)),
+        Some("tomorrow") => Ok(Some(today.succ_opt().unwrap_or(today))),
+        Some(text) => parse_day(text).map(Some).ok_or(()),
+    }
 }
 
 /// A `YYYY-MM-DD` from a query string, or nothing.
@@ -143,7 +149,7 @@ pub fn routes() -> Router<Shared> {
         .route("/todos/:id/complete", post(complete))
         .route("/todos/:id/uncomplete", post(uncomplete))
         .route("/todos/:id/cancel", post(cancel))
-        .route("/todos/:id/reschedule", post(reschedule))
+        .route("/todos/:id/due", post(set_due))
         .route("/todos/:id/link", post(link))
         .route("/todos/:id/file", post(file_todo))
         .route("/todos/folders", post(create_folder))
@@ -153,8 +159,6 @@ pub fn routes() -> Router<Shared> {
 
 #[derive(Deserialize, Default)]
 pub struct DayParams {
-    #[serde(default)]
-    day: Option<String>,
     /// Honoured only when `AIBRAIN_TODO_TEST_CLOCK=1`.
     #[serde(default)]
     now: Option<String>,
@@ -171,36 +175,28 @@ async fn list(
     let hour = ctx.config()?.todo_day_start_hour;
     let now = resolve_now(params.now.as_ref());
     let today = day_of(&now, hour);
-    let day = params.day.as_deref().and_then(parse_day).unwrap_or(today);
-
-    let rolled = if should_roll(day, today) {
-        db::todo::roll_over(&ctx.pool, day, now.with_timezone(&Utc)).await?
-    } else {
-        0
-    };
-
-    let (from, until) = day_window(day, hour, &Local);
-    let todos = db::todo::for_day(
-        &ctx.pool,
-        day,
-        from.with_timezone(&Utc),
-        until.with_timezone(&Utc),
-    )
-    .await?;
-    // Folders aren't day-scoped — they show on every day's view, always at
-    // the bottom, so the shelf loads them in the same round trip.
+    // Finished items linger until the day they were finished is over.
+    let (since, _) = day_window(today, hour, &Local);
+    let todos = db::todo::list(&ctx.pool, since.with_timezone(&Utc)).await?;
+    // Folders sit below the list, so the shelf loads them in the same trip.
     let folders = db::todo::list_folders(&ctx.pool).await?;
 
     Ok(Json(json!({
-        "day": day.to_string(),
+        // The browser labels due dates against this, not its own clock — the
+        // start hour decides what "today" is.
         "today": today.to_string(),
-        "prev_day": day.pred_opt().unwrap_or(day).to_string(),
-        "next_day": day.succ_opt().unwrap_or(day).to_string(),
         "start_hour": hour,
-        "rolled": rolled,
         "todos": todos,
         "folders": folders,
     })))
+}
+
+fn bad_due() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "a due date must be YYYY-MM-DD, today, tomorrow or empty" })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -213,7 +209,7 @@ struct RefBody {
 struct CreateBody {
     body: String,
     #[serde(default)]
-    scheduled_on: Option<String>,
+    due_on: Option<String>,
     #[serde(default)]
     refs: Vec<RefBody>,
 }
@@ -233,18 +229,16 @@ async fn create(
     }
     let hour = ctx.config()?.todo_day_start_hour;
     let now = resolve_now(params.now.as_ref());
-    let day = input
-        .scheduled_on
-        .as_deref()
-        .and_then(parse_day)
-        .unwrap_or_else(|| day_of(&now, hour));
+    let Ok(due) = parse_due(input.due_on.as_deref(), day_of(&now, hour)) else {
+        return Ok(bad_due());
+    };
 
     let refs: Vec<(String, String)> = input
         .refs
         .into_iter()
         .map(|r| (r.brain_id, r.rel_path))
         .collect();
-    let id = db::todo::create(&ctx.pool, &body, day, now.with_timezone(&Utc), &refs).await?;
+    let id = db::todo::create(&ctx.pool, &body, due, now.with_timezone(&Utc), &refs).await?;
     Ok(one(&ctx, id).await?)
 }
 
@@ -293,38 +287,26 @@ async fn cancel(
 }
 
 #[derive(Deserialize)]
-struct RescheduleBody {
-    to_day: String,
+struct DueBody {
+    /// Absent or null clears the date.
+    #[serde(default)]
+    due_on: Option<String>,
 }
 
-async fn reschedule(
+async fn set_due(
     State(ctx): State<Shared>,
     Path(id): Path<i64>,
     Query(params): Query<DayParams>,
-    Json(input): Json<RescheduleBody>,
+    Json(input): Json<DueBody>,
 ) -> ApiResult<Response> {
     let now = resolve_now(params.now.as_ref());
     let hour = ctx.config()?.todo_day_start_hour;
     // "tomorrow" is the common case and the UI could compute it, but the day
     // it would compute is the browser's, not the one the start hour defines.
-    let to_day = match input.to_day.trim() {
-        "today" => day_of(&now, hour),
-        "tomorrow" => {
-            let today = day_of(&now, hour);
-            today.succ_opt().unwrap_or(today)
-        }
-        text => match parse_day(text) {
-            Some(day) => day,
-            None => {
-                return Ok((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "to_day must be YYYY-MM-DD, today or tomorrow" })),
-                )
-                    .into_response())
-            }
-        },
+    let Ok(due) = parse_due(input.due_on.as_deref(), day_of(&now, hour)) else {
+        return Ok(bad_due());
     };
-    if !db::todo::reschedule(&ctx.pool, id, to_day, now.with_timezone(&Utc)).await? {
+    if !db::todo::set_due(&ctx.pool, id, due, now.with_timezone(&Utc)).await? {
         return Ok(not_found());
     }
     one(&ctx, id).await
@@ -531,11 +513,15 @@ mod tests {
     }
 
     #[test]
-    fn looking_forward_rolls_and_looking_back_does_not() {
+    fn a_due_date_is_a_day_a_shorthand_or_nothing() {
         let today = day("2026-09-22");
-        assert!(should_roll(today, today));
-        assert!(should_roll(day("2026-09-23"), today), "tomorrow is fair game");
-        assert!(!should_roll(day("2026-09-21"), today), "history stays put");
+        assert_eq!(parse_due(None, today), Ok(None));
+        assert_eq!(parse_due(Some(""), today), Ok(None));
+        assert_eq!(parse_due(Some(" none "), today), Ok(None));
+        assert_eq!(parse_due(Some("today"), today), Ok(Some(today)));
+        assert_eq!(parse_due(Some("tomorrow"), today), Ok(Some(day("2026-09-23"))));
+        assert_eq!(parse_due(Some("2026-12-31"), today), Ok(Some(day("2026-12-31"))));
+        assert_eq!(parse_due(Some("next week"), today), Err(()));
     }
 
     #[test]
@@ -581,7 +567,7 @@ mod tests {
     }
 }
 
-/// End to end against a real Postgres: create, roll over, complete, search.
+/// End to end against a real Postgres: create, date, complete, file, search.
 ///
 /// In-module rather than in `tests/` because the crate is a binary, and it
 /// skips with a printed reason rather than failing when the database is
@@ -598,16 +584,7 @@ mod integration {
     use super::*;
     use crate::db::todo as store;
 
-    /// `roll_over` sweeps the whole table by date, with no per-test marker to
-    /// scope it — a test using a later "today" would otherwise reach back and
-    /// carry forward another test's still-open rows if both ran at once,
-    /// which is exactly how `cargo test`'s default parallelism runs them.
-    /// Every integration test takes this before touching the database, so
-    /// only one is ever inside a `roll_over` sweep at a time.
-    static ROLLOVER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn pool() -> Option<(sqlx::PgPool, tokio::sync::MutexGuard<'static, ()>)> {
-        let guard = ROLLOVER_LOCK.lock().await;
+    async fn pool() -> Option<sqlx::PgPool> {
         let url = std::env::var("AIBRAIN_TEST_DATABASE_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -617,7 +594,7 @@ mod integration {
             return None;
         };
         match crate::db::connect(&url).await {
-            Ok(pool) => Some((pool, guard)),
+            Ok(pool) => Some(pool),
             Err(err) => {
                 eprintln!("skipping todo integration: {err:#}");
                 None
@@ -625,11 +602,9 @@ mod integration {
         }
     }
 
-    /// The zone the service itself uses, so the window the test computes is
-    /// the window the handlers would compute.
-    fn window(day: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-        let (from, until) = day_window(day, 4, &Local);
-        (from.with_timezone(&Utc), until.with_timezone(&Utc))
+    /// The start of a day's window, in the zone the service itself uses.
+    fn since(day: NaiveDate) -> DateTime<Utc> {
+        day_window(day, 4, &Local).0.with_timezone(&Utc)
     }
 
     fn instant(day: NaiveDate, hour: u32) -> DateTime<Utc> {
@@ -640,8 +615,8 @@ mod integration {
             .with_timezone(&Utc)
     }
 
-    fn count_mine(list: &[store::Todo], marker: &str) -> usize {
-        list.iter().filter(|t| t.body.contains(marker)).count()
+    fn mine<'a>(list: &'a [store::Todo], marker: &str) -> Vec<&'a store::Todo> {
+        list.iter().filter(|t| t.body.contains(marker)).collect()
     }
 
     fn find<'a>(list: &'a [store::Todo], id: i64) -> &'a store::Todo {
@@ -649,197 +624,138 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn a_day_rolls_over_completes_and_stays_in_history() {
-        let Some((pool, _guard)) = pool().await else { return };
+    async fn one_list_with_optional_due_dates_and_a_full_history() {
+        let Some(pool) = pool().await else { return };
 
         let marker = format!("zzmarker{}", std::process::id());
         let monday = parse_day("2026-03-02").unwrap();
         let tuesday = parse_day("2026-03-03").unwrap();
-        let wednesday = parse_day("2026-03-04").unwrap();
+        let friday = parse_day("2026-03-06").unwrap();
 
-        let carried = store::create(
-            &pool,
-            &format!("water the {marker} plants"),
-            monday,
-            instant(monday, 9),
-            &[],
-        )
-        .await
-        .unwrap();
-        let finished = store::create(
-            &pool,
-            &format!("post the {marker} letter"),
-            monday,
-            instant(monday, 9),
-            &[],
-        )
-        .await
-        .unwrap();
-
-        // Monday's own view moves nothing: both were scheduled on it.
-        let (from, until) = window(monday);
-        let moved = store::roll_over(&pool, monday, instant(monday, 10)).await.unwrap();
-        assert_eq!(moved, 0, "nothing is stale on its own day");
-        let list = store::for_day(&pool, monday, from, until).await.unwrap();
-        assert_eq!(count_mine(&list, &marker), 2);
-
-        // The letter gets posted at one in the morning — still Monday.
-        store::set_state(&pool, finished, "completed", instant(tuesday, 1))
+        let plants = store::create(&pool, &format!("water the {marker} plants"), None,
+                                   instant(monday, 9), &[])
             .await
             .unwrap();
-        let list = store::for_day(&pool, monday, from, until).await.unwrap();
-        assert_eq!(find(&list, finished).state, "completed", "struck through, still shown");
-        assert_eq!(count_mine(&list, &marker), 2);
-
-        // Opening Tuesday carries the open one forward and leaves the other.
-        let moved = store::roll_over(&pool, tuesday, instant(tuesday, 8)).await.unwrap();
-        assert!(moved >= 1, "the open item should have been carried");
-        let (from, until) = window(tuesday);
-        let list = store::for_day(&pool, tuesday, from, until).await.unwrap();
-        assert_eq!(count_mine(&list, &marker), 1, "the completed one is gone");
-        let plant = find(&list, carried);
-        assert_eq!(plant.scheduled_on, "2026-03-03");
-        assert_eq!(
-            plant.first_scheduled_on, "2026-03-02",
-            "where it started is not overwritten"
-        );
-
-        // Rescheduling moves it again, and Tuesday no longer shows it.
-        store::reschedule(&pool, carried, wednesday, instant(tuesday, 9))
+        let letter = store::create(&pool, &format!("post the {marker} letter"), Some(friday),
+                                   instant(monday, 9), &[])
             .await
             .unwrap();
-        let list = store::for_day(&pool, tuesday, from, until).await.unwrap();
-        assert_eq!(count_mine(&list, &marker), 0, "Tuesday is empty again");
 
-        // History keeps everything, with the story of how it got there.
+        // Both are on the list, undated one first because it was added first.
+        let list = store::list(&pool, since(monday)).await.unwrap();
+        let rows = mine(&list, &marker);
+        assert_eq!(rows.iter().map(|t| t.id).collect::<Vec<_>>(), vec![plants, letter]);
+        assert_eq!(find(&list, plants).due_on, None, "no date unless one is given");
+        assert_eq!(find(&list, letter).due_on.as_deref(), Some("2026-03-06"));
+
+        // A week later nothing has moved: there is no rollover to move it.
+        let later = parse_day("2026-03-09").unwrap();
+        let list = store::list(&pool, since(later)).await.unwrap();
+        assert_eq!(mine(&list, &marker).len(), 2);
+        assert_eq!(find(&list, letter).due_on.as_deref(), Some("2026-03-06"), "overdue, not moved");
+
+        // The letter gets posted at one in the morning — still Monday. It
+        // lingers, struck through, until Monday is over, then drops off.
+        store::set_state(&pool, letter, "completed", instant(tuesday, 1)).await.unwrap();
+        let list = store::list(&pool, since(monday)).await.unwrap();
+        assert_eq!(find(&list, letter).state, "completed", "struck through, still shown");
+        let list = store::list(&pool, since(tuesday)).await.unwrap();
+        assert_eq!(mine(&list, &marker).len(), 1, "gone once its day is over");
+
+        // Dating, re-dating and clearing are each one event.
+        store::set_due(&pool, plants, Some(tuesday), instant(monday, 10)).await.unwrap();
+        store::set_due(&pool, plants, Some(tuesday), instant(monday, 10)).await.unwrap();
+        store::set_due(&pool, plants, None, instant(monday, 11)).await.unwrap();
+        assert_eq!(store::get(&pool, plants).await.unwrap().unwrap().due_on, None);
+
         let found = store::history(&pool, &marker, 50).await.unwrap();
         assert_eq!(found.len(), 2, "both items are searchable by body");
-        let plant = find(&found, carried);
+        let plant = find(&found, plants);
         let kinds: Vec<&str> = plant.events.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(kinds, vec!["created", "rolled", "rescheduled"]);
-        assert_eq!(plant.events[1].from_day.as_deref(), Some("2026-03-02"));
+        assert_eq!(kinds, vec!["created", "rescheduled", "rescheduled"], "a no-op logs nothing");
+        assert_eq!(plant.events[1].from_day, None);
         assert_eq!(plant.events[1].to_day.as_deref(), Some("2026-03-03"));
-        assert!(find(&found, finished).events.iter().any(|e| e.kind == "completed"));
+        assert_eq!(plant.events[2].from_day.as_deref(), Some("2026-03-03"));
+        assert_eq!(plant.events[2].to_day, None);
+        assert_eq!(find(&found, letter).events[0].to_day.as_deref(), Some("2026-03-06"),
+                   "the created event remembers the first due date");
 
         // Undoing a completion is itself an event, not an erasure.
-        store::set_state(&pool, finished, "uncompleted", instant(wednesday, 9))
-            .await
-            .unwrap();
-        let letter = store::get(&pool, finished).await.unwrap().unwrap();
-        assert_eq!(letter.state, "open");
-        assert!(letter.completed_at.is_none());
-        let found = store::history(&pool, &marker, 50).await.unwrap();
-        assert!(find(&found, finished).events.iter().any(|e| e.kind == "uncompleted"));
+        store::set_state(&pool, letter, "uncompleted", instant(friday, 9)).await.unwrap();
+        let row = store::get(&pool, letter).await.unwrap().unwrap();
+        assert_eq!(row.state, "open");
+        assert!(row.completed_at.is_none());
 
-        // A note link is kept by path even when no such note exists here.
-        store::link(&pool, carried, "nobrain", "Notes/Plants.md", instant(wednesday, 9))
-            .await
-            .unwrap();
-        let plant = store::get(&pool, carried).await.unwrap().unwrap();
+        // A note link is kept by path even when no such note exists here, and
+        // linking the same note twice is not two links.
+        for _ in 0..2 {
+            store::link(&pool, plants, "nobrain", "Notes/Plants.md", instant(friday, 9))
+                .await
+                .unwrap();
+        }
+        let plant = store::get(&pool, plants).await.unwrap().unwrap();
         assert_eq!(plant.refs.len(), 1);
-        assert_eq!(plant.refs[0].rel_path, "Notes/Plants.md");
         assert!(plant.refs[0].note_id.is_none(), "no note, but the path is kept");
 
-        // Linking the same note twice is not two links.
-        store::link(&pool, carried, "nobrain", "Notes/Plants.md", instant(wednesday, 9))
-            .await
-            .unwrap();
-        assert_eq!(store::get(&pool, carried).await.unwrap().unwrap().refs.len(), 1);
-
-        assert!(
-            !store::set_state(&pool, -1, "completed", instant(wednesday, 9)).await.unwrap(),
-            "a missing todo is a miss, not an error"
-        );
+        assert!(!store::set_state(&pool, -1, "completed", instant(friday, 9)).await.unwrap(),
+                "a missing todo is a miss, not an error");
+        assert!(!store::set_due(&pool, -1, None, instant(friday, 9)).await.unwrap());
 
         sqlx::query("DELETE FROM todo WHERE id = ANY($1)")
-            .bind(vec![carried, finished])
+            .bind(vec![plants, letter])
             .execute(&pool)
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn foldered_items_sit_out_the_daily_rotation() {
-        let Some((pool, _guard)) = pool().await else { return };
+    async fn a_filed_item_leaves_the_list_and_comes_back_at_the_end() {
+        let Some(pool) = pool().await else { return };
 
         let marker = format!("zzfolder{}", std::process::id());
-        // A different week from the other integration test's: roll_over acts
-        // on the whole table, not just one test's rows, so sharing a date
-        // with a test running concurrently would make either's count racy.
         let monday = parse_day("2026-04-06").unwrap();
-        let tuesday = parse_day("2026-04-07").unwrap();
+        let at = instant(monday, 9);
 
-        let folder_id = store::create_folder(&pool, &format!("{marker} backlog"))
-            .await
-            .unwrap();
-        let item_a = store::create(&pool, &format!("{marker} a"), monday, instant(monday, 9), &[])
-            .await
-            .unwrap();
-        let item_b = store::create(&pool, &format!("{marker} b"), monday, instant(monday, 9), &[])
-            .await
-            .unwrap();
+        let folder_id = store::create_folder(&pool, &format!("{marker} backlog")).await.unwrap();
+        let item_a = store::create(&pool, &format!("{marker} a"), None, at, &[]).await.unwrap();
+        let item_b = store::create(&pool, &format!("{marker} b"), None, at, &[]).await.unwrap();
 
-        // Filed on Monday, still scheduled on Monday underneath: it must not
-        // show on Monday's own list, and roll_over must not touch it either.
-        store::file_todo(&pool, item_a, Some(folder_id), instant(monday, 10))
-            .await
-            .unwrap();
-        let (from, until) = window(monday);
-        let list = store::for_day(&pool, monday, from, until).await.unwrap();
-        assert_eq!(count_mine(&list, &marker), 1, "only the unfiled item shows");
-        assert_eq!(find(&list, item_b).id, item_b);
-
-        let moved = store::roll_over(&pool, tuesday, instant(tuesday, 8)).await.unwrap();
-        let plant = store::get(&pool, item_a).await.unwrap().unwrap();
-        assert_eq!(plant.scheduled_on, "2026-04-06", "a foldered item never rolls");
-        assert!(moved >= 1, "the unfiled item still rolls forward as normal");
-
-        // The folder groups its member, in order, and the day list stays
-        // ignorant of it.
+        store::file_todo(&pool, item_a, Some(folder_id), at).await.unwrap();
+        let list = store::list(&pool, since(monday)).await.unwrap();
+        assert_eq!(mine(&list, &marker).iter().map(|t| t.id).collect::<Vec<_>>(), vec![item_b],
+                   "only the unfiled item is on the list");
         let folders = store::list_folders(&pool).await.unwrap();
         let backlog = folders.iter().find(|f| f.id == folder_id).unwrap();
-        assert_eq!(backlog.todos.len(), 1);
-        assert_eq!(backlog.todos[0].id, item_a);
+        assert_eq!(backlog.todos.iter().map(|t| t.id).collect::<Vec<_>>(), vec![item_a]);
 
-        // Unfiling leaves scheduled_on alone — it is Monday's stale date that
-        // makes the *next* roll_over pick it up, with no special-casing.
-        store::file_todo(&pool, item_a, None, instant(tuesday, 9)).await.unwrap();
-        let plant = store::get(&pool, item_a).await.unwrap().unwrap();
-        assert!(plant.folder_id.is_none());
-        assert_eq!(plant.scheduled_on, "2026-04-06", "still stale, on purpose");
-        let wednesday = tuesday.succ_opt().unwrap();
-        store::roll_over(&pool, wednesday, instant(wednesday, 8)).await.unwrap();
-        let plant = store::get(&pool, item_a).await.unwrap().unwrap();
-        assert_eq!(plant.scheduled_on, "2026-04-08", "picked up by the very next rollover");
+        // Taken back out, it goes to the end — after b, though it was first.
+        store::file_todo(&pool, item_a, None, at).await.unwrap();
+        let list = store::list(&pool, since(monday)).await.unwrap();
+        assert_eq!(mine(&list, &marker).iter().map(|t| t.id).collect::<Vec<_>>(),
+                   vec![item_b, item_a]);
 
-        // Folder metadata: rename, collapse, and reordering a member.
-        store::file_todo(&pool, item_b, Some(folder_id), instant(wednesday, 9))
-            .await
-            .unwrap();
-        store::patch(&pool, item_b, None, Some(-5.0), instant(wednesday, 9))
-            .await
-            .unwrap();
-        let folders = store::list_folders(&pool).await.unwrap();
-        let backlog = folders.iter().find(|f| f.id == folder_id).unwrap();
-        assert_eq!(backlog.todos[0].id, item_b, "the lower sort_order sorts first");
-
+        // Folder metadata: reorder a member, rename, collapse.
+        store::file_todo(&pool, item_a, Some(folder_id), at).await.unwrap();
+        store::file_todo(&pool, item_b, Some(folder_id), at).await.unwrap();
+        store::patch(&pool, item_b, None, Some(-5.0), at).await.unwrap();
         assert!(store::update_folder(&pool, folder_id, Some("renamed"), Some(true), None)
             .await
             .unwrap());
         let folders = store::list_folders(&pool).await.unwrap();
         let backlog = folders.iter().find(|f| f.id == folder_id).unwrap();
+        assert_eq!(backlog.todos[0].id, item_b, "the lower sort_order sorts first");
         assert_eq!(backlog.name, "renamed");
         assert!(backlog.collapsed);
 
         assert!(!store::update_folder(&pool, -1, Some("x"), None, None).await.unwrap());
-        assert!(!store::file_todo(&pool, -1, Some(folder_id), instant(wednesday, 9)).await.unwrap());
+        assert!(!store::file_todo(&pool, -1, Some(folder_id), at).await.unwrap());
 
         // Deleting the folder un-files its members via ON DELETE SET NULL,
         // rather than deleting the append-only todo rows.
         assert!(store::delete_folder(&pool, folder_id).await.unwrap());
         assert!(!store::delete_folder(&pool, folder_id).await.unwrap(), "already gone");
-        let item_b_row = store::get(&pool, item_b).await.unwrap().unwrap();
-        assert!(item_b_row.folder_id.is_none());
+        let list = store::list(&pool, since(monday)).await.unwrap();
+        assert_eq!(mine(&list, &marker).len(), 2, "both back on the list");
 
         sqlx::query("DELETE FROM todo WHERE id = ANY($1)")
             .bind(vec![item_a, item_b])

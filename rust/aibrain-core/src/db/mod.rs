@@ -56,6 +56,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         include_str!("migrations/0002_search_queue.sql"),
         include_str!("migrations/0003_todo.sql"),
         include_str!("migrations/0004_todo_folders.sql"),
+        include_str!("migrations/0005_todo_due.sql"),
     ];
     // `pg_trgm` needs its own statement boundary and may fail without
     // superuser; the index that depends on it is optional, so a failure there
@@ -75,17 +76,23 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// One statement per `;` at a line end — except inside a `$$`-quoted body,
+/// where a `DO` block's own semicolons belong to it.
 fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
+    let mut quoted = false;
     for line in sql.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("--") {
+        if !quoted && trimmed.starts_with("--") {
             continue;
         }
         current.push_str(line);
         current.push('\n');
-        if line.trim_end().ends_with(';') {
+        if line.matches("$$").count() % 2 == 1 {
+            quoted = !quoted;
+        }
+        if !quoted && line.trim_end().ends_with(';') {
             if !current.trim().is_empty() {
                 out.push(current.clone());
             }
@@ -159,6 +166,15 @@ mod tests {
         for statement in &out {
             assert!(statement.trim_end().ends_with(';'));
         }
+    }
+
+    #[test]
+    fn a_do_block_is_one_statement() {
+        let out = split_statements(include_str!("migrations/0005_todo_due.sql"));
+        assert_eq!(out.len(), 3, "the whole DO block, semicolons and all, then two drops");
+        assert!(out[0].contains("RENAME COLUMN scheduled_on TO due_on"));
+        assert!(out[0].trim_end().ends_with("$$;"));
+        assert!(out[1].trim_start().starts_with("DROP INDEX"));
     }
 
     #[test]

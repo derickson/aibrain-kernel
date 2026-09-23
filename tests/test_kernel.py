@@ -1190,47 +1190,47 @@ class TodoTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())
 
-    def add(self, text, day=None, now=None):
+    def add(self, text, due=None, now=None):
         query = f"?now={now}" if now else ""
-        payload = self.call(f"/api/todos{query}",
-                            {"body": f"{text} {self.marker}",
-                             "scheduled_on": day or self.MONDAY})
-        return payload["todo"]
+        body = {"body": f"{text} {self.marker}"}
+        if due:
+            body["due_on"] = due
+        return self.call(f"/api/todos{query}", body)["todo"]
+
+    def listed(self, now):
+        return self.call(f"/api/todos?now={now}")
 
     def mine(self, payload):
         return [t for t in payload["todos"] if self.marker in t["body"]]
 
     # ---- tests -----------------------------------------------------------
-    def test_an_item_is_added_listed_completed_and_then_absent_tomorrow(self):
-        carried = self.add("water the plants")
-        finished = self.add("post the letter")
+    def test_one_list_where_a_finished_item_lingers_for_the_rest_of_its_day(self):
+        plants = self.add("water the plants", now=f"{self.MONDAY}T09:00:00")
+        letter = self.add("post the letter", now=f"{self.MONDAY}T09:00:00")
+        self.assertIsNone(plants["due_on"], "no date unless one is asked for")
 
-        day = self.call(f"/api/todos?day={self.MONDAY}&now={self.MONDAY}T09:00:00")
-        self.assertEqual(day["day"], self.MONDAY)
-        bodies = [t["body"] for t in self.mine(day)]
-        self.assertEqual(len(bodies), 2)
-        self.assertTrue(all(t["state"] == "open" for t in self.mine(day)))
+        listed = self.listed(f"{self.MONDAY}T09:00:00")
+        self.assertEqual(listed["today"], self.MONDAY)
+        self.assertNotIn("day", listed, "there is no day being viewed")
+        rows = self.mine(listed)
         # sort_order, not insertion order by accident.
-        self.assertEqual(bodies[0], carried["body"])
+        self.assertEqual([t["id"] for t in rows], [plants["id"], letter["id"]])
+        self.assertTrue(all(t["state"] == "open" for t in rows))
 
-        done = self.call(f"/api/todos/{finished['id']}/complete"
+        done = self.call(f"/api/todos/{letter['id']}/complete"
                          f"?now={self.TUESDAY}T01:00:00", {})
         self.assertEqual(done["todo"]["state"], "completed")
 
-        # One in the morning is still Monday, so it is still on Monday's list.
-        day = self.call(f"/api/todos?day={self.MONDAY}&now={self.MONDAY}T09:00:00")
-        states = {t["id"]: t["state"] for t in self.mine(day)}
-        self.assertEqual(states[finished["id"]], "completed")
-        self.assertEqual(states[carried["id"]], "open")
+        # One in the morning is still Monday, so it is still shown, struck.
+        states = {t["id"]: t["state"] for t in self.mine(self.listed(f"{self.TUESDAY}T01:30:00"))}
+        self.assertEqual(states, {plants["id"]: "open", letter["id"]: "completed"})
 
-        # Tuesday carries the open one and drops the completed one.
-        day = self.call(f"/api/todos?day={self.TUESDAY}&now={self.TUESDAY}T09:00:00")
-        rows = self.mine(day)
-        self.assertEqual([t["id"] for t in rows], [carried["id"]])
-        self.assertEqual(rows[0]["first_scheduled_on"], self.MONDAY)
-        self.assertEqual(rows[0]["scheduled_on"], self.TUESDAY)
+        # Tuesday proper: the finished one is gone, the open one is untouched.
+        rows = self.mine(self.listed(f"{self.TUESDAY}T09:00:00"))
+        self.assertEqual([t["id"] for t in rows], [plants["id"]])
+        self.assertIsNone(rows[0]["due_on"], "nothing rolled it onto a day")
 
-    def test_history_keeps_what_the_day_view_no_longer_shows(self):
+    def test_history_keeps_what_the_list_no_longer_shows(self):
         todo = self.add("buy stamps")
         self.call(f"/api/todos/{todo['id']}/complete?now={self.MONDAY}T10:00:00", {})
         found = self.call(f"/api/todos/history?q=stamps+{self.marker}")
@@ -1250,29 +1250,39 @@ class TodoTests(unittest.TestCase):
         self.assertEqual(refs[0]["rel_path"], "Protocols.md")
         self.assertIsNotNone(refs[0]["note_id"], "the note exists, so it resolves")
 
-    def test_rescheduling_and_editing_are_both_recorded(self):
-        todo = self.add("call the plumber")
-        moved = self.call(f"/api/todos/{todo['id']}/reschedule"
-                          f"?now={self.MONDAY}T09:00:00", {"to_day": "tomorrow"})
-        self.assertEqual(moved["todo"]["scheduled_on"], self.TUESDAY)
+    def test_a_due_date_is_set_moved_cleared_and_recorded(self):
+        todo = self.add("call the plumber", due="tomorrow", now=f"{self.MONDAY}T09:00:00")
+        self.assertEqual(todo["due_on"], self.TUESDAY)
 
-        edited = self.call(f"/api/todos/{todo['id']}?now={self.MONDAY}T10:00:00",
+        # 01:00 on Tuesday is still Monday, so "tomorrow" is still Tuesday.
+        moved = self.call(f"/api/todos/{todo['id']}/due?now={self.TUESDAY}T01:00:00",
+                          {"due_on": "tomorrow"})
+        self.assertEqual(moved["todo"]["due_on"], self.TUESDAY)
+        moved = self.call(f"/api/todos/{todo['id']}/due?now={self.TUESDAY}T09:00:00",
+                          {"due_on": "2031-06-01"})
+        self.assertEqual(moved["todo"]["due_on"], "2031-06-01")
+        cleared = self.call(f"/api/todos/{todo['id']}/due?now={self.TUESDAY}T09:30:00",
+                            {"due_on": None})
+        self.assertIsNone(cleared["todo"]["due_on"])
+
+        # Refused by the service; the proxy relays its reason, not a traceback.
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.call(f"/api/todos/{todo['id']}/due", {"due_on": "someday"})
+        self.assertIn("a due date must be", caught.exception.read().decode())
+
+        edited = self.call(f"/api/todos/{todo['id']}?now={self.TUESDAY}T10:00:00",
                            {"body": f"call the roofer {self.marker}"},
                            method="PATCH")
         self.assertIn("roofer", edited["todo"]["body"])
 
         found = self.call(f"/api/todos/history?q=roofer+{self.marker}")
         rows = [t for t in found["todos"] if t["id"] == todo["id"]]
-        kinds = [e["kind"] for e in rows[0]["events"]]
-        self.assertEqual(kinds, ["created", "rescheduled", "edited"])
-
-    def test_looking_at_an_earlier_day_does_not_drag_work_backwards(self):
-        todo = self.add("sweep the yard", day=self.TUESDAY)
-        # Open Monday, which is before it. Nothing should move.
-        self.call(f"/api/todos?day={self.MONDAY}&now={self.TUESDAY}T09:00:00")
-        day = self.call(f"/api/todos?day={self.TUESDAY}&now={self.TUESDAY}T09:00:00")
-        rows = [t for t in self.mine(day) if t["id"] == todo["id"]]
-        self.assertEqual(rows[0]["scheduled_on"], self.TUESDAY)
+        events = rows[0]["events"]
+        self.assertEqual([e["kind"] for e in events],
+                         ["created", "rescheduled", "rescheduled", "edited"],
+                         "setting the same date again logs nothing")
+        self.assertEqual(events[0]["to_day"], self.TUESDAY)
+        self.assertEqual((events[2]["from_day"], events[2]["to_day"]), ("2031-06-01", None))
 
     def test_an_empty_body_is_refused_and_a_missing_item_is_a_404(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -1368,7 +1378,7 @@ class McpTodoTests(unittest.TestCase):
         listed = self.rpc("tools/list")["result"]["tools"]
         names = {tool["name"] for tool in listed}
         self.assertEqual(names, {
-            "list_todos", "add_todo", "complete_todo", "reschedule_todo",
+            "list_todos", "add_todo", "complete_todo", "set_due_date",
             "link_todo_to_note", "search_history",
         })
         for tool in listed:
@@ -1377,20 +1387,26 @@ class McpTodoTests(unittest.TestCase):
 
         body = f"file the {self.marker} receipts"
         added = self.text_of(self.rpc("tools/call", {
-            "name": "add_todo", "arguments": {"body": body, "day": "2031-07-07"},
+            "name": "add_todo", "arguments": {"body": body, "due": "2031-07-07"},
         }))
         self.assertIn(self.marker, added)
+        self.assertIn("due 2031-07-07", added)
         todo_id = int(added.split("#")[1].split()[0])
 
         shown = self.text_of(self.rpc("tools/call", {
-            "name": "list_todos", "arguments": {"day": "2031-07-07"},
+            "name": "list_todos", "arguments": {},
         }))
         self.assertIn(self.marker, shown)
         self.assertIn("[ ]", shown)
 
         # And the browser's own route sees the very same row.
-        day = self.fixture.corpus.todos(day="2031-07-07")
-        self.assertIn(todo_id, [t["id"] for t in day["todos"]])
+        listed = self.fixture.corpus.todos()
+        self.assertIn(todo_id, [t["id"] for t in listed["todos"]])
+
+        cleared = self.text_of(self.rpc("tools/call", {
+            "name": "set_due_date", "arguments": {"id": todo_id, "due": ""},
+        }))
+        self.assertNotIn("due ", cleared)
 
         done = self.text_of(self.rpc("tools/call", {
             "name": "complete_todo", "arguments": {"id": todo_id},

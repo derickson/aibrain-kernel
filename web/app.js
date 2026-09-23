@@ -1477,7 +1477,7 @@ function wireStaticHandlers() {
       openDrawer('meetings');
     } catch (err) { toast(String(err.message || err), true); }
   };
-  wireShelf();              // the day's list — see the section at the bottom
+  wireShelf();              // the to-do list — see the section at the bottom
   $('#open-menu').onclick = () => openDrawer();
   $('#drawer-close').onclick = closeDrawer;
   $('#drawer-scrim').onclick = closeDrawer;
@@ -1531,18 +1531,18 @@ function openSearch() {
   setTimeout(() => $('#query').focus(), 360);
 }
 
-// ───────────────────────── the day's list (shelf) ───────────────────────
+// ───────────────────────── the to-do list (shelf) ───────────────────────
 //
 // A flex sibling ahead of the chat panel, so opening it pushes the
-// conversation right rather than covering it — the point is to see the day
+// conversation right rather than covering it — the point is to see the list
 // and the answer at once.
 //
-// Everything here is additive: its own state object, its own functions, and
-// one line in wireStaticHandlers that binds the toggle. The server owns which
-// day an item belongs to and when a rollover happens; this only asks.
+// One list, not a calendar: an item may have a due date, shown as a chip, but
+// there is no day to page to. Everything here is additive: its own state
+// object, its own functions, and one line in wireStaticHandlers that binds
+// the toggle. The server owns what "today" is; this only asks.
 
 const TODO = {
-  day: null,        // the day being shown, YYYY-MM-DD
   today: null,      // what the server calls today, by its start hour
   items: [],
   folders: [],      // the persistent backlog, always rendered last
@@ -1550,6 +1550,7 @@ const TODO = {
   picking: null,    // the id whose note picker is showing
   editingFolder: null,  // the folder id whose name is a text field right now
   addingFolder: false,  // whether the "new folder" input is showing
+  query: '',        // the in-browser filter; empty shows everything
   loading: false,
 };
 
@@ -1561,7 +1562,7 @@ let dragTodoId = null;
 function openShelf() {
   TODO.open = true;
   $('#shelf').dataset.open = 'true';
-  loadTodos(TODO.day);
+  loadTodos();
   setTimeout(() => $('#todo-draft')?.focus(), 360);
 }
 
@@ -1575,19 +1576,14 @@ function toggleShelf() {
   if (TODO.open) closeShelf(); else openShelf();
 }
 
-async function loadTodos(day) {
+async function loadTodos() {
   TODO.loading = true;
   try {
-    const query = day ? `?day=${encodeURIComponent(day)}` : '';
-    const data = await api(`/api/todos${query}`);
-    TODO.day = data.day;
+    const data = await api('/api/todos');
     TODO.today = data.today;
     TODO.items = data.todos || [];
     TODO.folders = data.folders || [];
     renderShelf();
-    if (data.rolled) {
-      toast(`${data.rolled} item${data.rolled === 1 ? '' : 's'} carried over`);
-    }
   } catch (err) {
     toast(String(err.message || err), true);
   } finally {
@@ -1602,29 +1598,78 @@ function shiftDay(iso, days) {
   return date.toISOString().slice(0, 10);
 }
 
-/// "Today", "Yesterday", or the weekday — the calendar date is underneath it.
-function dayLabel(day, today) {
-  if (!day || !today) return 'Today';
-  if (day === today) return 'Today';
-  if (day === shiftDay(today, 1)) return 'Tomorrow';
-  if (day === shiftDay(today, -1)) return 'Yesterday';
+function dayStamp(day, options = { day: 'numeric', month: 'short' }) {
   const [y, m, d] = day.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d))
-    .toLocaleDateString(undefined, { weekday: 'long', timeZone: 'UTC' });
+    .toLocaleDateString(undefined, { ...options, timeZone: 'UTC' });
 }
 
-function dayStamp(day) {
-  if (!day) return '—';
-  const [y, m, d] = day.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d))
-    .toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
-    .toUpperCase();
+/// How a due date reads next to an item, and which of three looks it gets.
+/// Measured against the server's today, not the browser's — the start hour
+/// decides when "tomorrow" arrives. ISO dates compare correctly as strings.
+function dueLabel(due, today, closed = false) {
+  if (!today || due === today) return { when: 'today', text: 'Due today' };
+  if (due < today) {
+    // Only open work can be late; a finished item's date is just history.
+    return closed ? { when: 'later', text: `Due ${dayStamp(due)}` }
+                  : { when: 'overdue', text: `Overdue · ${dayStamp(due)}` };
+  }
+  if (due === shiftDay(today, 1)) return { when: 'soon', text: 'Due tomorrow' };
+  if (due < shiftDay(today, 7)) {
+    return { when: 'soon', text: `Due ${dayStamp(due, { weekday: 'short' })}` };
+  }
+  const sameYear = due.slice(0, 4) === today.slice(0, 4);
+  return {
+    when: 'later',
+    text: `Due ${dayStamp(due, sameYear
+      ? { day: 'numeric', month: 'short' }
+      : { day: 'numeric', month: 'short', year: 'numeric' })}`,
+  };
+}
+
+/// Plain substring search over what is already loaded — the list is small
+/// and entirely in memory, so there is nothing for Postgres to add. Every
+/// word must appear, in any order, in the text or a linked note's path.
+function todoMatcher(query) {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return null;
+  return item => {
+    const hay = [item.body, ...(item.refs || []).map(r => r.rel_path)].join(' ').toLowerCase();
+    return terms.every(term => hay.includes(term));
+  };
+}
+
+function openShelfSearch() {
+  $('#shelf-search').hidden = false;
+  $('#shelf-search-toggle').setAttribute('aria-pressed', 'true');
+  $('#shelf-query').focus();
+  $('#shelf-query').select();
+}
+
+function closeShelfSearch() {
+  $('#shelf-search').hidden = true;
+  $('#shelf-search-toggle').setAttribute('aria-pressed', 'false');
+  $('#shelf-query').value = '';
+  if (TODO.query) { TODO.query = ''; renderShelf(); }
 }
 
 function renderShelf() {
-  $('#shelf-day').textContent = dayLabel(TODO.day, TODO.today);
-  $('#shelf-date').textContent = dayStamp(TODO.day);
-  $('#shelf-today').hidden = false;
+  const open = TODO.items.filter(i => i.state === 'open');
+  const overdue = open.filter(i => i.due_on && i.due_on < TODO.today).length;
+  const match = todoMatcher(TODO.query);
+  const items = match ? TODO.items.filter(match) : TODO.items;
+  // A folder stays when its name matches (all of it) or any member does
+  // (just those), and is shown open either way — a hit you cannot see is
+  // not a hit.
+  const folders = !match ? TODO.folders : TODO.folders
+    .map(folder => match({ body: folder.name })
+      ? { ...folder, collapsed: false }
+      : { ...folder, collapsed: false, todos: folder.todos.filter(match) })
+    .filter(folder => folder.todos.length);
+  const hits = items.length + (match ? folders.reduce((n, f) => n + f.todos.length, 0) : 0);
+  $('#shelf-meta').textContent = match
+    ? `${hits} MATCH${hits === 1 ? '' : 'ES'}`
+    : `${open.length} OPEN${overdue ? ` · ${overdue} OVERDUE` : ''}`;
 
   const list = $('#shelf-list');
   list.innerHTML = '';
@@ -1637,25 +1682,29 @@ function renderShelf() {
     if (dragTodoId != null) fileTodo(dragTodoId, null);
   };
 
-  if (!TODO.items.length) {
+  if (match && !hits) {
+    list.append(el('p', { class: 'shelf-empty' }, `Nothing matches “${TODO.query.trim()}”.`));
+    return;
+  }
+  if (!items.length && !match) {
     list.append(el('p', { class: 'shelf-empty' },
-      TODO.day === TODO.today
-        ? 'Nothing on today yet. Add the first thing below.'
-        : 'Nothing on this day.'));
+      'Nothing on the list. Add the first thing below.'));
   } else {
-    for (const item of TODO.items) {
+    for (const item of items) {
       list.append(todoRow(item));
       if (TODO.picking === item.id) list.append(todoPicker(item));
     }
-    const carried = TODO.items.filter(i => i.state === 'open'
-      && i.first_scheduled_on && i.first_scheduled_on !== i.scheduled_on).length;
-    if (carried) {
-      list.append(el('div', { class: 'shelf-note' },
-        `${carried} CARRIED FROM AN EARLIER DAY`));
-    }
   }
 
-  if (TODO.folders.length || TODO.addingFolder) {
+  if (match) {
+    // No "+ New folder" while filtering: it would be a verb on a view that
+    // is hiding most of what it acts on.
+    if (folders.length) {
+      const wrap = el('div', { class: 'shelf-folders' });
+      for (const folder of folders) wrap.append(folderSection(folder));
+      list.append(wrap);
+    }
+  } else if (TODO.folders.length || TODO.addingFolder) {
     const wrap = el('div', { class: 'shelf-folders' });
     for (const folder of TODO.folders) wrap.append(folderSection(folder));
     wrap.append(folderAddRow());
@@ -1698,7 +1747,7 @@ function folderSection(folder) {
     el('button', {
       class: 'act', title: 'Delete this folder',
       onclick: () => {
-        if (folder.todos.length && !confirm(`Delete “${folder.name}”? Its ${folder.todos.length} task${folder.todos.length === 1 ? '' : 's'} will land back on today's list.`)) return;
+        if (folder.todos.length && !confirm(`Delete “${folder.name}”? Its ${folder.todos.length} task${folder.todos.length === 1 ? '' : 's'} will go back on the list.`)) return;
         deleteFolder(folder.id);
       },
     }, '×'),
@@ -1781,9 +1830,9 @@ function todoRow(item, folder) {
   const col = el('div', { class: 'col' },
     el('div', { class: 'body' }, item.body));
 
-  const carried = item.first_scheduled_on && item.first_scheduled_on !== item.scheduled_on;
-  if (carried && !done && !gone) {
-    col.append(el('div', { class: 'mt' }, `carried since ${dayStamp(item.first_scheduled_on)}`));
+  if (item.due_on) {
+    const due = dueLabel(item.due_on, TODO.today, done || gone);
+    col.append(el('div', { class: 'due', 'data-when': due.when }, due.text));
   }
   if (item.refs?.length) {
     const refs = el('div', { class: 'refs' });
@@ -1805,12 +1854,9 @@ function todoRow(item, folder) {
           class: 'act', title: 'Take out of the folder',
           onclick: () => fileTodo(item.id, null),
         }, '⇤')
-      : el('button', {
-          class: 'act', title: 'Move to tomorrow',
-          onclick: () => todoAction(item.id, 'reschedule', { to_day: 'tomorrow' }),
-        }, '»'),
+      : null,
     el('button', {
-      class: 'act', title: 'Pick a day, or link a note',
+      class: 'act', title: 'Set a due date, or link a note',
       onclick: () => { TODO.picking = TODO.picking === item.id ? null : item.id; renderShelf(); },
     }, '⊞'),
     el('button', {
@@ -1855,7 +1901,7 @@ function todoRow(item, folder) {
   return row;
 }
 
-/// Pick a day, or attach a note. The note search is the app's own search, so
+/// Set or clear a due date, or attach a note. The note search is the app's own search, so
 /// what you can cite is what you can link.
 function todoPicker(item) {
   const hits = el('div', { class: 'hits' });
@@ -1881,12 +1927,17 @@ function todoPicker(item) {
   }, 180);
   field.addEventListener('input', () => search(field.value));
 
-  const date = el('input', { type: 'date', value: item.scheduled_on || '' });
-  date.addEventListener('change', () => {
-    if (date.value) todoAction(item.id, 'reschedule', { to_day: date.value });
-  });
+  const setDue = due_on => todoAction(item.id, 'due', { due_on });
+  const date = el('input', { type: 'date', value: item.due_on || '', title: 'Due date' });
+  date.addEventListener('change', () => { if (date.value) setDue(date.value); });
+  const dueRow = el('div', { class: 'due-row' }, date,
+    el('button', { title: 'Due today', onclick: () => setDue('today') }, 'TODAY'),
+    el('button', { title: 'Due tomorrow', onclick: () => setDue('tomorrow') }, 'TMRW'),
+    item.due_on
+      ? el('button', { title: 'No due date', onclick: () => setDue(null) }, 'CLEAR')
+      : null);
 
-  const picker = el('div', { class: 'todo-picker' }, date, field, hits);
+  const picker = el('div', { class: 'todo-picker' }, dueRow, field, hits);
   setTimeout(() => field.focus(), 0);
   return picker;
 }
@@ -1903,14 +1954,14 @@ async function todoAction(id, action, body) {
   try {
     await api(`/api/todos/${id}/${action}`, { method: 'POST', body: body || {} });
     TODO.picking = null;
-    await loadTodos(TODO.day);
+    await loadTodos();
   } catch (err) {
     toast(String(err.message || err), true);
   }
 }
 
 /// File a task into a folder, or (`folderId: null`) take it back out onto
-/// the day's list — the service handles both through the same endpoint.
+/// the list — the service handles both through the same endpoint.
 async function fileTodo(id, folderId) {
   await todoAction(id, 'file', { folder_id: folderId });
 }
@@ -1929,7 +1980,7 @@ async function reorderInFolder(id, folder, beforeId) {
       await api(`/api/todos/${id}/file`, { method: 'POST', body: { folder_id: folder.id } });
     }
     await api(`/api/todos/${id}`, { method: 'PATCH', body: { sort_order: order } });
-    await loadTodos(TODO.day);
+    await loadTodos();
   } catch (err) {
     toast(String(err.message || err), true);
   }
@@ -1938,7 +1989,7 @@ async function reorderInFolder(id, folder, beforeId) {
 async function createFolder(name) {
   try {
     await api('/api/todos/folders', { method: 'POST', body: { name } });
-    await loadTodos(TODO.day);
+    await loadTodos();
   } catch (err) {
     toast(String(err.message || err), true);
   }
@@ -1951,7 +2002,7 @@ async function renameFolder(id, name) {
 async function patchFolder(id, patch) {
   try {
     await api(`/api/todos/folders/${id}`, { method: 'PATCH', body: patch });
-    await loadTodos(TODO.day);
+    await loadTodos();
   } catch (err) {
     toast(String(err.message || err), true);
   }
@@ -1960,7 +2011,7 @@ async function patchFolder(id, patch) {
 async function deleteFolder(id) {
   try {
     await api(`/api/todos/folders/${id}/delete`, { method: 'POST', body: {} });
-    await loadTodos(TODO.day);
+    await loadTodos();
   } catch (err) {
     toast(String(err.message || err), true);
   }
@@ -1973,12 +2024,8 @@ async function addTodo() {
   draft.value = '';
   draft.style.height = 'auto';
   try {
-    await api('/api/todos', {
-      method: 'POST',
-      // Whichever day is on screen, not whichever day it is.
-      body: { body: text, scheduled_on: TODO.day },
-    });
-    await loadTodos(TODO.day);
+    await api('/api/todos', { method: 'POST', body: { body: text } });
+    await loadTodos();
   } catch (err) {
     draft.value = text;
     toast(String(err.message || err), true);
@@ -1988,9 +2035,17 @@ async function addTodo() {
 function wireShelf() {
   $('#open-todo').onclick = toggleShelf;
   $('#shelf-close').onclick = closeShelf;
-  $('#shelf-prev').onclick = () => loadTodos(shiftDay(TODO.day || todayIso(), -1));
-  $('#shelf-next').onclick = () => loadTodos(shiftDay(TODO.day || todayIso(), 1));
-  $('#shelf-today').onclick = () => loadTodos(null);
+  $('#shelf-search-toggle').onclick = () =>
+    $('#shelf-search').hidden ? openShelfSearch() : closeShelfSearch();
+  const query = $('#shelf-query');
+  query.addEventListener('input', () => { TODO.query = query.value; renderShelf(); });
+  query.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    // Kept from reaching the window handler, which would close the shelf.
+    event.stopPropagation();
+    if (query.value) { query.value = ''; TODO.query = ''; renderShelf(); }
+    else closeShelfSearch();
+  });
   $('#todo-send').onclick = addTodo;
 
   const draft = $('#todo-draft');
@@ -2004,14 +2059,6 @@ function wireShelf() {
       addTodo();
     }
   });
-}
-
-/// Only a fallback for the very first navigation, before the server has told
-/// us what it considers today — its start hour is the authority, not ours.
-function todayIso() {
-  const now = new Date();
-  return new Date(now.getTime() - now.getTimezoneOffset() * 60000)
-    .toISOString().slice(0, 10);
 }
 
 boot().catch(err => {

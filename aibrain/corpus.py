@@ -253,23 +253,23 @@ class Corpus:
         return self._request("/reindex", body={"force": bool(force)},
                              timeout=REINDEX_TIMEOUT) or {}
 
-    # ---- the day's list --------------------------------------------------
-    # Thin on purpose. Which day an item belongs to, when a rollover happens
-    # and what gets logged are all decisions the service owns; Python only
-    # carries the question there and the answer back.
+    # ---- the to-do list -------------------------------------------------
+    # Thin on purpose. What "today" and "tomorrow" mean for a due date, how
+    # long a finished item lingers and what gets logged are all decisions the
+    # service owns; Python only carries the question there and the answer back.
     #
     # `now` is honoured by the service only when it was started with
     # AIBRAIN_TODO_TEST_CLOCK=1. Passing it otherwise is harmless.
 
-    def todos(self, day: str | None = None, now: str | None = None) -> dict:
-        return self._request("/todos", params={"day": day, "now": now}) or {}
+    def todos(self, now: str | None = None) -> dict:
+        return self._request("/todos", params={"now": now}) or {}
 
-    def add_todo(self, body: str, scheduled_on: str | None = None,
+    def add_todo(self, body: str, due_on: str | None = None,
                  refs: list[dict] | None = None,
                  now: str | None = None) -> dict:
         payload: dict[str, Any] = {"body": body, "refs": refs or []}
-        if scheduled_on:
-            payload["scheduled_on"] = scheduled_on
+        if due_on:
+            payload["due_on"] = due_on
         return self._request("/todos", body=payload, params={"now": now}) or {}
 
     def complete_todo(self, todo_id: int, now: str | None = None) -> dict:
@@ -281,9 +281,10 @@ class Corpus:
     def cancel_todo(self, todo_id: int, now: str | None = None) -> dict:
         return self._todo_post(todo_id, "cancel", now=now)
 
-    def reschedule_todo(self, todo_id: int, to_day: str,
-                        now: str | None = None) -> dict:
-        return self._todo_post(todo_id, "reschedule", {"to_day": to_day}, now)
+    def set_due_todo(self, todo_id: int, due_on: str | None,
+                     now: str | None = None) -> dict:
+        """`YYYY-MM-DD`, `today`, `tomorrow`, or None/"" to clear the date."""
+        return self._todo_post(todo_id, "due", {"due_on": due_on or None}, now)
 
     def link_todo(self, todo_id: int, brain_id: str, rel_path: str,
                   now: str | None = None) -> dict:
@@ -311,8 +312,7 @@ class Corpus:
         return self._todo_post(todo_id, "file", {"folder_id": folder_id}, now)
 
     # ---- to-do folders -----------------------------------------------------
-    # A persistent backlog beside the day's list — see the service's own
-    # doc-comments in db/todo.rs for why folders are exempt from rollover.
+    # Groups below the list; a filed item shows under its folder instead.
 
     def create_folder(self, name: str) -> dict:
         return self._request("/todos/folders", body={"name": name}) or {}

@@ -1,5 +1,8 @@
 //! Every statement the to-do list runs.
 //!
+//! There is one list, not one per day. A date on an item is an optional due
+//! date — something to show beside it — never where it lives.
+//!
 //! Separate from `queries.rs` because the corpus and the list have opposite
 //! natures: the corpus is derived from markdown and can be thrown away, the
 //! list is a source of truth and is therefore append-only. Nothing here ever
@@ -37,8 +40,8 @@ pub struct Todo {
     pub id: i64,
     pub body: String,
     pub created_at: f64,
-    pub first_scheduled_on: String,
-    pub scheduled_on: String,
+    /// `YYYY-MM-DD`, or absent for the many things that have no deadline.
+    pub due_on: Option<String>,
     pub completed_at: Option<f64>,
     pub cancelled_at: Option<f64>,
     pub sort_order: f64,
@@ -48,8 +51,8 @@ pub struct Todo {
     pub refs: Vec<TodoRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<TodoEvent>,
-    /// Set once an item has been filed into a folder — see todo_folder.rs
-    /// doc-comment on the migration for what that exempts it from.
+    /// Set once an item has been filed into a folder, which takes it off the
+    /// list itself and shows it under that folder instead.
     pub folder_id: Option<i64>,
 }
 
@@ -62,7 +65,7 @@ pub struct TodoFolder {
     pub todos: Vec<Todo>,
 }
 
-const COLUMNS: &str = "id, body, created_at, first_scheduled_on, scheduled_on, \
+const COLUMNS: &str = "id, body, created_at, due_on, \
                        completed_at, cancelled_at, sort_order, folder_id";
 
 fn epoch(at: DateTime<Utc>) -> f64 {
@@ -76,8 +79,7 @@ fn row_to_todo(row: &sqlx::postgres::PgRow) -> Todo {
         id: row.get("id"),
         body: row.get("body"),
         created_at: epoch(row.get::<DateTime<Utc>, _>("created_at")),
-        first_scheduled_on: row.get::<NaiveDate, _>("first_scheduled_on").to_string(),
-        scheduled_on: row.get::<NaiveDate, _>("scheduled_on").to_string(),
+        due_on: row.get::<Option<NaiveDate>, _>("due_on").map(|d| d.to_string()),
         completed_at: completed.map(epoch),
         cancelled_at: cancelled.map(epoch),
         sort_order: row.get("sort_order"),
@@ -115,60 +117,21 @@ pub async fn log_event(
     Ok(())
 }
 
-/// Move everything still open from before `day` onto `day`, logging each move.
-///
-/// Returns how many moved. Done on read rather than on a timer because a
-/// missed midnight — laptop asleep, app not running — must not lose a day.
-pub async fn roll_over(pool: &PgPool, day: NaiveDate, at: DateTime<Utc>) -> Result<usize> {
-    let mut tx = pool.begin().await?;
-    // FOR UPDATE, because two browser tabs opening the same day at once would
-    // otherwise each log a move for the same item.
-    let stale = sqlx::query(
-        "SELECT id, scheduled_on FROM todo
-          WHERE scheduled_on < $1 AND completed_at IS NULL AND cancelled_at IS NULL
-            AND folder_id IS NULL
-          ORDER BY id
-            FOR UPDATE",
-    )
-    .bind(day)
-    .fetch_all(&mut *tx)
-    .await?;
-
-    for row in &stale {
-        let id: i64 = row.get("id");
-        let from: NaiveDate = row.get("scheduled_on");
-        sqlx::query("UPDATE todo SET scheduled_on = $1 WHERE id = $2")
-            .bind(day)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        log_event(&mut tx, id, at, "rolled", Some(from), Some(day)).await?;
-    }
-    tx.commit().await?;
-    Ok(stale.len())
-}
-
-/// The list for one day: what is open on it, plus what was finished or
-/// abandoned during it. The finished ones are matched on an instant range
-/// because "during it" depends on the start hour, which SQL does not know.
-pub async fn for_day(
-    pool: &PgPool,
-    day: NaiveDate,
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
-) -> Result<Vec<Todo>> {
+/// The list: everything open and not filed into a folder, plus whatever was
+/// finished or abandoned since `closed_since` — so an item ticked off a
+/// moment ago stays on screen, struck through, instead of vanishing under the
+/// pointer. Older closed items are the history's business.
+pub async fn list(pool: &PgPool, closed_since: DateTime<Utc>) -> Result<Vec<Todo>> {
     let rows = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM todo
           WHERE folder_id IS NULL AND (
-                (completed_at IS NULL AND cancelled_at IS NULL AND scheduled_on = $1)
-             OR (completed_at >= $2 AND completed_at < $3)
-             OR (cancelled_at >= $2 AND cancelled_at < $3)
+                (completed_at IS NULL AND cancelled_at IS NULL)
+             OR completed_at >= $1
+             OR cancelled_at >= $1
           )
           ORDER BY sort_order, id"
     ))
-    .bind(day)
-    .bind(from)
-    .bind(until)
+    .bind(closed_since)
     .fetch_all(pool)
     .await?;
     let mut todos: Vec<Todo> = rows.iter().map(row_to_todo).collect();
@@ -283,29 +246,29 @@ async fn attach_events(pool: &PgPool, todos: &mut [Todo]) -> Result<()> {
     Ok(())
 }
 
-/// Add an item to a day, at the end of it.
+/// Add an item to the end of the list, due on `due` if it has a deadline.
 pub async fn create(
     pool: &PgPool,
     body: &str,
-    day: NaiveDate,
+    due: Option<NaiveDate>,
     at: DateTime<Utc>,
     refs: &[(String, String)],
 ) -> Result<i64> {
     let mut tx = pool.begin().await?;
     let id: i64 = sqlx::query(
-        "INSERT INTO todo (body, created_at, first_scheduled_on, scheduled_on, sort_order)
-         VALUES ($1, $2, $3, $3,
-                 COALESCE((SELECT MAX(sort_order) FROM todo WHERE scheduled_on = $3), 0) + 1)
+        "INSERT INTO todo (body, created_at, due_on, sort_order)
+         VALUES ($1, $2, $3, (SELECT COALESCE(MAX(sort_order), 0) + 1
+                                FROM todo WHERE folder_id IS NULL))
          RETURNING id",
     )
     .bind(body)
     .bind(at)
-    .bind(day)
+    .bind(due)
     .fetch_one(&mut *tx)
     .await?
     .get("id");
 
-    log_event(&mut tx, id, at, "created", None, Some(day)).await?;
+    log_event(&mut tx, id, at, "created", None, due).await?;
     for (brain_id, rel_path) in refs {
         insert_ref(&mut tx, id, brain_id, rel_path).await?;
         log_event(&mut tx, id, at, "linked", None, None).await?;
@@ -385,29 +348,33 @@ pub async fn set_state(
     Ok(true)
 }
 
-/// Move an item to another day. Uncompletes nothing: a finished item that is
-/// rescheduled is a mistake being corrected, and the event says so.
-pub async fn reschedule(
+/// Set, move or (`None`) clear an item's due date. Logged as `rescheduled`
+/// with the old and new dates, either of which may be empty. Uncompletes
+/// nothing: a date on a finished item is a correction, and the event says so.
+pub async fn set_due(
     pool: &PgPool,
     id: i64,
-    to_day: NaiveDate,
+    due: Option<NaiveDate>,
     at: DateTime<Utc>,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let Some(row) = sqlx::query("SELECT scheduled_on FROM todo WHERE id = $1 FOR UPDATE")
+    let Some(row) = sqlx::query("SELECT due_on FROM todo WHERE id = $1 FOR UPDATE")
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
     else {
         return Ok(false);
     };
-    let from: NaiveDate = row.get("scheduled_on");
-    sqlx::query("UPDATE todo SET scheduled_on = $1 WHERE id = $2")
-        .bind(to_day)
+    let from: Option<NaiveDate> = row.get("due_on");
+    if from == due {
+        return Ok(true);
+    }
+    sqlx::query("UPDATE todo SET due_on = $1 WHERE id = $2")
+        .bind(due)
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    log_event(&mut tx, id, at, "rescheduled", Some(from), Some(to_day)).await?;
+    log_event(&mut tx, id, at, "rescheduled", from, due).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -445,7 +412,7 @@ pub async fn patch(
 }
 
 // ---------------------------------------------------------------------------
-// folders — a persistent backlog, exempt from for_day and roll_over above
+// folders — groups kept below the list; a filed item is not on the list itself
 // ---------------------------------------------------------------------------
 
 /// Every folder, each with its member todos attached, ordered the way the
@@ -524,9 +491,8 @@ pub async fn update_folder(
     Ok(changed > 0)
 }
 
-/// Un-files every member (ON DELETE SET NULL) and drops the folder. A member
-/// with a stale scheduled_on reappears on today's list via the next
-/// roll_over — nothing here needs to touch todo rows itself.
+/// Un-files every member (ON DELETE SET NULL) and drops the folder, so its
+/// items land back on the list — nothing here needs to touch todo rows.
 pub async fn delete_folder(pool: &PgPool, id: i64) -> Result<bool> {
     let changed = sqlx::query("DELETE FROM todo_folder WHERE id = $1")
         .bind(id)
@@ -536,9 +502,9 @@ pub async fn delete_folder(pool: &PgPool, id: i64) -> Result<bool> {
     Ok(changed > 0)
 }
 
-/// File an item into a folder, or (`folder_id: None`) take it back out.
-/// Unfiling deliberately leaves `scheduled_on` alone — see the migration's
-/// doc-comment for why that is enough to put it back in the daily rotation.
+/// File an item into a folder, or (`folder_id: None`) take it back out onto
+/// the end of the list. Either way its sort_order is re-based, because the
+/// number only means something among its new neighbours.
 pub async fn file_todo(
     pool: &PgPool,
     id: i64,
@@ -546,33 +512,22 @@ pub async fn file_todo(
     at: DateTime<Utc>,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let sort_order: f64 = match folder_id {
-        Some(fid) => {
-            sqlx::query(
-                "SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM todo WHERE folder_id = $1",
-            )
-            .bind(fid)
-            .fetch_one(&mut *tx)
-            .await?
-            .get("n")
-        }
-        None => 0.0,
-    };
-    let changed = if folder_id.is_some() {
-        sqlx::query("UPDATE todo SET folder_id = $2, sort_order = $3 WHERE id = $1")
-            .bind(id)
-            .bind(folder_id)
-            .bind(sort_order)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-    } else {
-        sqlx::query("UPDATE todo SET folder_id = NULL WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-    };
+    // IS NOT DISTINCT FROM, so a NULL folder_id means "the list itself".
+    let sort_order: f64 = sqlx::query(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM todo
+          WHERE folder_id IS NOT DISTINCT FROM $1",
+    )
+    .bind(folder_id)
+    .fetch_one(&mut *tx)
+    .await?
+    .get("n");
+    let changed = sqlx::query("UPDATE todo SET folder_id = $2, sort_order = $3 WHERE id = $1")
+        .bind(id)
+        .bind(folder_id)
+        .bind(sort_order)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     if changed == 0 {
         return Ok(false);
     }

@@ -1,4 +1,4 @@
-"""An MCP server over the day's list, so a coding agent can read and edit it.
+"""An MCP server over the to-do list, so a coding agent can read and edit it.
 
 Run it as `python3 -m aibrain.mcp_todo`. It speaks JSON-RPC 2.0 over stdio,
 one message per line, which is what the MCP stdio transport is: no framing
@@ -47,26 +47,20 @@ TOOLS: list[dict] = [
     {
         "name": "list_todos",
         "description": (
-            "The to-do list for one day. Open items scheduled on it, plus "
-            "anything completed or cancelled during it. Omit the day for "
-            "today. Opening a day also rolls anything still open from before "
-            "it onto it."
+            "The to-do list: every open item, in order, with its due date if it "
+            "has one, plus anything finished or cancelled today. There is one "
+            "list, not one per day."
         ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "day": _string("day", "YYYY-MM-DD. Defaults to today."),
-            },
-        },
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "add_todo",
-        "description": "Add an item to a day's list. Defaults to today.",
+        "description": "Add an item to the end of the list, optionally with a due date.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "body": _string("body", "What needs doing."),
-                "day": _string("day", "YYYY-MM-DD. Defaults to today."),
+                "due": _string("due", "YYYY-MM-DD, 'today' or 'tomorrow'. Omit for no due date."),
             },
             "required": ["body"],
         },
@@ -74,8 +68,8 @@ TOOLS: list[dict] = [
     {
         "name": "complete_todo",
         "description": (
-            "Mark an item done. It stays visible on the day it was completed, "
-            "struck through, and is absent the next day."
+            "Mark an item done. It stays on the list, struck through, for the "
+            "rest of the day, then only the history has it."
         ),
         "inputSchema": {
             "type": "object",
@@ -84,15 +78,15 @@ TOOLS: list[dict] = [
         },
     },
     {
-        "name": "reschedule_todo",
-        "description": "Move an item to another day.",
+        "name": "set_due_date",
+        "description": "Give an item a due date, change it, or clear it.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "integer", "description": "The to-do id."},
-                "to_day": _string("to_day", "YYYY-MM-DD, or 'today' / 'tomorrow'."),
+                "due": _string("due", "YYYY-MM-DD, 'today' or 'tomorrow'. Empty clears it."),
             },
-            "required": ["id", "to_day"],
+            "required": ["id"],
         },
     },
     {
@@ -115,7 +109,7 @@ TOOLS: list[dict] = [
         "name": "search_history",
         "description": (
             "Search every to-do ever written, done or not, with the history "
-            "of how each one moved between days."
+            "of every change to it, due-date moves included."
         ),
         "inputSchema": {
             "type": "object",
@@ -142,23 +136,20 @@ class TodoTools:
 
     # ---- the six ---------------------------------------------------------
     def _list_todos(self, args: dict) -> str:
-        payload = self.corpus.todos(day=args.get("day") or None)
-        day = payload.get("day", "")
+        payload = self.corpus.todos()
+        today = payload.get("today", "")
         rows = payload.get("todos", [])
         if not rows:
-            return f"{day}: nothing on the list."
-        lines = [f"{day} — {len(rows)} item(s):"]
-        lines += [self._line(row) for row in rows]
-        rolled = payload.get("rolled") or 0
-        if rolled:
-            lines.append(f"({rolled} carried over from an earlier day)")
+            return "Nothing on the list."
+        lines = [f"{len(rows)} item(s) (today is {today}):"]
+        lines += [self._line(row, today) for row in rows]
         return "\n".join(lines)
 
     def _add_todo(self, args: dict) -> str:
         body = str(args.get("body", "")).strip()[:4000]
         if not body:
             return "Nothing to add: body was empty."
-        row = self.corpus.add_todo(body, scheduled_on=args.get("day") or None)
+        row = self.corpus.add_todo(body, due_on=args.get("due") or None)
         return "Added " + self._line(row.get("todo", {}))
 
     def _complete_todo(self, args: dict) -> str:
@@ -167,11 +158,11 @@ class TodoTools:
             return f"There is no to-do {args['id']}."
         return "Done: " + self._line(row.get("todo", {}))
 
-    def _reschedule_todo(self, args: dict) -> str:
-        row = self.corpus.reschedule_todo(int(args["id"]), str(args["to_day"]))
+    def _set_due_date(self, args: dict) -> str:
+        row = self.corpus.set_due_todo(int(args["id"]), str(args.get("due") or "") or None)
         if not row:
             return f"There is no to-do {args['id']}."
-        return "Moved: " + self._line(row.get("todo", {}))
+        return "Updated: " + self._line(row.get("todo", {}))
 
     def _link_todo_to_note(self, args: dict) -> str:
         row = self.corpus.link_todo(int(args["id"]), str(args["brain_id"]),
@@ -194,23 +185,24 @@ class TodoTools:
             lines.append(self._line(row))
             for event in row.get("events", []):
                 span = ""
-                if event.get("from_day") and event.get("to_day"):
-                    span = f" {event['from_day']} → {event['to_day']}"
+                if event.get("from_day") or event.get("to_day"):
+                    span = f" {event.get('from_day') or '—'} → {event.get('to_day') or '—'}"
                 lines.append(f"    · {event.get('kind', '?')}{span}")
         return "\n".join(lines)
 
     # ---- formatting ------------------------------------------------------
     @staticmethod
-    def _line(row: dict) -> str:
+    def _line(row: dict, today: str = "") -> str:
         if not row:
             return "(nothing)"
-        mark = {"completed": "[x]", "cancelled": "[-]"}.get(row.get("state", ""), "[ ]")
+        state = row.get("state", "")
+        mark = {"completed": "[x]", "cancelled": "[-]"}.get(state, "[ ]")
         bits = [f"#{row.get('id')}", mark, str(row.get("body", ""))]
-        scheduled = row.get("scheduled_on", "")
-        first = row.get("first_scheduled_on", "")
-        if scheduled:
-            bits.append(f"({scheduled}")
-            bits[-1] += f", carried since {first})" if first and first != scheduled else ")"
+        due = row.get("due_on")
+        if due:
+            # ISO dates compare as strings, so no parsing needed to flag it.
+            late = state == "open" and today and due < today
+            bits.append(f"(due {due}{', OVERDUE' if late else ''})")
         for ref in row.get("refs", []):
             bits.append(f"→ {ref.get('brain_id')}/{ref.get('rel_path')}")
         return " ".join(bits)

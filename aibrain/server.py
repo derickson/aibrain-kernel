@@ -686,12 +686,11 @@ def build_router(state: State) -> Router:
         rows = state.corpus.recent(limit=h.int_query("limit", 24, 1, 200))
         h.json({"results": [state.decorate(row) for row in rows]})
 
-    # ---- the day's list --------------------------------------------------
-    # Pure proxies. The rollover, the day boundary and the history all belong
-    # to the service; adding a second opinion here is how the two would drift.
+    # ---- the to-do list -------------------------------------------------
+    # Pure proxies. The day boundary, due-date shorthands and the history all
+    # belong to the service; a second opinion here is how the two would drift.
     def todos(h: Handler) -> None:
-        q = h.query()
-        h.json(state.corpus.todos(day=q.get("day"), now=q.get("now")))
+        h.json(state.corpus.todos(now=h.query().get("now")))
 
     def todo_add(h: Handler) -> None:
         payload = h.body()
@@ -701,7 +700,7 @@ def build_router(state: State) -> Router:
             return
         h.json(state.corpus.add_todo(
             body,
-            scheduled_on=payload.get("scheduled_on"),
+            due_on=payload.get("due_on"),
             refs=payload.get("refs") or [],
             now=h.query().get("now"),
         ))
@@ -711,9 +710,10 @@ def build_router(state: State) -> Router:
             now = h.query().get("now")
             payload = h.body()
             todo_id = _int_id(tid, "to-do id")
-            if action == "reschedule":
-                result = state.corpus.reschedule_todo(
-                    todo_id, str(payload.get("to_day", "tomorrow"))[:32], now=now)
+            if action == "due":
+                due_on = payload.get("due_on")
+                result = state.corpus.set_due_todo(
+                    todo_id, str(due_on)[:32] if due_on else None, now=now)
             elif action == "link":
                 result = state.corpus.link_todo(
                     todo_id, str(payload.get("brain_id", ""))[:200],
@@ -1201,7 +1201,7 @@ def build_router(state: State) -> Router:
     router.post("/api/todos", todo_add)
     router.get("/api/todos/history", todo_history)
     router.patch("/api/todos/<tid>", todo_patch)
-    for _action in ("complete", "uncomplete", "cancel", "reschedule", "link", "file"):
+    for _action in ("complete", "uncomplete", "cancel", "due", "link", "file"):
         router.post(f"/api/todos/<tid>/{_action}", todo_action(_action))
     router.post("/api/todos/folders", folder_add)
     router.patch("/api/todos/folders/<fid>", folder_patch)

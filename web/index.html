@@ -12,24 +12,27 @@
 
 <div class="app">
 
-  <!-- ───────────────────── far left: the day's list ───────────────────── -->
-  <aside class="panel panel-shelf" id="shelf" data-open="false" aria-label="The day's list">
+  <!-- ───────────────────── far left: the to-do list ───────────────────── -->
+  <aside class="panel panel-shelf" id="shelf" data-open="false" aria-label="To-do list">
     <div class="panel-inner">
       <header class="shelf-head">
-        <button class="icon-btn" id="shelf-prev" title="The day before">‹</button>
-        <button class="shelf-title" id="shelf-today" title="Back to today">
-          <div class="name" id="shelf-day">Today</div>
-          <div class="meta mono" id="shelf-date">—</div>
-        </button>
-        <button class="icon-btn" id="shelf-next" title="The day after">›</button>
+        <div class="shelf-title">
+          <div class="name">To-do</div>
+          <div class="meta mono" id="shelf-meta">—</div>
+        </div>
+        <button class="icon-btn" id="shelf-search-toggle" title="Search the list">⌕</button>
         <button class="icon-btn" id="shelf-close" title="Close">×</button>
       </header>
+      <div class="shelf-search" id="shelf-search" hidden>
+        <input type="search" id="shelf-query" placeholder="Search tasks and folders…"
+               autocomplete="off" spellcheck="false">
+      </div>
 
       <div class="shelf-list" id="shelf-list"></div>
 
       <footer class="shelf-add">
         <div class="composer-box">
-          <textarea id="todo-draft" rows="1" placeholder="Add to this day…"></textarea>
+          <textarea id="todo-draft" rows="1" placeholder="Add a task…"></textarea>
           <button class="send" id="todo-send" title="Add">↑</button>
         </div>
         <div class="composer-hint mono" id="shelf-hint">ENTER TO ADD</div>
@@ -37,7 +40,7 @@
     </div>
   </aside>
 
-  <button class="shelf-tab" id="open-todo" title="The day's list" aria-label="The day's list">☑</button>
+  <button class="shelf-tab" id="open-todo" title="To-do list" aria-label="To-do list">☑</button>
 
   <!-- ─────────────────────────── left: agent chat ─────────────────────── -->
   <aside class="panel panel-left" id="left" data-open="false">

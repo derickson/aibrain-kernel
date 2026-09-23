@@ -142,10 +142,10 @@ class ViewOptions:
 
 @dataclass
 class TodoOptions:
-    """Settings for the day's list. Python writes them; Rust reads them.
+    """Settings for the to-do list. Python writes them; Rust reads them.
 
-    04:00 rather than midnight so that finishing something at one in the
-    morning lands on the day you were working, not on an empty new one.
+    04:00 rather than midnight so that at one in the morning "today" and
+    "tomorrow" still mean the day you were working and the one after it.
     """
 
     day_start_hour: int = 4

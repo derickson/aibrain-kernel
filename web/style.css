@@ -646,21 +646,28 @@ button { cursor: pointer; background: none; border: none; }
 }
 .muted { color: var(--fg-mute); font: 400 12px/1.6 Manrope, system-ui, sans-serif; }
 
-/* ─────────────────────── the day's list (shelf) ──────────────────────── */
+/* ─────────────────────── the to-do list (shelf) ──────────────────────── */
 
 .shelf-head {
   display: flex; align-items: center; gap: 6px;
   padding: 14px 14px 14px 12px; border-bottom: 1px solid var(--line); flex: none;
 }
-.shelf-title {
-  flex: 1; min-width: 0; text-align: left; padding: 2px 6px; border-radius: 8px;
-  transition: background .15s;
-}
-.shelf-title:hover { background: rgba(127, 216, 232, .07); }
+.shelf-title { flex: 1; min-width: 0; padding: 2px 6px; }
 .shelf-title .name {
   font-size: 15px; font-weight: 700; letter-spacing: -.01em; color: var(--fg);
 }
 .shelf-title .meta { font-size: 10px; color: var(--fg-mono); margin-top: 2px; }
+
+.shelf-search { padding: 10px 14px; border-bottom: 1px solid var(--line); flex: none; }
+.shelf-search input {
+  width: 100%; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid rgba(127, 216, 232, .16); background: rgba(4, 6, 11, .6);
+  font: 400 13px Manrope, system-ui, sans-serif; outline: none;
+}
+.shelf-search input:focus { border-color: var(--line-strong); }
+#shelf-search-toggle[aria-pressed="true"] {
+  color: #fff; border-color: var(--line-strong); background: rgba(127, 216, 232, .1);
+}
 
 .shelf-list {
   flex: 1; min-height: 0; overflow-y: auto;
@@ -705,10 +712,29 @@ button { cursor: pointer; background: none; border: none; }
 .todo[data-state="completed"] .body,
 .todo[data-state="cancelled"] .body { text-decoration: line-through; color: var(--fg-mute); }
 
-.todo .mt {
-  font: 500 9px 'JetBrains Mono', monospace; letter-spacing: .12em;
-  color: var(--fg-faint); text-transform: uppercase; margin-top: 4px;
+/* A due date is a chip beside the text, not a page the item lives on. */
+.todo .due {
+  display: inline-block; margin-top: 5px; padding: 1px 7px; border-radius: 999px;
+  font: 500 9px 'JetBrains Mono', monospace; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--fg-mono); border: 1px solid rgba(127, 216, 232, .16);
 }
+.todo .due[data-when="today"] { color: var(--accent); border-color: rgba(127, 216, 232, .4); }
+.todo .due[data-when="overdue"] {
+  color: #ff9b8f; border-color: rgba(255, 122, 89, .35); background: rgba(255, 122, 89, .08);
+}
+.todo[data-state="completed"] .due,
+.todo[data-state="cancelled"] .due { color: var(--fg-mute); border-color: var(--line); background: none; }
+
+.todo-picker .due-row { display: flex; gap: 4px; }
+.todo-picker .due-row input { flex: 1; min-width: 0; }
+.todo-picker .due-row button {
+  flex: none; padding: 0 8px; border-radius: 7px;
+  font: 500 10px 'JetBrains Mono', monospace; letter-spacing: .06em;
+  color: var(--fg-mono); border: 1px solid rgba(127, 216, 232, .16);
+  transition: color .15s, background .15s;
+}
+.todo-picker .due-row button:hover { color: #fff; background: rgba(127, 216, 232, .1); }
+
 .todo .refs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .todo .ref {
   font: 500 10px 'JetBrains Mono', monospace; letter-spacing: 0;
@@ -756,7 +782,7 @@ button { cursor: pointer; background: none; border: none; }
 
 .shelf-add { padding: 12px 14px 14px; border-top: 1px solid var(--line); flex: none; }
 
-/* Folders: a persistent backlog, always last, exempt from rollover. */
+/* Folders: groups kept below the list; a filed item shows only here. */
 .shelf-folders {
   margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 4px;

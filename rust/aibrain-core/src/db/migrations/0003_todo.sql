@@ -16,15 +16,13 @@ CREATE TABLE IF NOT EXISTS todo (
     sort_order         DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
--- The day list reads by scheduled_on; the same day's completions read by
--- completed_at, as an instant range rather than a date, because which day an
--- instant belongs to depends on the configured start hour.
-CREATE INDEX IF NOT EXISTS todo_scheduled_idx ON todo (scheduled_on);
+-- Recent completions read by completed_at, as an instant range rather than a
+-- date, because which day an instant belongs to depends on the configured
+-- start hour. (The scheduled_on indexes that stood here went with the day
+-- view — see 0005; this file re-runs on every start, so nothing in it may
+-- name a column 0005 renames.)
 CREATE INDEX IF NOT EXISTS todo_completed_idx ON todo (completed_at);
 CREATE INDEX IF NOT EXISTS todo_cancelled_idx ON todo (cancelled_at);
--- Rollover asks one question on every day view: what is still open and stale.
-CREATE INDEX IF NOT EXISTS todo_open_idx ON todo (scheduled_on)
-    WHERE completed_at IS NULL AND cancelled_at IS NULL;
 
 -- History is searched, not scrolled. Spelled with the explicit regconfig for
 -- the same reason note.tsv is: the one-argument form is not immutable.

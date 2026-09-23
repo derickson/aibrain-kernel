@@ -143,7 +143,7 @@ below). Real environment variables always win over `.env`.
 | `AIBRAIN_BIND` | `127.0.0.1:8781` | Rust | Address `aibrain-core serve` listens on. |
 | `AIBRAIN_LOG` | `aibrain_core=info,sqlx=warn` | Rust | `tracing_subscriber` env filter. |
 | `AIBRAIN_CORE_URL` | `http://127.0.0.1:8781` | Python (`aibrain/corpus.py`) and the MCP server | Where the Rust service is, for anything that talks to it over HTTP. |
-| `AIBRAIN_TODO_TEST_CLOCK` | unset | Rust | `1` lets every `/todos` route take a `?now=` override instead of the wall clock, so tests can roll the day forward. Never set this in normal use. |
+| `AIBRAIN_TODO_TEST_CLOCK` | unset | Rust | `1` lets every `/todos` route take a `?now=` override instead of the wall clock, so tests can say what day it is. Never set this in normal use. |
 | `ELASTICSEARCH_URL` | unset | Rust | Elasticsearch endpoint. Unset means search stays on Postgres. |
 | `ELASTICSEARCH_API_KEY` | unset | Rust | Sent as `Authorization: ApiKey ...`. |
 | `AIBRAIN_ES_INFERENCE_ID` | `.jina-embeddings-v5-omni-small` | Rust | The EIS inference endpoint used for the `semantic_text` field. |
@@ -221,22 +221,25 @@ status` reports how many rows are pending or failing.
 ## The to-do shelf
 
 Postgres-backed (`todo`, `todo_ref`, `todo_event` — see
-`rust/aibrain-core/src/db/migrations/0003_todo.sql`), never materialised into
-Obsidian. A day does not start at midnight: `todo.day_start_hour` in
-`config.json` defaults to 04:00, so something finished at 01:00 still counts
-as the evening before. Rollover is lazy — opening a day migrates anything
-still open from before it onto it, logging the move, so a laptop asleep at
-midnight never loses a day. A completed item stays visible, struck through,
-on the day it was completed, and is simply absent the next day; nothing is
-deleted, `todo_event` keeps the full history. The routes live in
-`rust/aibrain-core/src/todo.rs` and are covered in the API table below.
+`rust/aibrain-core/src/db/migrations/0003_todo.sql` and `0005_todo_due.sql`),
+never materialised into Obsidian. It is one list, not a calendar: there is no
+day to page to and nothing rolls over. An item may carry an optional due date,
+shown beside it as a chip (due today, tomorrow, a weekday, or overdue); most
+items have none. Folders sit below the list, and a filed item shows under its
+folder instead. A completed item stays on the list, struck through, until the
+day it was completed is over, then only the history has it; nothing is
+deleted, and `todo_event` keeps every change. A day does not start at
+midnight: `todo.day_start_hour` in `config.json` defaults to 04:00, so at
+01:00 "today" and "tomorrow" still mean the day you were working and the one
+after. The routes live in `rust/aibrain-core/src/todo.rs` and are covered in
+the API table below.
 
 ### MCP server
 
 `python3 -m aibrain.mcp_todo` is a stdio JSON-RPC 2.0 server (standard
 library only) exposing six tools: `list_todos`, `add_todo`, `complete_todo`,
-`reschedule_todo`, `link_todo_to_note`, `search_history`. It talks to the
-day's list the same way the browser does, over HTTP through
+`set_due_date`, `link_todo_to_note`, `search_history`. It talks to the
+to-do list the same way the browser does, over HTTP through
 `aibrain/corpus.py` and never straight to Postgres, so there is exactly one
 owner of the schema. It reads `AIBRAIN_CORE_URL` for where the service is.
 
@@ -272,7 +275,7 @@ aibrain-kernel/
 │   ├── src/layout.rs          the galaxy layout
 │   ├── src/graph.rs           layout → the universe payload, graph_cache, ETags
 │   ├── src/events.rs          the /events change feed
-│   ├── src/todo.rs            the day's list
+│   ├── src/todo.rs            the to-do list
 │   ├── src/es/                Elasticsearch client, queue worker, search
 │   └── src/db/                sqlx queries and migrations
 ├── web/                       the UI (no framework, no build step)
@@ -387,14 +390,14 @@ cargo run --manifest-path rust/Cargo.toml -- status          # what the database
 | GET | `/notes/recent` | `?limit=` — most recently touched notes. |
 | POST | `/reindex` | `{force}` — rescan every linked vault. |
 | POST | `/search/resync` | Queue every note for Elasticsearch (backfill). |
-| GET | `/todos` | `?day=&now=` — one day's list; opening it also rolls stale items onto it. |
-| POST | `/todos` | `{body, scheduled_on?, refs?}` — add an item. |
+| GET | `/todos` | `?now=` — the list: open items plus anything closed today, the folders, and the service's `today`. |
+| POST | `/todos` | `{body, due_on?, refs?}` — add an item to the end of the list. |
 | GET | `/todos/history` | `?q=&limit=` — every to-do ever written, with its event history. |
 | PATCH | `/todos/:id` | `{body?, sort_order?}` — edit an item in place. |
-| POST | `/todos/:id/complete` | Mark done; stays visible, struck through, the day it was completed. |
+| POST | `/todos/:id/complete` | Mark done; stays visible, struck through, for the rest of the day. |
 | POST | `/todos/:id/uncomplete` | Undo a completion (an event, not an erasure). |
 | POST | `/todos/:id/cancel` | Mark cancelled. |
-| POST | `/todos/:id/reschedule` | `{to_day}` — `YYYY-MM-DD`, `today`, or `tomorrow`. |
+| POST | `/todos/:id/due` | `{due_on}` — `YYYY-MM-DD`, `today`, `tomorrow`, or null to clear. |
 | POST | `/todos/:id/link` | `{brain_id, rel_path}` — attach a note, kept by path so a rename can be repaired. |
 
 ### Python (`aibrain`, default `127.0.0.1:8760`)
@@ -414,7 +417,7 @@ Thin proxies over the Rust routes above, plus what only Python knows about
 | GET/POST | `/api/todos` | Proxy to Rust's `/todos`. |
 | GET | `/api/todos/history` | Proxy to Rust's `/todos/history`. |
 | PATCH | `/api/todos/<tid>` | Proxy to Rust's `PATCH /todos/:id`. |
-| POST | `/api/todos/<tid>/{complete,uncomplete,cancel,reschedule,link}` | Proxies to the matching Rust route. |
+| POST | `/api/todos/<tid>/{complete,uncomplete,cancel,due,link,file}` | Proxies to the matching Rust route. |
 | GET | `/api/stream/chat` | `?agent=&q=` — SSE: ask an agent a question. |
 | GET | `/api/chat/<agent_id>/history` | This session's chat history with one agent. |
 | POST | `/api/chat/<agent_id>/clear` | Clear it. |
