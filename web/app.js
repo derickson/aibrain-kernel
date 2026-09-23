@@ -853,6 +853,28 @@ async function renderDrawer() {
      view: renderViewPanel }[S.drawerTab])();
 }
 
+/** One line about the search index, only when there is something to say:
+ *  the cluster is unreachable, a removed vault's index is still waiting to be
+ *  deleted, or documents were refused for good. */
+function searchHealthLine() {
+  const search = S.status?.search;
+  if (!search || search.engine !== 'elasticsearch') return null;
+  const parts = [];
+  if (search.health && !search.health.available) {
+    parts.push('Search index unreachable — changes are queued and will be sent when it is back.');
+  }
+  const pending = search.retirements || [];
+  if (pending.length) {
+    const failing = pending.find(r => r.last_error);
+    parts.push(`Deleting the search index of ${pending.length} removed vault${pending.length > 1 ? 's' : ''}`
+      + (failing ? ` (last attempt failed: ${failing.last_error})` : '') + '.');
+  }
+  if (search.dead_letter) {
+    parts.push(`${search.dead_letter} note${search.dead_letter > 1 ? 's were' : ' was'} refused by the search index.`);
+  }
+  return parts.length ? el('div', { class: 'note-line' }, parts.join(' ')) : null;
+}
+
 function renderBrainsPanel() {
   const panel = $('#panel-brains');
   panel.innerHTML = '';
@@ -866,6 +888,7 @@ function renderBrainsPanel() {
       S.status?.indexedAt
         ? `Last built ${timeAgo(Number(S.status.indexedAt))}. Rescanning only re-reads files whose timestamp changed.`
         : 'Not built yet.'),
+    searchHealthLine(),
     el('div', { class: 'card-actions' },
       el('button', { class: 'btn primary', onclick: () => runReindex(false) }, 'Rescan vaults'),
       el('button', { class: 'btn ghost', onclick: () => runReindex(true) }, 'Rebuild from scratch'))
@@ -909,9 +932,13 @@ function renderBrainsPanel() {
         el('button', {
           class: 'btn danger',
           onclick: async () => {
-            if (!confirm(`Remove ${brain.name} from the app? The vault itself is not touched.`)) return;
-            await api(`/api/brain/${brain.id}/remove`, { method: 'POST' });
-            toast(`${brain.name} removed`);
+            if (!confirm(`Remove ${brain.name} from the app? Its notes leave the universe and its search index is deleted. The vault itself is not touched.`)) return;
+            try {
+              const res = await api(`/api/brain/${brain.id}/remove`, { method: 'POST' });
+              toast(res.retired || !res.needsReindex
+                ? `${brain.name} removed`
+                : `${brain.name} unlinked — it will be cleared on the next rescan`);
+            } catch (err) { toast(String(err.message || err), true); }
             renderDrawer();
           },
         }, 'Remove')),

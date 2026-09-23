@@ -11,9 +11,11 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use std::time::Duration;
 
+pub mod lifecycle;
 pub mod queries;
 pub mod todo;
 
+pub use lifecycle::*;
 pub use queries::*;
 
 /// Connect, with retries, then bring the schema up to date.
@@ -56,6 +58,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         include_str!("migrations/0002_search_queue.sql"),
         include_str!("migrations/0003_todo.sql"),
         include_str!("migrations/0004_todo_folders.sql"),
+        include_str!("migrations/0006_index_lifecycle.sql"),
     ];
     // `pg_trgm` needs its own statement boundary and may fail without
     // superuser; the index that depends on it is optional, so a failure there

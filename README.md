@@ -147,7 +147,7 @@ below). Real environment variables always win over `.env`.
 | `ELASTICSEARCH_URL` | unset | Rust | Elasticsearch endpoint. Unset means search stays on Postgres. |
 | `ELASTICSEARCH_API_KEY` | unset | Rust | Sent as `Authorization: ApiKey ...`. |
 | `AIBRAIN_ES_INFERENCE_ID` | `.jina-embeddings-v5-omni-small` | Rust | The EIS inference endpoint used for the `semantic_text` field. |
-| `AIBRAIN_ES_INDEX_PREFIX` | `aibrain-` | Rust | Prefix for the per-brain index names (`aibrain-<vault>`). |
+| `AIBRAIN_ES_INDEX_PREFIX` | `aibrain-` | Rust | Prefix for the per-brain index names (`aibrain-<uid>`) and aliases (`aibrain-_w-<uid>`, `aibrain-_search`). |
 | `AIBRAIN_ES_BATCH` | `50` | Rust | Documents per bulk request when draining the search queue. |
 | `AIBRAIN_ES_POLL_MS` | `2000` | Rust | How often the idle worker checks the queue for new rows. |
 
@@ -188,9 +188,13 @@ If it is set, a background worker (`rust/aibrain-core/src/es/worker.rs`)
 claims batches of `AIBRAIN_ES_BATCH` rows, sends one `_bulk` request per
 batch (the embedding model runs inside the write, so one round trip per
 batch beats one per note), and marks them done or retries them with the
-error recorded. Each per-brain index (`aibrain-<vault-name>`, sanitized to
-`[a-z0-9._-]`) gets a `semantic_text` field on the configured inference
-endpoint plus plain lexical fields (`title`, `headings`, `tags`, `source`,
+error recorded. Each brain gets its own index, `aibrain-<uid>`, named by an
+id the brain row is given once and never reuses (brains that predate this
+keep their old `aibrain-<vault-name>` index, adopted in place). Writes go
+through a per-brain alias with `require_alias=true`, so a write can never
+recreate a dropped index; searches across every brain go through the
+`aibrain-_search` alias. Each index gets a `semantic_text` field on the
+configured inference endpoint plus plain lexical fields (`title`, `headings`, `tags`, `source`,
 `excerpt`, `body`). `/search` queries both with a `retriever.linear`
 (`minmax`-normalised lexical `multi_match` leg weighted 1.0, semantic leg
 weighted 1.5) and resolves every hit back to its current Postgres row before
@@ -199,10 +203,21 @@ Elasticsearch errors, or a non-empty query comes back with zero hits (the
 semantic leg matches every indexed note, so empty usually means the note is
 not indexed yet), `/search` falls back to Postgres for that request.
 
-At startup, `aibrain-core serve` reconciles: for each brain, it compares the
-note count in Postgres against the document count in that brain's
-Elasticsearch index, and if they differ (and nothing is already queued for
-that brain) it queues the whole brain.
+Removing a vault (the Remove button, or a rescan that no longer finds its
+link) retires the brain in one Postgres transaction: its notes and every
+queued write for it go at once, and its index is recorded in
+`index_retirement`. The worker detaches the aliases and deletes the index —
+now, or whenever Elasticsearch is next reachable. While the cluster is down
+the worker pauses as a whole rather than charging the outage to individual
+documents; a document refused ten times moves to `search_dead_letter`.
+
+The worker also reconciles at startup, every fifteen minutes, and after an
+outage: a brain whose document count differs from Postgres is requeued, a
+missing index is reprovisioned, and an index stamped as ours (`_meta.aibrain`)
+with no brain behind it is retired. An index under the prefix without that
+stamp is reported and never touched. `GET /search/status` (and the `search`
+block of `/api/status`) shows all of this. The design is in
+`design_concepts/RECOMMENDATION_ELASTICSEARCH.md`.
 
 ### Backfilling
 
@@ -460,9 +475,11 @@ at the end naming every stage that passed, failed or was skipped (and why):
 4. **Rust integration tests (Elasticsearch)** — `cargo test es::integration`,
    which additionally needs `ELASTICSEARCH_URL` and `ELASTICSEARCH_API_KEY`.
    The script reads them from the environment, or from a repo-root `.env` if
-   the environment does not already have them. It indexes under an
-   `aibrain-test-<pid>-` prefix and deletes those indices itself when it
-   finishes, so a real `aibrain-*` index is never touched. Skipped with a
+   the environment does not already have them. Each test indexes under its
+   own `aibrain-test-<pid>-<tag>-` prefix and deletes those indices itself
+   when it finishes, so a real `aibrain-*` index is never touched. These
+   tests run one at a time and clear the brain table of the test database
+   first, because the worker acts on every brain it finds there. Skipped with a
    reason when no credentials are found.
 
 The script exits non-zero if any stage that ran failed. It never rewrites

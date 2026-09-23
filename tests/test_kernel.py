@@ -805,6 +805,48 @@ class CitationTests(unittest.TestCase):
         self.assertTrue(self.agent.retrieve("describe the protocols for me"))
 
 
+class BrainRetirementTests(unittest.TestCase):
+    """Removing a vault retires its brain in aibrain-core at once.
+
+    See design_concepts/RECOMMENDATION_ELASTICSEARCH.md. Elasticsearch is off
+    in these tests; the index side is covered by the Rust suite.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus({"Doomed": {"Gone.md": "# Gone\n\nSoon.\n"}})
+        cls.addClassCleanup(cls.fixture.stop)
+        cls.doomed = cls.fixture.extra_ids["Doomed"]
+
+    def brain_ids(self):
+        return {b["id"] for b in self.fixture.corpus.status().get("brains", [])}
+
+    def test_a_linked_vault_cannot_be_retired_then_an_unlinked_one_is(self):
+        corpus = self.fixture.corpus
+        self.assertIn(self.doomed, self.brain_ids())
+
+        # Still on disk and in the config: refused, because the next rescan
+        # would only put it back after re-embedding every note.
+        with self.assertRaises(CorpusError) as caught:
+            corpus.retire_brain(self.doomed)
+        self.assertIn("409", str(caught.exception))
+        self.assertIn(self.doomed, self.brain_ids())
+
+        # What remove_brain does first: the link goes, the config forgets it.
+        shutil.rmtree(Path(self.fixture.cfg.brain(self.doomed).path))
+        self.fixture.cfg.brains = [b for b in self.fixture.cfg.brains
+                                   if b.id != self.doomed]
+        self.fixture.cfg.save()
+
+        result = corpus.retire_brain(self.doomed)
+        self.assertTrue(result["retired"])
+        self.assertIsNone(result["index"], "no cluster, so no index to drop")
+        self.assertNotIn(self.doomed, self.brain_ids())
+        self.assertIn(self.fixture.brain_id, self.brain_ids(), "the other vault is untouched")
+        # Idempotent.
+        self.assertFalse(corpus.retire_brain(self.doomed)["retired"])
+
+
 class StartupTests(unittest.TestCase):
     """No Rust service means no app, and the message has to say how to fix it."""
 

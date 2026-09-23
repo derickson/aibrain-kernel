@@ -42,27 +42,29 @@ pub fn spawn(ctx: Arc<Ctx>) {
         .expect("spawn watcher thread");
 }
 
-fn run(ctx: Arc<Ctx>, runtime: tokio::runtime::Handle) -> anyhow::Result<()> {
-    let cfg = ctx.config()?;
-    if cfg.brains.is_empty() {
-        tracing::info!("nothing linked in obsidian_vaults/ — not watching");
-        return Ok(());
-    }
+/// How often the set of watched vaults is compared with the config, so a
+/// vault linked or unlinked while we run is picked up without a restart.
+const RESYNC: Duration = Duration::from_secs(5);
 
+fn run(ctx: Arc<Ctx>, runtime: tokio::runtime::Handle) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(DEBOUNCE, None, tx)?;
-
-    for brain in &cfg.brains {
-        let root = Path::new(&brain.root);
-        // The vault is reached through a symlink, so watch what it points at —
-        // FSEvents reports the real path, and matching against the link would
-        // never line up.
-        let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        debouncer.watcher().watch(&real, RecursiveMode::Recursive)?;
-        tracing::info!("watching {} ({})", brain.name, real.display());
+    // Real directory -> brain name, for what is being watched right now.
+    let mut watched: BTreeMap<PathBuf, String> = BTreeMap::new();
+    sync_watches(&ctx, debouncer.watcher(), &mut watched);
+    if watched.is_empty() {
+        tracing::info!("nothing linked in obsidian_vaults/ yet — watching for vaults to appear");
     }
 
-    for result in rx {
+    loop {
+        let result = match rx.recv_timeout(RESYNC) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                sync_watches(&ctx, debouncer.watcher(), &mut watched);
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let events = match result {
             Ok(events) => events,
             Err(errors) => {
@@ -103,6 +105,56 @@ fn run(ctx: Arc<Ctx>, runtime: tokio::runtime::Handle) -> anyhow::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Watch every linked vault and stop watching any that was unlinked.
+///
+/// Watching is by real path, because the vault is reached through a symlink
+/// and FSEvents reports the real path — matching against the link would never
+/// line up. A vault whose link is gone no longer canonicalises, so it drops
+/// out here, and its events stop arriving rather than being filtered later.
+fn sync_watches(
+    ctx: &Ctx,
+    watcher: &mut impl Watcher,
+    watched: &mut BTreeMap<PathBuf, String>,
+) {
+    let cfg = match ctx.config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!("config unreadable, keeping the current watches: {err:#}");
+            return;
+        }
+    };
+    let wanted: BTreeMap<PathBuf, String> = cfg
+        .brains
+        .iter()
+        .filter_map(|b| {
+            let real = std::fs::canonicalize(&b.root).ok()?;
+            real.is_dir().then(|| (real, b.name.clone()))
+        })
+        .collect();
+
+    let gone: Vec<PathBuf> = watched.keys().filter(|p| !wanted.contains_key(*p)).cloned().collect();
+    for path in gone {
+        if let Err(err) = watcher.unwatch(&path) {
+            tracing::debug!("unwatch {}: {err}", path.display());
+        }
+        if let Some(name) = watched.remove(&path) {
+            tracing::info!("stopped watching {name} ({})", path.display());
+        }
+    }
+    for (path, name) in wanted {
+        if watched.contains_key(&path) {
+            continue;
+        }
+        match watcher.watch(&path, RecursiveMode::Recursive) {
+            Ok(()) => {
+                tracing::info!("watching {name} ({})", path.display());
+                watched.insert(path, name);
+            }
+            Err(err) => tracing::warn!("could not watch {name} ({}): {err}", path.display()),
+        }
+    }
 }
 
 /// Re-read one debounced burst of files and tell anyone listening.
