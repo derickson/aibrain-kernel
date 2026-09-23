@@ -407,6 +407,12 @@ class ServerTests(unittest.TestCase):
         cites = next(e for e in events if e["type"] == "cites")["cites"]
         self.assertTrue(cites)
         self.assertIn("nid", cites[0])
+        # The answer is markdown, rendered server-side, and every hit in it is
+        # a link the browser can open — the same note its citation pill opens.
+        html = next(e for e in events if e["type"] == "cites")["html"]
+        for cite in cites:
+            self.assertIn(f'data-note="{cite["nid"]}"', html)
+        self.assertNotIn("wiki-missing", html)
 
     def test_unknown_agent_reports_an_error_rather_than_hanging(self):
         events = self.sse("/api/stream/chat?agent=nope&q=hi")
@@ -798,6 +804,21 @@ class CitationTests(unittest.TestCase):
         cites = agent.cites_from_text("As in [[Ramen]].", [])
         self.assertEqual(len(cites), 1, "one pill, not one per copy")
         self.assertEqual(cites[0].ambiguous_with, 1)
+
+    def test_each_local_hit_links_to_its_own_copy_of_a_shared_title(self):
+        # Ramen lives in both vaults; a title-keyed link would send both
+        # entries to whichever copy won.
+        agent = LocalAgent(
+            AgentConfig(id="a", name="A", kind="local",
+                        brains=[self.brain_id, self.other_id]),
+            self.corpus, {self.brain_id: "Test", self.other_id: "Other"})
+        events = list(agent.ask("ramen", []))
+        done = next(e for e in events if e.type == "cites")
+        ramen = [c.note_id for c in done.cites if c.title == "Ramen"]
+        self.assertEqual(len(ramen), 2, "fixture has Ramen in both vaults")
+        html = done.data["html"]
+        for nid in ramen:
+            self.assertIn(f'data-note="{nid}"', html)
 
     def test_a_question_still_retrieves_when_a_word_is_absent(self):
         # "describe" appears in no note. Rust widens once server-side when the
