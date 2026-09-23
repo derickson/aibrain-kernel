@@ -798,6 +798,7 @@ def build_router(state: State) -> Router:
         def events() -> Iterator[dict]:
             answer: list[str] = []
             cites: list[dict] = []
+            html = ""
             yield {"type": "open", "agent": agent_id}
             try:
                 for event in agent.ask(question, history[:-1]):
@@ -806,12 +807,14 @@ def build_router(state: State) -> Router:
                         answer.append(event.text)
                     if event.type == "cites":
                         cites = payload.get("cites", [])
+                        html = payload.get("html", "")
                     yield payload
             except Exception as exc:
                 traceback.print_exc()
                 yield {"type": "error", "text": f"{type(exc).__name__}: {exc}"}
                 yield {"type": "done"}
-            history.append({"role": "agent", "text": "".join(answer), "cites": cites})
+            history.append({"role": "agent", "text": "".join(answer), "cites": cites,
+                            "html": html})
 
         h.sse(events())
 

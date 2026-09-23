@@ -558,7 +558,8 @@ class ACPAgent(Agent):
 
         yield Event("cites", cites=cites,
                     data={"context": [c.to_dict() for c in
-                                      self.context_citations(hits, cites)]})
+                                      self.context_citations(hits, cites)],
+                          "html": self.render_html(text, cites)})
         yield Event("done")
 
     def _read_note_ids(self, opened: dict[str, tuple[str, str]]) -> dict[int, tuple[str, str]]:

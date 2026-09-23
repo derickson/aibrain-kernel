@@ -8,6 +8,7 @@ graft
 
 # per-machine Claude Code overrides (bakes in this checkout's absolute vault paths)
 .claude/settings.local.json
+acp-claude/.claude/settings.local.json
 
 # rust build output
 rust/target/

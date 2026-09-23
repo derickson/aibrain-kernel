@@ -52,6 +52,12 @@ local fallback to degrade to.
 - **Docker or Podman**, for Postgres. `docker compose` (or `docker-compose`)
   must be on `PATH`.
 - **Python 3**, standard library only — no virtualenv, no pip installs.
+- **Node/npm**, only if you want the Claude Code agent: install the ACP
+  adapter it talks over (see [Agents](#agents)):
+
+  ```sh
+  npm install -g @agentclientprotocol/claude-agent-acp
+  ```
 
 ```sh
 git clone <this repo>

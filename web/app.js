@@ -460,12 +460,11 @@ function noteRow(item, onClick) {
       el('div', { class: 'sn', html: safeSnippet(item.snippet) })
     );
   }
-  // Hovering a result lights its star up in the universe.
+  // Hovering a result lights its star, its links, and their titles up in the
+  // universe — the same treatment a real pointer hover over the node gets.
   if (item.gid != null && item.gid >= 0) {
-    row.addEventListener('mouseenter', () => S.universe?.highlight([item.gid]));
-    row.addEventListener('mouseleave', () => {
-      S.universe?.highlight(S.results.map(r => r.gid).filter(g => g != null));
-    });
+    row.addEventListener('mouseenter', () => S.universe?.hoverNode(item.gid));
+    row.addEventListener('mouseleave', () => S.universe?.hoverNode(-1));
   }
   return row;
 }
@@ -599,7 +598,20 @@ function renderMessage(message, agent) {
     wrap.append(el('div', { class: 'bubble thought' }, message.thought));
   }
 
-  if (message.text || message.role === 'user' || message.streaming) {
+  if (message.html && !message.streaming) {
+    // Rendered server-side through the same sanitizing markdown pipeline
+    // notes use, so `[[Title]]` came back as `a.wiki[data-note]` — the same
+    // markup a note's own body uses, styled by `.note` and driven the same
+    // way a citation pill is: open the note, fly the camera to it.
+    const bubble = el('div', { class: 'bubble rendered note', html: message.html });
+    bubble.addEventListener('click', event => {
+      const link = event.target.closest('a.wiki[data-note]');
+      if (!link) return;
+      event.preventDefault();
+      goToCitedNote(Number(link.dataset.note));
+    });
+    wrap.append(bubble);
+  } else if (message.text || message.role === 'user' || message.streaming) {
     const bubble = el('div', { class: 'bubble' }, message.text || '');
     if (message.streaming) {
       bubble.append(el('span', {
@@ -647,6 +659,15 @@ const EVIDENCE = {
   context: { mark: '○', label: 'supplied to the agent; it never referred to this' },
 };
 
+// Open a cited note and fly the universe camera to it — what a citation pill
+// does, and, for a rendered chat answer, what clicking its inline `[[Title]]`
+// link does too. One place, so the two can never drift apart.
+function goToCitedNote(nid) {
+  openNote(nid, 'chat');
+  const gid = S.universe?.gidForNote(nid);
+  if (gid != null && gid >= 0) S.universe.flyTo(gid);
+}
+
 function citePills(cites) {
   const box = el('div', { class: 'cites' });
   for (const cite of cites) {
@@ -657,11 +678,7 @@ function citePills(cites) {
     box.append(el('button', {
       class: `cite ev-${cite.evidence || 'named'}`,
       title: why,
-      onclick: () => {
-        openNote(cite.nid, 'chat');
-        const gid = S.universe?.gidForNote(cite.nid);
-        if (gid != null && gid >= 0) S.universe.flyTo(gid);
-      },
+      onclick: () => goToCitedNote(cite.nid),
     },
       el('span', { class: 'pip', style: `background:${cite.color};box-shadow:0 0 6px ${cite.color}` }),
       el('span', { class: 'nm' }, cite.name),
@@ -747,6 +764,7 @@ function send(text) {
       case 'cites':
         reply.cites = event.cites || [];
         reply.context = event.context || [];
+        reply.html = event.html || '';
         // Only real citations pulse in the universe. Lighting up the supplied
         // context too would re-create the impression we are trying to remove.
         if (reply.cites.length) {

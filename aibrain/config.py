@@ -507,7 +507,14 @@ def default_agents() -> list[AgentConfig]:
                 "Draft a note linking my open projects",
             ],
             command=["claude-agent-acp"],
-            cwd=str(REPO_ROOT),
+            # A dedicated cwd, not REPO_ROOT: the SDK resolves project
+            # settings/skills/CLAUDE.md from this session's cwd
+            # (@agentclientprotocol/claude-agent-acp watches
+            # <cwd>/.claude/settings*.json directly), so pointing it at
+            # acp-claude/ keeps the kernel dev config — hooks, permissions,
+            # skills meant for editing this repo — out of the vault-Q&A agent,
+            # and vice versa.
+            cwd=str(REPO_ROOT / "acp-claude"),
             enabled=_on_path("claude-agent-acp"),
         ),
         AgentConfig(
@@ -526,7 +533,12 @@ def default_agents() -> list[AgentConfig]:
                 "What are the oldest notes in my vault about?",
             ],
             command=["codex-acp"],
-            cwd=str(REPO_ROOT),
+            # A dedicated cwd, not REPO_ROOT: codex-acp spawns the real `codex
+            # app-server` binary, which resolves AGENTS.md, .agents/skills/,
+            # and project .codex/config.toml layers from this session's cwd —
+            # same separation as the Claude Code agent, above, just via
+            # Codex's own conventions instead of Claude Code's.
+            cwd=str(REPO_ROOT / "acp-codex"),
             enabled=_on_path("codex-acp"),
         ),
         AgentConfig(

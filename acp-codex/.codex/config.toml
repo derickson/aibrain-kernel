@@ -1,0 +1,23 @@
+# Project config for the Codex agent embedded in the aibrain UI (see
+# ../AGENTS.md). Codex's default sandbox denies outbound network entirely —
+# confirmed directly with `codex sandbox macos --log-denials`, which reported
+# `network-outbound remote:*:8760` for a plain `curl 127.0.0.1:8760` — so the
+# vault-search skill's call to the aibrain server was silently unreachable
+# and the agent fell back to reading vault files directly instead of
+# searching them. This is Codex's project-level escape hatch for that —
+# there's no narrower "loopback only" knob, so it reopens all outbound
+# network for this session, same as `--sandbox danger-full-access` would for
+# network specifically while keeping the filesystem sandbox in place.
+[sandbox_workspace_write]
+network_access = true
+
+# Pinned explicitly rather than left to inherit ~/.codex/config.toml's
+# defaults (currently the same values) — so this agent's model/effort can't
+# silently change out from under it if the global Codex default ever does.
+# Same intent as the Claude Code agent's "model": "sonnet" in
+# ../../acp-claude/.claude/settings.json — except that one really is just the
+# global ~/.claude/settings.json default (there's no per-project override
+# there yet either); this makes the Codex side's choice load-bearing on
+# purpose instead.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"

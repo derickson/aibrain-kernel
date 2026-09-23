@@ -257,6 +257,16 @@ class Agent:
                           "we supplied this passage; the agent never referred to it")
                 for hit in supplied if hit.note_id not in used]
 
+    def render_html(self, text: str, cited: list[Citation]) -> str:
+        """The answer as sanitized HTML, `[[Title]]` turned into the same
+        clickable link a citation pill is — same note id, because `cited` is
+        exactly what `cites_from_text` already resolved for the pills. Not
+        every `[[Title]]` the agent wrote necessarily survived into `cited`
+        (an unmatched title becomes a "not in the index" span instead, same
+        as a note's own unresolved wikilinks)."""
+        resolved = {normalize(c.title): c.note_id for c in cited}
+        return self.corpus.render(text, resolved)
+
     # ---- interface -------------------------------------------------------
     def ask(self, question: str, history: list[dict]) -> Iterator[Event]:
         raise NotImplementedError

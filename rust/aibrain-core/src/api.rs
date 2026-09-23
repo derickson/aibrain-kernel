@@ -141,6 +141,7 @@ pub fn router(ctx: Shared) -> Router {
         .route("/notes/recent", get(recent))
         .route("/reindex", post(reindex))
         .route("/search/resync", post(resync_search))
+        .route("/render", post(render_markdown))
         // The day's list keeps its own module; merged before the state so it
         // shares this one Ctx.
         .merge(crate::todo::routes())
@@ -325,6 +326,36 @@ async fn resync_search(State(ctx): State<Shared>) -> ApiResult<Json<serde_json::
         "enqueued": enqueued,
         "engine": if ctx.es.is_some() { "elasticsearch" } else { "postgres" },
     })))
+}
+
+#[derive(Deserialize)]
+struct RenderBody {
+    text: String,
+    /// Note titles this caller already resolved (chat citations, a wikilink
+    /// an agent wrote), keyed by `vault::normalize(title)` — the same fold
+    /// `to_html_with` looks targets up with. We render exactly this set
+    /// rather than re-resolving from the DB, so a `[[Title]]` in a chat
+    /// answer links to the same note id its citation pill points at, even
+    /// when the title is ambiguous and the caller's own tie-break differs
+    /// from a plain title lookup here.
+    #[serde(default)]
+    resolved: std::collections::HashMap<String, i64>,
+}
+
+/// Render arbitrary markdown (a chat answer, not a note on disk) through the
+/// same sanitizing pipeline notes use, so an agent's response gets the same
+/// safe HTML and the same clickable `[[Title]]` links as everything else.
+async fn render_markdown(Json(body): Json<RenderBody>) -> ApiResult<Json<serde_json::Value>> {
+    const MAX_LEN: usize = 200_000;
+    // `.get()` refuses a byte offset that lands mid-character rather than
+    // panicking the way slicing would; step back until it accepts one.
+    let mut cut = MAX_LEN.min(body.text.len());
+    while cut > 0 && body.text.get(..cut).is_none() {
+        cut -= 1;
+    }
+    let text = body.text.get(..cut).unwrap_or(&body.text);
+    let html = crate::vault::render::to_html_with(text, &body.resolved);
+    Ok(Json(json!({ "html": html })))
 }
 
 async fn note(

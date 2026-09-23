@@ -193,6 +193,22 @@ class Corpus:
         finally:
             response.close()
 
+    def render(self, text: str, resolved: dict[str, int] | None = None) -> str:
+        """Markdown to sanitized HTML, through the same pipeline notes use.
+
+        `resolved` maps a normalized title (`agents.base.normalize`) to the
+        note id a `[[Title]]` naming it should link to — callers pass in
+        whatever they already resolved (a citation set) rather than letting
+        this re-resolve titles on its own, so an inline link always points at
+        the same note its citation pill does.
+        """
+        if not text.strip():
+            return ""
+        result = self._request("/render", body={
+            "text": text, "resolved": resolved or {},
+        }) or {}
+        return result.get("html", "")
+
     def search_page(self, query: str, limit: int = 60,
                     brain_ids: list[str] | None = None,
                     any_terms: bool = False) -> dict:

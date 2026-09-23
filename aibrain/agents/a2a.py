@@ -277,7 +277,8 @@ class A2AAgent(Agent):
         cites = self.cites_from_text(text, hits)
         yield Event("cites", cites=cites,
                     data={"context": [c.to_dict() for c in
-                                      self.context_citations(hits, cites)]})
+                                      self.context_citations(hits, cites)],
+                          "html": self.render_html(text, cites)})
         yield Event("done")
 
     def probe(self) -> dict:
