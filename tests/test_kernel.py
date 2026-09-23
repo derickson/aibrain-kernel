@@ -1468,6 +1468,59 @@ class AcpRegistrationTests(unittest.TestCase):
         self.assertTrue((Path(env["PYTHONPATH"]) / "aibrain" / "mcp_todo.py").is_file())
 
 
+class AcpPermissionTests(unittest.TestCase):
+    """Claude Code edits files itself rather than asking us to; the only
+    place we can refuse one outside the session directory or a vault is the
+    permission request it sends first — see `ACPConnection._permission`."""
+
+    def connection(self, roots=()):
+        from aibrain.agents.acp import ACPConnection
+        return ACPConnection(["true"], "/tmp", {}, roots=roots,
+                             core_url="http://127.0.0.1:8781")
+
+    @staticmethod
+    def _request(path=None, kind="allow_once"):
+        tool_call = {"title": "a tool call"}
+        if path is not None:
+            tool_call["locations"] = [{"path": path}]
+        return {
+            "toolCall": tool_call,
+            "options": [{"kind": kind, "optionId": "opt1", "name": "Allow"}],
+        }
+
+    def test_a_location_inside_the_session_directory_is_approved(self):
+        outcome = self.connection()._permission(self._request("/tmp/note.md"))
+        self.assertEqual(outcome, {"outcome": "selected", "optionId": "opt1"})
+
+    def test_a_location_inside_a_vault_is_approved(self):
+        conn = self.connection(roots=["/tmp/vault"])
+        outcome = conn._permission(self._request("/tmp/vault/note.md"))
+        self.assertEqual(outcome, {"outcome": "selected", "optionId": "opt1"})
+
+    def test_a_location_outside_every_root_is_refused(self):
+        outcome = self.connection()._permission(self._request("/etc/passwd"))
+        self.assertEqual(outcome, {"outcome": "cancelled"})
+
+    def test_one_bad_location_among_several_refuses_the_whole_call(self):
+        conn = self.connection()
+        request = self._request()
+        request["toolCall"]["locations"] = [
+            {"path": "/tmp/fine.md"}, {"path": "/etc/passwd"},
+        ]
+        self.assertEqual(conn._permission(request), {"outcome": "cancelled"})
+
+    def test_a_tool_call_with_no_declared_locations_falls_back_to_allow_once(self):
+        # Most shell commands report no locations at all; that is the gap
+        # this check narrows rather than closes, not a case to refuse.
+        outcome = self.connection()._permission(self._request(None))
+        self.assertEqual(outcome, {"outcome": "selected", "optionId": "opt1"})
+
+    def test_no_allow_option_offered_is_still_cancelled(self):
+        outcome = self.connection()._permission(
+            self._request("/tmp/note.md", kind="reject_once"))
+        self.assertEqual(outcome, {"outcome": "cancelled"})
+
+
 class _NoCorpus:
     """Stands in for the HTTP client in tests that never reach the service."""
 

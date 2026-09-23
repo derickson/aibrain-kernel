@@ -304,15 +304,44 @@ class ACPConnection:
         path.write_text(params.get("content", ""), encoding="utf-8")
         self.log(f"agent wrote {path}")
 
+    def _within_roots(self, raw: str) -> bool:
+        try:
+            self._confine(raw)
+            return True
+        except (ACPError, OSError, ValueError):
+            return False
+
     def _permission(self, params: dict) -> dict:
-        """Auto-approve the least surprising option.
+        """Auto-approve the least surprising option — but never outside our roots.
 
         The UI has no modal yet, so a blocking prompt would hang the stream.
         We take the allow-once option when the agent offers one, and otherwise
         refuse, which agents handle as a declined tool call.
+
+        Claude Code edits files by running its own tools directly rather than
+        asking us to write them through `fs/write_text_file` (that path is
+        already confined by `_confine`) — it only tells us what a tool call
+        touched, via `locations`, when it asks permission to run it. So this
+        is the one place we can refuse a write outside the session directory
+        or a vault before it happens rather than merely notice it afterwards.
+        A tool call with no declared locations — most shell commands — cannot
+        be checked this way; this narrows the gap, it does not close it the
+        way an OS-level sandbox would.
         """
         options = params.get("options") or []
-        tool = (params.get("toolCall") or {}).get("title", "a tool call")
+        tool_call = params.get("toolCall") or {}
+        tool = tool_call.get("title", "a tool call")
+
+        outside = [
+            loc["path"] for loc in (tool_call.get("locations") or [])
+            if isinstance(loc, dict) and loc.get("path")
+            and not self._within_roots(loc["path"])
+        ]
+        if outside:
+            self.log(f"refused {tool}: touches {', '.join(outside)}, "
+                     f"outside the session directory and its vaults")
+            return {"outcome": "cancelled"}
+
         for want in ("allow_once", "allow_always"):
             for opt in options:
                 if opt.get("kind") == want:
