@@ -8,12 +8,12 @@
 
 import assert from 'node:assert/strict';
 import {
-  EASE_RATE, EDGE_DIM, EDGE_LIT, MAX_TRACED,
+  EASE_RATE, EDGE_DIM, EDGE_LIT, EDGE_LIT_FAR, MAX_TRACED,
   easeMix, edgeBrightness, freezeEase,
 } from '../web/edges.js';
 
-// A square with a diagonal: 0-1, 1-2, 2-3, 3-0, 0-2.
-const EDGES = [[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]];
+// A path, so hop distance from node 0 is unambiguous: 0-1-2-3-4.
+const EDGES = [[0, 1], [1, 2], [2, 3], [3, 4]];
 const out = () => new Float32Array(EDGES.length * 2);
 
 // Float32Array rounds, so brightness is compared with a tolerance.
@@ -35,25 +35,26 @@ function both(buf, i, want) {
   for (let i = 0; i < EDGES.length; i++) both(buf, i, 0.3);
 }
 
-// Hovering node 0: its edges light, the rest fall back.
+// Hovering node 0: its edge to node 1 (the tight ring) is fully lit, the next
+// hop out (1-2, reaching node 2) is lit but fainter, and anything past the
+// two-hop active set falls all the way back.
 {
   const buf = out(), hl = [];
-  const active = new Set([0, 1, 2]), strong = new Set([0]);
-  edgeBrightness(EDGES, 0, active, strong, 1, buf, hl);
-  both(buf, 0, EDGE_LIT);   // 0-1, both active
-  both(buf, 1, EDGE_LIT);   // 1-2, both active
-  both(buf, 2, EDGE_DIM);   // 2-3, 3 is not
-  both(buf, 3, EDGE_DIM);   // 3-0, 3 is not
-  both(buf, 4, EDGE_LIT);   // 0-2, both active
-  // Traced: lit, and touching the node actually under the cursor.
-  assert.deepEqual(hl, [0, 4]);
+  const near = new Set([0, 1]), active = new Set([0, 1, 2]);
+  edgeBrightness(EDGES, 0, active, near, 1, buf, hl);
+  both(buf, 0, EDGE_LIT);       // 0-1, both in the tight ring
+  both(buf, 1, EDGE_LIT_FAR);   // 1-2, active but reaches past the ring
+  both(buf, 2, EDGE_DIM);       // 2-3, node 3 is not active
+  both(buf, 3, EDGE_DIM);       // 3-4, neither is active
+  // Traced: only the tight edge, so the overlay reads as a ring, not a haze.
+  assert.deepEqual(hl, [0]);
 }
 
 // Global ids are offset by the brain's base, local indices are not.
 {
   const buf = out(), hl = [];
-  const active = new Set([100, 101]), strong = new Set([100]);
-  edgeBrightness(EDGES, 100, active, strong, 1, buf, hl);
+  const near = new Set([100, 101]), active = new Set([100, 101]);
+  edgeBrightness(EDGES, 100, active, near, 1, buf, hl);
   both(buf, 0, EDGE_LIT);
   both(buf, 1, EDGE_DIM);
   assert.deepEqual(hl, [0]);
@@ -63,9 +64,9 @@ function both(buf, i, want) {
 // MAX_TRACED the overlay is a haze, not a path.
 {
   const buf = out(), hl = [];
-  const active = new Set([0, 1, 2, 3]), strong = new Set([0]);
+  const near = new Set([0, 1]), active = new Set([0, 1, 2, 3]);
   for (let g = 10; g < 10 + MAX_TRACED; g++) active.add(g);
-  edgeBrightness(EDGES, 0, active, strong, 1, buf, hl);
+  edgeBrightness(EDGES, 0, active, near, 1, buf, hl);
   both(buf, 0, EDGE_LIT);
   assert.deepEqual(hl, []);
 }

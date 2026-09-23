@@ -71,8 +71,13 @@ void main(){
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   vec4 c = viewMatrix * modelMatrix * vec4(0.0, 0.0, 0.0, 1.0);
   vDepth = clamp((mv.z - c.z) / uR, -1.0, 1.0);
-  float pulse = aBright > 1.3 ? 1.0 + 0.3 * sin(uTime * 5.0 + position.x * 3.0) : 1.0;
-  gl_PointSize = aSize * SIZEMUL * pulse * uScale / -mv.z;
+  float pulse = aBright > 1.6 ? 1.0 + 0.3 * sin(uTime * 5.0 + position.x * 3.0) : 1.0;
+  // Brightness already decays with hop distance from whatever is selected —
+  // reuse it to grow the star too, so a read note and its neighbourhood swell
+  // in step with how lit they are instead of needing a second attribute.
+  // Dimmed stars (bright < 1) never shrink below their resting size.
+  float sizeBoost = max(aBright, 1.0);
+  gl_PointSize = aSize * SIZEMUL * pulse * sizeBoost * uScale / -mv.z;
   gl_Position = projectionMatrix * mv;
 }`;
 const FRAG_CORE = `
@@ -290,12 +295,12 @@ export function createUniverse(container, cfg) {
       uR: { value: R }, uGain: { value: glowGain },
     };
     const points = new THREE.Points(geo, new THREE.ShaderMaterial({
-      uniforms: uni, vertexShader: VERT.replace('SIZEMUL', '1.0'),
+      uniforms: uni, vertexShader: VERT.replace('SIZEMUL', '2.0'),
       fragmentShader: FRAG_CORE, transparent: true, depthWrite: false,
     }));
     points.userData.offset = offset;
     group.add(new THREE.Points(geo, new THREE.ShaderMaterial({
-      uniforms: uni, vertexShader: VERT.replace('SIZEMUL', '2.8'),
+      uniforms: uni, vertexShader: VERT.replace('SIZEMUL', '5.6'),
       fragmentShader: FRAG_GLOW, transparent: true, depthWrite: false,
       blending: THREE.AdditiveBlending, opacity: glowGain,
     })), points);
@@ -576,6 +581,13 @@ export function createUniverse(container, cfg) {
   // ---------- focus state
   let hover = -1, focusNode = -1, searchSet = null, brainFocus = null, hoverAgent = -1;
   const signalSet = new Map();
+  // Hop-1 out from whatever is selected — origin plus its direct links — kept
+  // around after recomputeTargets so updateLabels can title that ring too.
+  // Beyond this many origins a "neighbourhood" stops meaning anything (the
+  // whole search-results list lighting up should not drag in two hops from
+  // every hit), so the halo is skipped and only the origins themselves light.
+  const TIER_EXPAND_MAX = 24;
+  let near = null;
 
   const info = gid => {
     const nd = allNodes[gid], b = brains[nd.bi];
@@ -588,36 +600,49 @@ export function createUniverse(container, cfg) {
   };
 
   function recomputeTargets() {
-    let active = null;
-    const strong = new Set();
+    let origin = null;
     if (hover >= 0) {
-      active = new Set([hover, ...gadj[hover]]);
-      strong.add(hover);
+      origin = new Set([hover]);
     } else if (focusNode >= 0 || signalSet.size || searchSet) {
-      active = new Set();
-      if (focusNode >= 0) {
-        active.add(focusNode);
-        gadj[focusNode].forEach(g => active.add(g));
-        strong.add(focusNode);
-      }
-      for (const g of signalSet.keys()) { active.add(g); strong.add(g); }
-      if (searchSet) for (const g of searchSet) {
-        active.add(g);
-        if (searchSet.size <= 80) strong.add(g);
+      origin = new Set();
+      if (focusNode >= 0) origin.add(focusNode);
+      for (const g of signalSet.keys()) origin.add(g);
+      if (searchSet) for (const g of searchSet) origin.add(g);
+    }
+
+    // Three rings, decaying outward: the origin itself, its direct links, and
+    // their links in turn. `near` is the tight first ring (origin + hop 1),
+    // `active` widens it with hop 2 — everything else fades to the resting dim.
+    let active = null, strong = null;
+    near = null;
+    if (origin && origin.size) {
+      strong = origin;
+      near = new Set(origin);
+      if (origin.size <= TIER_EXPAND_MAX) {
+        for (const g of origin) for (const nb of gadj[g]) near.add(nb);
+        active = new Set(near);
+        for (const g of near) if (!origin.has(g)) for (const nb of gadj[g]) active.add(nb);
+      } else {
+        active = near;
       }
     }
+
     for (const b of brains) {
       const dimB = brainFocus != null && brainFocus !== b.bi ? 0.3 : 1;
       for (let i = 0; i < b.n; i++) {
         const g = b.offset + i;
-        b.briT[i] = (!active ? 1 : strong.has(g) ? 1.7 : active.has(g) ? 1.1 : 0.1) * dimB;
+        b.briT[i] = (!active ? 1
+          : strong.has(g) ? 2.0
+          : near.has(g) ? 1.4
+          : active.has(g) ? 1.15
+          : 0.1) * dimB;
       }
       // Fold however far the running ease got into the "from" snapshot, then
       // aim at the new one. This is the only pass over a brain's edges, and it
       // happens when the selection changes, not when a frame is drawn.
       const hl = [];
       freezeEase(b.eFrom, b.eTo, b.eMix.value);
-      edgeBrightness(b.edges, b.offset, active, strong, dimB, b.eTo, hl);
+      edgeBrightness(b.edges, b.offset, active, near, dimB, b.eTo, hl);
       b.eFromAttr.needsUpdate = true;
       b.eToAttr.needsUpdate = true;
       b.eT = 0;
@@ -748,6 +773,13 @@ export function createUniverse(container, cfg) {
     if (focusNode >= 0) picked.push(focusNode);
     for (const g of signalSet.keys()) picked.push(g);
     if (searchSet && searchSet.size <= 30) searchSet.forEach(g => picked.push(g));
+    // Whatever is lit also gets its direct links titled — capped so a
+    // heavily-linked note does not carpet the screen, and thinning with
+    // distance the same way the ring's brightness does.
+    if (near) {
+      let room = 20;
+      for (const g of near) { if (!room) break; picked.push(g); room--; }
+    }
     for (const b of brains) {
       for (const g of (opt.showAllLabels ? b.hubs : b.labelIds)) ambient.push(g);
     }
@@ -1135,6 +1167,11 @@ export function createUniverse(container, cfg) {
       recomputeTargets();
       return out;
     },
+
+    /** Drive the hover highlight from outside the canvas — a search result
+     *  row, a linked-note row — so mousing over it lights the same node,
+     *  neighbourhood and titles a real pointer hover would. */
+    hoverNode(gid) { setHover(gid ?? -1); },
 
     focusNode(gid) {
       focusNode = gid ?? -1;

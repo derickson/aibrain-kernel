@@ -8,10 +8,16 @@
 
 /** Past this many active nodes the traced overlay reads as noise, not a path. */
 export const MAX_TRACED = 240;
-/** An edge with both ends in the active set. Above 1, so the shader stops
- *  fading it by depth and it reads through the shell. */
+/** An edge sitting inside the tight first ring — both ends within one hop of
+ *  the origin. Above 1, so the shader stops fading it by depth and it reads
+ *  through the shell; also the overlay-traced brightness. */
 export const EDGE_LIT = 1.5;
-/** ...and one without. Not zero: the galaxy keeps its shape while you look. */
+/** An edge that reaches into the second ring but does not touch the first —
+ *  still lit, just fainter, so attention decays with distance instead of
+ *  cutting off sharply at one hop. */
+export const EDGE_LIT_FAR = 0.75;
+/** Neither end is within two hops. Not zero: the galaxy keeps its shape while
+ *  you look. */
 export const EDGE_DIM = 0.06;
 
 /**
@@ -19,19 +25,21 @@ export const EDGE_DIM = 0.06;
  * ends — into `out`, and collect into `highlight` the edges worth drawing in
  * the bright overlay on top.
  *
- * `active` is null when nothing is selected, which is the common case. `dim`
- * is the whole-galaxy multiplier applied when another galaxy has the focus.
- * Returns `highlight`, emptied first.
+ * `active` is every node within two hops of the origin (null when nothing is
+ * selected, the common case); `near` is the tighter one-hop ring (origin plus
+ * its direct links). `dim` is the whole-galaxy multiplier applied when
+ * another galaxy has the focus. Returns `highlight`, emptied first.
  */
-export function edgeBrightness(edges, offset, active, strong, dim, out, highlight) {
+export function edgeBrightness(edges, offset, active, near, dim, out, highlight) {
   highlight.length = 0;
   const trace = !!active && active.size < MAX_TRACED;
   for (let i = 0; i < edges.length; i++) {
     if (!active) { out[i * 2] = out[i * 2 + 1] = dim; continue; }
     const e = edges[i], ga = offset + e[0], gc = offset + e[1];
     const both = active.has(ga) && active.has(gc);
-    out[i * 2] = out[i * 2 + 1] = (both ? EDGE_LIT : EDGE_DIM) * dim;
-    if (both && trace && (strong.has(ga) || strong.has(gc))) highlight.push(i);
+    const tight = both && near.has(ga) && near.has(gc);
+    out[i * 2] = out[i * 2 + 1] = (tight ? EDGE_LIT : both ? EDGE_LIT_FAR : EDGE_DIM) * dim;
+    if (tight && trace) highlight.push(i);
   }
   return highlight;
 }
