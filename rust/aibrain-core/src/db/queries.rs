@@ -585,11 +585,15 @@ pub fn to_tsquery(text: &str, any: bool) -> String {
     terms.join(if any { " | " } else { " & " })
 }
 
-pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<NoteSummary>> {
+pub async fn recent(pool: &PgPool, brains: &[String], limit: i64) -> Result<Vec<NoteSummary>> {
     let rows = sqlx::query(
         "SELECT id, brain_id, rel_path, title, source, degree, mtime, excerpt
-           FROM note ORDER BY mtime DESC LIMIT $1",
+           FROM note
+          WHERE ($1::text[] IS NULL OR cardinality($1::text[]) = 0
+                 OR brain_id = ANY($1::text[]))
+          ORDER BY mtime DESC LIMIT $2",
     )
+    .bind(brains)
     .bind(limit)
     .fetch_all(pool)
     .await?;

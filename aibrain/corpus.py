@@ -245,8 +245,11 @@ class Corpus:
         return self._request("/notes/by-path", allow_404=True,
                              params={"brain": brain_id, "path": rel_path})
 
-    def recent(self, limit: int = 24) -> list[dict]:
-        payload = self._request("/notes/recent", params={"limit": limit}) or {}
+    def recent(self, limit: int = 24, brain_ids: list[str] | None = None) -> list[dict]:
+        params: dict = {"limit": limit}
+        if brain_ids:
+            params["brains"] = ",".join(brain_ids)
+        payload = self._request("/notes/recent", params=params) or {}
         return payload.get("results", [])
 
     def retire_brain(self, brain_id: str) -> dict:

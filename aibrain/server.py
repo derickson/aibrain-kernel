@@ -764,7 +764,10 @@ def build_router(state: State) -> Router:
         h.json({"nid": note_id})
 
     def recent(h: Handler) -> None:
-        rows = state.corpus.recent(limit=h.int_query("limit", 24, 1, 200))
+        q = h.query()
+        brain_ids = [b for b in q.get("brains", "").split(",") if b][:32]
+        rows = state.corpus.recent(limit=h.int_query("limit", 24, 1, 200),
+                                   brain_ids=brain_ids or None)
         h.json({"results": [state.decorate(row) for row in rows]})
 
     # ---- the to-do list -------------------------------------------------

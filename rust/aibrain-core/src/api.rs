@@ -447,6 +447,7 @@ async fn note_by_path(
 #[derive(Deserialize)]
 struct RecentParams {
     limit: Option<i64>,
+    brains: Option<String>,
 }
 
 async fn recent(
@@ -454,7 +455,15 @@ async fn recent(
     Query(params): Query<RecentParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let limit = params.limit.unwrap_or(20).clamp(1, 200);
-    Ok(Json(json!({ "results": db::recent(&ctx.pool, limit).await? })))
+    let brains: Vec<String> = params
+        .brains
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .take(64)
+        .map(str::to_string)
+        .collect();
+    Ok(Json(json!({ "results": db::recent(&ctx.pool, &brains, limit).await? })))
 }
 
 #[derive(Deserialize)]

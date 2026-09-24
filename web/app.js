@@ -93,6 +93,7 @@ const S = {
   note: null,
   noteFrom: null,
   results: [],
+  recentResults: [],   // shown in the search panel when query is blank
   searchMeta: null,    // {engine, ms} for the last /api/search response
   query: '',
   brainFocus: null,
@@ -328,8 +329,9 @@ function renderChips() {
         S.universe?.focusBrain(S.brainFocus);
         renderChips();
         renderStatus();
-        // The scope changed under an open query, so the results must follow.
+        // The scope changed — re-run search or refresh recent list accordingly.
         if (S.query.trim()) runSearch(S.query);
+        else if (S.rightOpen) refreshRecentResults();
       },
     },
       el('span', { class: 'pip', style: `background:${color};box-shadow:0 0 8px ${color}` }),
@@ -493,7 +495,7 @@ const runSearch = debounce(async text => {
     S.results = [];
     S.searchMeta = null;
     S.universe?.highlight(null);
-    renderResults();
+    refreshRecentResults();
     return;
   }
   try {
@@ -515,26 +517,36 @@ const runSearch = debounce(async text => {
 function renderResults() {
   S.note = null;
   $('#note-view').hidden = true;
-  const any = S.results.length > 0, searching = !!S.query.trim();
-  $('#results-view').hidden = !searching;
-  $('#empty-view').hidden = searching;
-  if (!searching) return;
+  const searching = !!S.query.trim();
+  $('#results-view').hidden = false;
+  $('#empty-view').hidden = true;
 
   const brain = S.data?.brains.find(b => b.id === S.brainFocus);
   const scope = brain ? ` IN ${brain.name.toUpperCase()}` : '';
+  const meta = $('#results-meta');
+  const list = $('#results');
+  list.innerHTML = '';
+
+  if (!searching) {
+    $('#results-label').textContent = `RECENT${scope}`;
+    meta.hidden = true;
+    for (const item of S.recentResults) {
+      list.append(noteRow(item, () => openNote(item.nid, 'results')));
+    }
+    return;
+  }
+
+  const any = S.results.length > 0;
   $('#results-label').textContent = any
     ? `${S.results.length} RESULT${S.results.length === 1 ? '' : 'S'} FOR “${S.query.toUpperCase()}”${scope}`
     : `NOTHING MATCHES “${S.query.toUpperCase()}”${scope}`;
-  const meta = $('#results-meta');
   if (S.searchMeta?.engine) {
     meta.hidden = false;
     meta.dataset.engine = S.searchMeta.engine;
-    meta.innerHTML = `<span class="engine">${esc(S.searchMeta.engine.toUpperCase())}</span> · ${S.searchMeta.ms}ms`;
+    meta.innerHTML = `<span class=”engine”>${esc(S.searchMeta.engine.toUpperCase())}</span> · ${S.searchMeta.ms}ms`;
   } else {
     meta.hidden = true;
   }
-  const list = $('#results');
-  list.innerHTML = '';
   for (const item of S.results) {
     list.append(noteRow(item, () => openNote(item.nid, 'results')));
   }
@@ -547,6 +559,15 @@ async function loadRecent() {
     list.innerHTML = '';
     for (const item of results) list.append(noteRow(item, () => openNote(item.nid, null)));
   } catch { /* the panel is still usable without it */ }
+}
+
+async function refreshRecentResults() {
+  try {
+    const scope = S.brainFocus ? `&brains=${encodeURIComponent(S.brainFocus)}` : '';
+    const { results } = await api(`/api/recent?limit=60${scope}`);
+    S.recentResults = results;
+    if (!S.query.trim()) renderResults();
+  } catch { /* non-fatal */ }
 }
 
 // ───────────────────────────── chat ─────────────────────────────────────
@@ -1526,6 +1547,7 @@ function wireStaticHandlers() {
       toast(String(err.message || err), true);
     }
     if (S.query.trim()) runSearch(S.query);
+    else if (S.rightOpen) refreshRecentResults();
   };
   $('#import-meetings').onclick = async () => {
     try { await refreshStatus(); } catch (err) { toast(String(err.message || err), true); return; }
@@ -1596,6 +1618,7 @@ function wireStaticHandlers() {
 function openSearch() {
   openRight();
   S.note = null;
+  refreshRecentResults();
   renderResults();
   setTimeout(() => $('#query').focus(), 360);
 }

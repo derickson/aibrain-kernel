@@ -406,8 +406,20 @@ def render_body(lines) -> str:
     return "\n\n".join(out) + "\n"
 
 
+_ANON_SPEAKER_RE = re.compile(r"^(Unknown|Speaker\s+\d+)$", re.IGNORECASE)
+
+
 def render_markdown(meta: dict, lines) -> str:
-    return render_frontmatter(meta) + render_body(lines)
+    seen: set[str] = set()
+    speakers: list[str] = []
+    for _start, _end, _text, speaker in lines:
+        name = (speaker or "Unknown").strip()
+        if name not in seen:
+            seen.add(name)
+            if not _ANON_SPEAKER_RE.match(name):
+                speakers.append(name)
+    speaker_block = "\n".join(f"[[{s}]]" for s in speakers) + "\n\n" if speakers else ""
+    return render_frontmatter(meta) + speaker_block + render_body(lines)
 
 
 # --------------------------------------------------------------------------- drift detection
