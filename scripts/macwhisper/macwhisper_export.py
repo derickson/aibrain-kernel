@@ -334,7 +334,7 @@ ORDER BY s.dateCreated DESC
 """
 
 LINES_SQL = """
-SELECT tl.start, tl.text, sp.name
+SELECT tl.start, tl.end, tl.text, sp.name
 FROM transcriptline tl
 LEFT JOIN speaker sp ON sp.id = tl.speakerID
 WHERE tl.sessionId = ?
@@ -385,11 +385,25 @@ def render_frontmatter(meta: dict) -> str:
 
 
 def render_body(lines) -> str:
+    """Collapse consecutive same-speaker segments into paragraphs.
+
+    Each group is: speaker name, timestamp of first segment, then all segment
+    texts joined with a space. Groups are separated by blank lines. A new group
+    starts only when the speaker changes — this matches MacWhisper's own
+    'transcript' export (as opposed to per-segment export).
+    """
+    groups: list[list] = []  # [start_ms, speaker, [texts]]
+    for start, _end, text, speaker in lines:
+        speaker = speaker or "Unknown"
+        if groups and groups[-1][1] == speaker:
+            groups[-1][2].append(text)
+        else:
+            groups.append([start, speaker, [text]])
     out = []
-    for start, text, speaker in lines:
-        out.append(f"**{speaker or 'Unknown'}**\n*{fmt_timestamp(start)}*\n{text}\n")
-    # MacWhisper's own export ends with a blank line, so keep the trailing "\n".
-    return "\n".join(out) + "\n"
+    for start, speaker, texts in groups:
+        body = " ".join(t.strip() for t in texts)
+        out.append(f"{speaker}\n{fmt_timestamp(start)}\n{body}")
+    return "\n\n".join(out) + "\n"
 
 
 def render_markdown(meta: dict, lines) -> str:
