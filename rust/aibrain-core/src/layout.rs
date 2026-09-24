@@ -9,16 +9,63 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Folders that are containers rather than subjects get folded together, so a
-/// vault does not become thirty near-empty ribbons.
-const MIN_SOURCE_SHARE: f64 = 0.012;
-const MAX_SOURCES: usize = 8;
+/// A folder needs a couple of notes to earn its own ribbon; single-note
+/// folders and anything past the cap fold together into "Other".
+const MIN_SOURCE_NOTES: usize = 2;
+/// Well under the 255 a `source_index` byte can address. Past the palette's
+/// ten colors they repeat — see `ribbon_colors` for how neighbours avoid it.
+const MAX_SOURCES: usize = 100;
 pub const OTHER_LABEL: &str = "Other";
+
+/// Bumped whenever the same notes would land differently or take different
+/// colors. It is part of the cache signature and the ETag, so a new build
+/// never serves a layout the old code produced.
+pub const LAYOUT_VERSION: u32 = 2;
 
 pub const SOURCE_COLORS: [&str; 10] = [
     "#4db3f0", "#f06aa6", "#f0c030", "#3ecf9a", "#9b7cf0",
     "#f2952d", "#4fd6d0", "#e0637a", "#7fd8e8", "#c0d05a",
 ];
+
+/// What a ribbon stands for. `note.source` is always the top-level folder —
+/// search indexes it that way — so the finer grouping is derived from the
+/// path here, at layout time, and switching modes never needs a reindex.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GroupBy {
+    /// `Notes/2025/today.md` sits on the `Notes` ribbon.
+    #[default]
+    TopFolder,
+    /// `Notes/2025/today.md` sits on the `Notes/2025` ribbon.
+    Folder,
+}
+
+impl GroupBy {
+    /// Anything unrecognised is the default: a typo in config.json should
+    /// draw the familiar galaxy, not refuse to draw one.
+    pub fn parse(value: &str) -> GroupBy {
+        match value {
+            "folder" => GroupBy::Folder,
+            _ => GroupBy::TopFolder,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GroupBy::TopFolder => "top_folder",
+            GroupBy::Folder => "folder",
+        }
+    }
+
+    fn key<'a>(self, note: &'a LayoutNote) -> &'a str {
+        match self {
+            GroupBy::TopFolder => &note.source,
+            GroupBy::Folder => match note.rel_path.rsplit_once('/') {
+                Some((folder, _)) => folder,
+                None => "Root",
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceMeta {
@@ -148,23 +195,26 @@ pub fn brain_slots(radii: &[f32]) -> Vec<[f32; 3]> {
         .collect()
 }
 
-/// Group notes by top-level folder, merging the long tail into "Other".
-pub fn source_buckets(notes: &[LayoutNote], brain_name: &str) -> Vec<(String, Vec<usize>)> {
+/// Group notes by folder (per `group_by`), merging the long tail into "Other".
+pub fn source_buckets(
+    notes: &[LayoutNote],
+    brain_name: &str,
+    group_by: GroupBy,
+) -> Vec<(String, Vec<usize>)> {
     let mut buckets: Vec<(String, Vec<usize>)> = Vec::new();
     for (i, note) in notes.iter().enumerate() {
-        match buckets.iter_mut().find(|(name, _)| *name == note.source) {
+        let key = group_by.key(note);
+        match buckets.iter_mut().find(|(name, _)| name == key) {
             Some((_, list)) => list.push(i),
-            None => buckets.push((note.source.clone(), vec![i])),
+            None => buckets.push((key.to_string(), vec![i])),
         }
     }
     buckets.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
-    let total = notes.len() as f64;
-    let floor = (total * MIN_SOURCE_SHARE).max(2.0);
     let mut keep: Vec<(String, Vec<usize>)> = Vec::new();
     let mut tail: Vec<usize> = Vec::new();
     for (name, items) in buckets {
-        if keep.len() < MAX_SOURCES && items.len() as f64 >= floor {
+        if keep.len() < MAX_SOURCES && items.len() >= MIN_SOURCE_NOTES {
             keep.push((name, items));
         } else {
             tail.extend(items);
@@ -203,9 +253,10 @@ pub fn place_brain(
     seed: i32,
     notes: &[LayoutNote],
     ribbon_twist: f64,
+    group_by: GroupBy,
 ) -> (Vec<Placed>, Vec<SourceMeta>, f32) {
     let radius = brain_radius(notes.len());
-    let buckets = source_buckets(notes, brain_name);
+    let buckets = source_buckets(notes, brain_name, group_by);
 
     let mut rng = Rng::new(seed.unsigned_abs());
     let golden = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
@@ -227,6 +278,7 @@ pub fn place_brain(
 
     let mut placed = Vec::with_capacity(notes.len());
     let mut sources = Vec::with_capacity(buckets.len());
+    let mut axes = Vec::with_capacity(buckets.len());
 
     for (si, (name, members)) in buckets.iter().enumerate() {
         let count = members.len().max(1) as f64;
@@ -235,6 +287,7 @@ pub fn place_brain(
         let th = base_rot + si as f64 * golden;
 
         let u = normalize3([th.cos() * rad, y, th.sin() * rad]);
+        axes.push(u);
         let tilt = normalize3([rng.next() - 0.5, rng.next() - 0.5, rng.next() - 0.5]);
         let w = normalize3(cross(u, tilt));
         let v = normalize3(cross(w, u));
@@ -295,12 +348,48 @@ pub fn place_brain(
         sources.push(SourceMeta {
             id: format!("{brain_id}:{}", slugify(name)),
             name: name.clone(),
-            color: SOURCE_COLORS[(si + 3) % SOURCE_COLORS.len()].to_string(),
+            color: String::new(),
             count: members.len(),
         });
     }
+    for (source, color) in sources.iter_mut().zip(ribbon_colors(&axes)) {
+        source.color = SOURCE_COLORS[color].to_string();
+    }
 
     (placed, sources, radius)
+}
+
+/// A palette index for each ribbon, given the direction it points from the
+/// brain's center.
+///
+/// Consecutive ribbons are not neighbours — they step round the sphere by the
+/// golden angle — so "don't repeat the previous color" would not help. Each
+/// ribbon instead takes the color whose closest existing use is farthest from
+/// it. Ties go to palette order starting at 3, so a brain with ten ribbons or
+/// fewer gets exactly the colors it always had.
+fn ribbon_colors(axes: &[[f64; 3]]) -> Vec<usize> {
+    let n = SOURCE_COLORS.len();
+    let mut colors: Vec<usize> = Vec::with_capacity(axes.len());
+    for (i, axis) in axes.iter().enumerate() {
+        let mut best = (f64::INFINITY, 0);
+        for step in 0..n {
+            let color = (step + 3) % n;
+            // Closeness as a dot product: 1 is the same spot, -1 opposite.
+            let nearest = (0..i)
+                .filter(|&j| colors[j] == color)
+                .map(|j| dot(*axis, axes[j]))
+                .fold(-f64::INFINITY, f64::max);
+            if nearest < best.0 {
+                best = (nearest, color);
+            }
+        }
+        colors.push(best.1);
+    }
+    colors
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -406,11 +495,11 @@ mod tests {
         let before: Vec<LayoutNote> = (0..500)
             .map(|i| note(i, &format!("n{i}.md"), "Notes", 1))
             .collect();
-        let (placed_before, _, _) = place_brain("b", "B", 7, &before, 0.25);
+        let (placed_before, _, _) = place_brain("b", "B", 7, &before, 0.25, GroupBy::TopFolder);
 
         let mut after = before.clone();
         after.push(note(9999, "new.md", "Notes", 1));
-        let (placed_after, _, _) = place_brain("b", "B", 7, &after, 0.25);
+        let (placed_after, _, _) = place_brain("b", "B", 7, &after, 0.25, GroupBy::TopFolder);
         assert_eq!(
             moved_count(&placed_before, &placed_after),
             0,
@@ -419,7 +508,7 @@ mod tests {
 
         // Deleting one is the same promise in reverse.
         let fewer: Vec<LayoutNote> = before[1..].to_vec();
-        let (placed_fewer, _, _) = place_brain("b", "B", 7, &fewer, 0.25);
+        let (placed_fewer, _, _) = place_brain("b", "B", 7, &fewer, 0.25, GroupBy::TopFolder);
         assert_eq!(
             moved_count(&placed_fewer, &placed_before),
             0,
@@ -482,7 +571,7 @@ mod tests {
         for i in 0..12 {
             notes.push(note(1000 + i, &format!("Odd{i}/x.md"), &format!("Odd{i}"), 1));
         }
-        let buckets = source_buckets(&notes, "B");
+        let buckets = source_buckets(&notes, "B", GroupBy::TopFolder);
         assert_eq!(buckets[0].0, "Notes");
         assert!(buckets.iter().any(|(name, _)| name == OTHER_LABEL));
         assert!(buckets.len() <= MAX_SOURCES + 1);
@@ -495,7 +584,7 @@ mod tests {
         let notes: Vec<LayoutNote> = (0..400)
             .map(|i| note(i, &format!("Notes/{i}.md"), "Notes", i as i32 % 30))
             .collect();
-        let (placed, sources, radius) = place_brain("b", "B", 11, &notes, 0.25);
+        let (placed, sources, radius) = place_brain("b", "B", 11, &notes, 0.25, GroupBy::TopFolder);
         assert_eq!(placed.len(), notes.len());
         assert_eq!(sources.iter().map(|s| s.count).sum::<usize>(), notes.len());
         for p in &placed {
@@ -512,9 +601,79 @@ mod tests {
             .map(|i| note(i, &format!("n{i}.md"), "Notes", 1))
             .collect();
         notes.push(note(999, "hub.md", "Notes", 400));
-        let (placed, _, _) = place_brain("b", "B", 3, &notes, 0.25);
+        let (placed, _, _) = place_brain("b", "B", 3, &notes, 0.25, GroupBy::TopFolder);
         let hub = placed.iter().find(|p| p.id == 999).unwrap();
         let leaf = placed.iter().find(|p| p.id == 0).unwrap();
         assert!(hub.size > leaf.size * 2.0, "hub {} vs leaf {}", hub.size, leaf.size);
+    }
+
+    #[test]
+    fn folder_mode_splits_ribbons_by_the_full_folder_chain() {
+        let mut notes: Vec<LayoutNote> = (0..50)
+            .map(|i| note(i, &format!("Notes/{i}.md"), "Notes", 1))
+            .collect();
+        notes.extend((0..50).map(|i| note(100 + i, &format!("Notes/2025/{i}.md"), "Notes", 1)));
+        notes.extend((0..50).map(|i| note(200 + i, &format!("top{i}.md"), "Root", 1)));
+
+        let top = source_buckets(&notes, "B", GroupBy::TopFolder);
+        let names: Vec<&str> = top.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Notes", "Root"]);
+
+        let deep = source_buckets(&notes, "B", GroupBy::Folder);
+        let mut names: Vec<&str> = deep.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Notes", "Notes/2025", "Root"]);
+    }
+
+    #[test]
+    fn group_by_reads_leniently() {
+        assert_eq!(GroupBy::parse("folder"), GroupBy::Folder);
+        assert_eq!(GroupBy::parse("top_folder"), GroupBy::TopFolder);
+        assert_eq!(GroupBy::parse("Folder?"), GroupBy::TopFolder);
+    }
+
+    #[test]
+    fn a_small_brain_keeps_the_colors_it_always_had() {
+        let notes: Vec<LayoutNote> = (0..60)
+            .map(|i| note(i, &format!("F{}/{i}.md", i % 6), &format!("F{}", i % 6), 1))
+            .collect();
+        let (_, sources, _) = place_brain("b", "B", 5, &notes, 0.25, GroupBy::TopFolder);
+        for (si, source) in sources.iter().enumerate() {
+            assert_eq!(source.color, SOURCE_COLORS[(si + 3) % SOURCE_COLORS.len()]);
+        }
+    }
+
+    #[test]
+    fn no_ribbon_shares_a_color_with_its_nearest_neighbour() {
+        for count in [11, 25, 42, 100] {
+            let notes: Vec<LayoutNote> = (0..count * 3)
+                .map(|i| {
+                    let folder = format!("F{:03}", i % count);
+                    note(i as i64, &format!("{folder}/{i}.md"), &folder, 1)
+                })
+                .collect();
+            let (placed, sources, _) = place_brain("b", "B", 9, &notes, 0.25, GroupBy::TopFolder);
+            assert_eq!(sources.len(), count);
+
+            // Each ribbon's direction is the mean of the notes on it.
+            let mut axes = vec![[0.0f64; 3]; count];
+            for p in &placed {
+                let a = &mut axes[p.source_index as usize];
+                for k in 0..3 {
+                    a[k] += p.position[k] as f64;
+                }
+            }
+            let axes: Vec<[f64; 3]> = axes.into_iter().map(normalize3).collect();
+            for i in 0..count {
+                let nearest = (0..count)
+                    .filter(|&j| j != i)
+                    .max_by(|&a, &b| dot(axes[i], axes[a]).total_cmp(&dot(axes[i], axes[b])))
+                    .unwrap();
+                assert_ne!(
+                    sources[i].color, sources[nearest].color,
+                    "{count} ribbons: {i} and its neighbour {nearest} match"
+                );
+            }
+        }
     }
 }

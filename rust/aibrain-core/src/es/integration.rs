@@ -137,6 +137,7 @@ async fn setup(tag: &str) -> Option<Harness> {
         seed: 3,
         excludes: vec![],
         color: "#4db3f0".into(),
+        group_by: Default::default(),
     };
     // The worker provisions, drains and reconciles every brain in the
     // database, so anything else left here — an earlier crashed run, or the
@@ -543,6 +544,7 @@ async fn a_stale_reindex_cannot_resurrect_a_removed_vault() {
         seed: 1,
         excludes: vec![],
         color: "#fff".into(),
+        group_by: Default::default(),
     };
 
     ingest::reindex(&pool, std::slice::from_ref(&spec), false, |_| {}).await.unwrap();

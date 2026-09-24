@@ -43,7 +43,14 @@ pub fn cache_is_current(cached: Option<(i64, &str)>, revision: i64, signature: &
 pub fn signature(spec: &BrainSpec, ribbon_twist: f64) -> String {
     // Six decimals is finer than the slider can move and coarser than float
     // noise, so an unchanged config always produces an unchanged string.
-    format!("{}|{}|{:.6}", spec.seed, spec.name, ribbon_twist)
+    format!(
+        "v{}|{}|{}|{:.6}|{}",
+        layout::LAYOUT_VERSION,
+        spec.seed,
+        spec.name,
+        ribbon_twist,
+        spec.group_by.as_str()
+    )
 }
 
 /// The ETag for a universe: a hash of every `(brain_id, revision)` pair.
@@ -96,17 +103,17 @@ pub async fn revisions(pool: &PgPool, cfg: &Config) -> Result<Vec<(String, i64)>
         .collect())
 }
 
-/// The corpus-wide half of the ETag input, plus every brain's color — a
-/// color edit does not touch a note's revision, so without this a browser
-/// holding a cached payload would never learn about it.
+/// The corpus-wide half of the ETag input, plus every brain's color and
+/// grouping — neither touches a note's revision, so without this a browser
+/// holding a cached payload would never learn about the change.
 pub fn shape_of(cfg: &Config) -> String {
     let colors: String = cfg
         .brains
         .iter()
-        .map(|b| format!("{}={}", b.id, b.color))
+        .map(|b| format!("{}={}/{}", b.id, b.color, b.group_by.as_str()))
         .collect::<Vec<_>>()
         .join(",");
-    format!("{}|{:.6}|{colors}", cfg.title, cfg.ribbon_twist)
+    format!("v{}|{}|{:.6}|{colors}", layout::LAYOUT_VERSION, cfg.title, cfg.ribbon_twist)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +294,7 @@ async fn block_for(
 
     let notes = db::notes_for_layout(pool, &spec.id).await?;
     let (placed, sources, radius) =
-        layout::place_brain(&spec.id, &spec.name, spec.seed, &notes, ribbon_twist);
+        layout::place_brain(&spec.id, &spec.name, spec.seed, &notes, ribbon_twist, spec.group_by);
 
     let mut geometry = Geometry {
         note_ids: Vec::with_capacity(placed.len()),
@@ -439,6 +446,7 @@ mod tests {
             seed,
             excludes: vec![],
             color: "#4db3f0".into(),
+            group_by: Default::default(),
         }
     }
 
@@ -493,6 +501,21 @@ mod tests {
         let before = shape_of(&cfg);
         cfg.brains[0].color = "#000000".into();
         assert_ne!(before, shape_of(&cfg));
+    }
+
+    #[test]
+    fn a_grouping_change_rebuilds_the_layout_and_the_etag() {
+        let flat = spec("a", "A", 7);
+        let mut deep = spec("a", "A", 7);
+        deep.group_by = crate::layout::GroupBy::Folder;
+        assert_ne!(signature(&flat, 0.25), signature(&deep, 0.25));
+        let cfg = |b: BrainSpec| Config {
+            brains: vec![b],
+            ribbon_twist: 0.25,
+            title: "t".into(),
+            todo_day_start_hour: 4,
+        };
+        assert_ne!(shape_of(&cfg(flat)), shape_of(&cfg(deep)));
     }
 
     #[test]

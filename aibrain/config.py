@@ -59,6 +59,10 @@ class BrainConfig:
     # first time this brain is seen, same as an agent's color is picked once
     # at creation rather than recomputed on every read.
     color: str = ""
+    # Which folder a note's ribbon and dot color follow: "top_folder" puts
+    # Notes/2025/today.md on "Notes", "folder" puts it on "Notes/2025".
+    # Read by the Rust layout; changing it needs no reindex.
+    group_by: str = "top_folder"
     exclude: list[str] = field(
         default_factory=lambda: [".obsidian", ".trash", ".git", "ZZ-Attachments",
                                  "ZZ-Attachements", "assets", "scans", "Excalidraw"]

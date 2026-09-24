@@ -275,6 +275,7 @@ mod tests {
             seed: 1,
             excludes: vec![],
             color: "#4db3f0".into(),
+            group_by: Default::default(),
         }];
 
         let inside = std::fs::canonicalize(&vault).unwrap().join("Notes/A.md");

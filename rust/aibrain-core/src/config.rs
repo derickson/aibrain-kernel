@@ -17,6 +17,9 @@ pub struct BrainSpec {
     /// The UI owns assigning this (see `reconcile_brains` in aibrain/config.py);
     /// the fallback below only covers a config Python has not touched yet.
     pub color: String,
+    /// Which folder a note's ribbon (and dot color) follows. Config key
+    /// `group_by`: `"top_folder"` (default) or `"folder"`.
+    pub group_by: crate::layout::GroupBy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +35,8 @@ struct RawBrain {
     exclude: Vec<String>,
     #[serde(default)]
     color: Option<String>,
+    #[serde(default)]
+    group_by: Option<String>,
 }
 
 fn yes() -> bool {
@@ -109,6 +114,7 @@ pub fn load(path: &Path) -> Result<Config> {
             name: b.name,
             root: expand(&b.path),
             excludes: b.exclude,
+            group_by: crate::layout::GroupBy::parse(b.group_by.as_deref().unwrap_or_default()),
         })
         // A vault whose link is broken simply is not there; the UI reports it.
         .filter(|b| Path::new(&b.root).is_dir())
