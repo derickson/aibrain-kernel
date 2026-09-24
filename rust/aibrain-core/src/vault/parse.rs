@@ -226,6 +226,16 @@ fn excerpt(body: &str, limit: usize) -> String {
 /// Parse one file's text into a record. `rel_path` is posix-style, relative to
 /// the vault root.
 pub fn parse(rel_path: &str, text: &str) -> ParsedNote {
+    // Postgres refuses a NUL byte in any text column, valid UTF-8 or not —
+    // a note that has picked one up (a paste from a binary source, a
+    // truncated write) would otherwise take the whole scan down with it.
+    let owned;
+    let text = if text.contains('\0') {
+        owned = text.replace('\0', "");
+        owned.as_str()
+    } else {
+        text
+    };
     let (fields, body) = split_frontmatter(text);
 
     let stem = Path::new(rel_path)
@@ -378,5 +388,19 @@ mod tests {
         let b = parse("different-name.md", "same body");
         assert_eq!(a.content_hash, b.content_hash);
         assert_ne!(a.content_hash, parse("x.md", "other body").content_hash);
+    }
+
+    #[test]
+    fn nul_bytes_are_stripped_rather_than_carried_into_postgres() {
+        // Postgres rejects a NUL byte in a text column outright, so a note
+        // that has one anywhere would otherwise fail on write and take the
+        // whole scan down with it.
+        let note = parse("x.md", "---\ntitle: Tit\0le\n---\n\nBody with a stray\0byte.\n");
+        assert_eq!(note.title, "Title");
+        assert!(!note.body.contains('\0'));
+        assert_eq!(
+            note.content_hash,
+            parse("x.md", "---\ntitle: Title\n---\n\nBody with a straybyte.\n").content_hash
+        );
     }
 }

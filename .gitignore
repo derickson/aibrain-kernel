@@ -22,3 +22,6 @@ rust/target/
 # local secrets — never commit; see .env.example
 .env
 .env.local
+
+# dev.sh logs
+logs/

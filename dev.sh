@@ -12,6 +12,21 @@ cd "$(dirname "$0")"
 DB_URL="${AIBRAIN_DATABASE_URL:-postgres://aibrain:aibrain@127.0.0.1:5433/aibrain}"
 export AIBRAIN_DATABASE_URL="$DB_URL"
 
+# Everything below is shown live in this terminal AND streamed, timestamped,
+# to a log file — so an agent (or you) can review a run after the fact. `tee`
+# passes the terminal copy through untouched (so the "waiting..." dots still
+# animate live) and only timestamps the branch written to the log file. Plain
+# `date` per line rather than awk's strftime, which isn't universally built in.
+mkdir -p logs
+LOG_FILE="logs/dev-$(date +%Y%m%d-%H%M%S).log"
+timestamp() {
+  while IFS= read -r line; do
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"
+  done
+}
+exec > >(tee >(timestamp >> "$LOG_FILE")) 2>&1
+echo "==> logging to $LOG_FILE"
+
 compose() {
   if docker compose version >/dev/null 2>&1; then docker compose "$@"
   else docker-compose "$@"; fi
@@ -42,7 +57,7 @@ stop() {
 trap stop INT TERM EXIT
 
 echo "==> aibrain-core"
-cargo run --manifest-path rust/Cargo.toml -- serve --watch &
+stdbuf -oL -eL cargo run --manifest-path rust/Cargo.toml -- serve --watch &
 pids+=($!)
 
 # The Python server refuses to start until /health answers. On a first-time
@@ -58,7 +73,7 @@ for _ in $(seq 1 180); do
 done
 
 echo "==> aibrain (ui)"
-python3 -m aibrain "$@" &
+stdbuf -oL -eL python3 -m aibrain "$@" &
 pids+=($!)
 
 # wait -n requires bash 4.3+; macOS ships bash 3.2. Poll instead.

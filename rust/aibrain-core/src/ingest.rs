@@ -195,9 +195,13 @@ pub async fn ingest_brain(
             }
         }
 
-        let Ok(text) = tokio::fs::read_to_string(&entry.path).await else {
+        let Ok(bytes) = tokio::fs::read(&entry.path).await else {
             continue;
         };
+        // Lossy rather than skipping outright: a note with one stray
+        // non-UTF-8 byte still has a title, links and 99% of its body worth
+        // indexing, and a dropped replacement character beats a dropped note.
+        let text = String::from_utf8_lossy(&bytes);
         let parsed = vault::parse(&entry.rel_path, &text);
 
         // The timestamp moved but the bytes did not — an autosave. Nothing to do.
@@ -208,7 +212,12 @@ pub async fn ingest_brain(
             }
         }
 
-        write_note(pool, brain, &parsed, entry.mtime, entry.size).await?;
+        // One note's write failing (a constraint it still manages to trip,
+        // a transient DB hiccup) should not cost the rest of the vault.
+        if let Err(err) = write_note(pool, brain, &parsed, entry.mtime, entry.size).await {
+            tracing::warn!("skipping {}: {err:#}", entry.rel_path);
+            continue;
+        }
 
         if prior.is_some() {
             stats.updated += 1;
@@ -253,7 +262,8 @@ pub async fn ingest_one(pool: &PgPool, brain: &BrainSpec, rel_path: &str) -> Res
         return Ok(None);
     }
 
-    let text = tokio::fs::read_to_string(&path).await?;
+    let bytes = tokio::fs::read(&path).await?;
+    let text = String::from_utf8_lossy(&bytes);
     let parsed = vault::parse(rel_path, &text);
     if let Some((_, hash, _, _)) = known.get(rel_path) {
         if hash.as_slice() == parsed.content_hash.as_slice() {
