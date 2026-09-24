@@ -16,10 +16,12 @@ import math
 import mimetypes
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import traceback
 import urllib.parse
+from datetime import datetime
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +39,7 @@ WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 # see that script's DEFAULT_OUT for the source of truth.
 RAW_TRANSCRIPTS_DIR = REPO_ROOT / "raw_transcripts"
 IMPORT_LEDGER_PATH = DEFAULT_CONFIG_DIR / "meeting_import_ledger.json"
+MACWHISPER_STATE_DB = REPO_ROOT / "scripts/macwhisper/export_state.sqlite3"
 
 _VOLATILE_FM_RE = re.compile(r"^script_exported_at:.*\n", re.M)
 
@@ -62,6 +65,58 @@ def _save_import_ledger(ledger: dict[str, str]) -> None:
     tmp = IMPORT_LEDGER_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(IMPORT_LEDGER_PATH)
+
+
+def _backfill_ledger(ledger: dict[str, str]) -> bool:
+    """One-time migration for pre-ledger imports.
+
+    When the ledger was introduced, files that were already imported and sorted
+    out of the inbox had no ledger entries and resurfaced as 'new'. This
+    cross-references export_state.sqlite3 (written by macwhisper_export.py) to
+    find those files and silently add them.
+
+    A file is auto-dismissed only when all three hold:
+      1. first_exported_at predates the ledger file — it was pulled before the
+         ledger existed, so it could not have been recorded at import time.
+      2. Its current content hash matches export_state — content hasn't changed
+         since it was pulled, so there is nothing new for the user to review.
+      3. It is present in raw_transcripts/ right now.
+
+    Files exported after the ledger was created are left alone; they are either
+    genuinely new or already in the ledger from a recent import.
+    """
+    if not MACWHISPER_STATE_DB.exists() or not IMPORT_LEDGER_PATH.exists():
+        return False
+    ledger_birth = IMPORT_LEDGER_PATH.stat().st_mtime
+    try:
+        conn = sqlite3.connect(f"file:{MACWHISPER_STATE_DB}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT filename, content_hash, first_exported_at FROM exported_sessions"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return False
+
+    modified = False
+    for row in rows:
+        filename = row["filename"]
+        if filename in ledger:
+            continue
+        try:
+            first_exp = datetime.fromisoformat(row["first_exported_at"]).timestamp()
+        except Exception:
+            continue
+        if first_exp >= ledger_birth:
+            continue  # exported after ledger was created — leave for the user to see
+        raw_path = RAW_TRANSCRIPTS_DIR / filename
+        if not raw_path.exists():
+            continue
+        if _file_content_hash(raw_path) != row["content_hash"]:
+            continue  # content changed since export — may need fresh import
+        ledger[filename] = row["content_hash"]
+        modified = True
+    return modified
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("font/woff2", ".woff2")
@@ -1106,6 +1161,8 @@ def build_router(state: State) -> Router:
             return
         dest = target.resolved_meeting_folder()
         ledger = _load_import_ledger()
+        if _backfill_ledger(ledger):
+            _save_import_ledger(ledger)
         files = []
         if RAW_TRANSCRIPTS_DIR.is_dir():
             for path in sorted(RAW_TRANSCRIPTS_DIR.glob("*.md")):
