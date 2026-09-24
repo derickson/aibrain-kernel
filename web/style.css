@@ -640,6 +640,7 @@ button { cursor: pointer; background: none; border: none; }
 .file-row:last-child { border-bottom: none; }
 .badge.new { color: #7ee0b8; border-color: rgba(62, 207, 154, .35); }
 .badge.overwrite { color: #ff9b8f; border-color: rgba(255, 122, 89, .35); }
+.badge.update { color: #ffd480; border-color: rgba(255, 193, 64, .35); }
 .section-title {
   font: 500 10px 'JetBrains Mono', monospace; letter-spacing: .18em;
   color: var(--fg-mute); margin-top: 6px;
@@ -835,6 +836,26 @@ button { cursor: pointer; background: none; border: none; }
 .todo.drag-over {
   border-color: var(--line-strong); background: rgba(127, 216, 232, .12);
 }
+
+/* ───────────────────────────── confirm modal ──────────────────────────── */
+
+.modal-scrim {
+  position: fixed; inset: 0; background: rgba(2, 4, 8, .72);
+  z-index: 80; display: flex; align-items: center; justify-content: center;
+  animation: fade .15s ease;
+}
+.modal {
+  background: rgba(10, 16, 26, .98); border: 1px solid var(--line-strong);
+  border-radius: 14px; padding: 24px 24px 20px;
+  width: min(420px, 92vw); box-shadow: 0 24px 60px rgba(0, 0, 0, .7);
+  display: flex; flex-direction: column; gap: 18px;
+  animation: modal-in .18s cubic-bezier(.2, .8, .2, 1);
+}
+@keyframes modal-in { from { opacity: 0; transform: scale(.96) translateY(6px); } }
+.modal-message {
+  font: 400 13px/1.65 Manrope, system-ui, sans-serif; color: var(--fg-mid);
+}
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
 /* ───────────────────────────── toasts ────────────────────────────────── */
 

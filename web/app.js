@@ -44,6 +44,20 @@ async function api(path, options) {
   return data;
 }
 
+function appConfirm(message) {
+  return new Promise(resolve => {
+    const scrim = el('div', { class: 'modal-scrim' },
+      el('div', { class: 'modal' },
+        el('p', { class: 'modal-message' }, message),
+        el('div', { class: 'modal-actions' },
+          el('button', { class: 'btn ghost', onclick: () => { scrim.remove(); resolve(false); } }, 'Cancel'),
+          el('button', { class: 'btn primary', onclick: () => { scrim.remove(); resolve(true); } }, 'Confirm'))));
+    scrim.addEventListener('keydown', e => { if (e.key === 'Escape') { scrim.remove(); resolve(false); } });
+    document.body.append(scrim);
+    scrim.querySelector('.btn.primary').focus();
+  });
+}
+
 function toast(message, bad = false) {
   const node = el('div', { class: `toast${bad ? ' bad' : ''}` }, message);
   $('#toasts').append(node);
@@ -1267,7 +1281,7 @@ function renderMeetingsPanel() {
       const files = [...preview.querySelectorAll('input[type=checkbox]:checked')]
         .map(cb => cb.dataset.name);
       if (!files.length) return;
-      if (!confirm(
+      if (!await appConfirm(
         `Copy ${files.length} file${files.length === 1 ? '' : 's'} into ` +
         `${target.name} → ${target.meetingFolder || 'Meetings'}? Files with ` +
         `the same name already there will be overwritten.`
@@ -1277,7 +1291,7 @@ function renderMeetingsPanel() {
       try {
         const { job } = await api('/api/meetings/import', { method: 'POST', body: { files } });
         attachConsole(importConsole, job.id, () => {
-          loadMeetingPreview(preview, importButton);
+          loadMeetingPreview(preview, importButton, dismissButton);
         });
       } catch (err) {
         toast(String(err.message || err), true);
@@ -1286,16 +1300,45 @@ function renderMeetingsPanel() {
     },
   }, 'Import selected');
 
+  const dismissButton = el('button', {
+    class: 'btn ghost', disabled: true,
+    onclick: async () => {
+      const files = [...preview.querySelectorAll('input[type=checkbox]:checked')]
+        .map(cb => cb.dataset.name);
+      if (!files.length) return;
+      if (!await appConfirm(
+        `Mark ${files.length} file${files.length === 1 ? '' : 's'} as already handled? ` +
+        `They will be removed from this list without being copied anywhere.`
+      )) return;
+      try {
+        await api('/api/meetings/dismiss', { method: 'POST', body: { files } });
+        loadMeetingPreview(preview, importButton, dismissButton);
+      } catch (err) {
+        toast(String(err.message || err), true);
+      }
+    },
+  }, 'Dismiss selected');
+
+  const previewSection = el('div', { hidden: true },
+    el('div', { class: 'label mono', style: 'margin-top:4px' }, 'NEW & CHANGED TRANSCRIPTS'),
+    preview,
+    el('div', { class: 'card-actions' }, importButton, dismissButton));
+
+  const showPreview = () => {
+    previewSection.hidden = false;
+    loadMeetingPreview(preview, importButton, dismissButton);
+  };
+
   if (script) {
     const running = (S.status?.jobs || []).find(j => j.name === script.name && j.status === 'running');
     const runButton = el('button', {
       class: 'btn primary',
       onclick: async () => {
-        if (!confirm('Pulling transcripts will quit MacWhisper (it relaunches automatically when done). Continue?')) return;
+        if (!await appConfirm('Pulling transcripts will quit MacWhisper (it relaunches automatically when done). Continue?')) return;
         runButton.disabled = true;
         try {
           const { job } = await api(`/api/script/${script.id}/run`, { method: 'POST', body: { options: [] } });
-          attachConsole(pullConsole, job.id, () => { runButton.disabled = false; loadMeetingPreview(preview, importButton); });
+          attachConsole(pullConsole, job.id, () => { runButton.disabled = false; runButton.textContent = 'Pull from MacWhisper'; showPreview(); });
         } catch (err) {
           toast(String(err.message || err), true);
           runButton.disabled = false;
@@ -1307,28 +1350,27 @@ function renderMeetingsPanel() {
       attachConsole(pullConsole, running.id, () => {
         runButton.disabled = false;
         runButton.textContent = 'Pull from MacWhisper';
-        loadMeetingPreview(preview, importButton);
+        showPreview();
       });
     }
     card.append(el('div', { class: 'card-actions' }, runButton), pullConsole);
   }
 
-  card.append(
-    el('div', { class: 'label mono', style: 'margin-top:4px' }, 'PREVIEW — SELECT WHAT TO IMPORT'),
-    preview,
-    el('div', { class: 'card-actions' }, importButton),
-    importConsole);
+  card.append(previewSection, importConsole);
   panel.append(card);
-  loadMeetingPreview(preview, importButton);
 }
 
-async function loadMeetingPreview(node, importButton) {
+async function loadMeetingPreview(node, importButton, dismissButton) {
   node.innerHTML = '';
+  const setButtons = enabled => {
+    if (importButton) importButton.disabled = !enabled;
+    if (dismissButton) dismissButton.disabled = !enabled;
+  };
   try {
     const { files } = await api('/api/meetings/preview');
     if (!files.length) {
-      node.append(el('div', { class: 'muted' }, 'raw_transcripts/ is empty — nothing staged.'));
-      if (importButton) importButton.disabled = true;
+      node.append(el('div', { class: 'muted' }, 'All transcripts are up to date — nothing to import or dismiss.'));
+      setButtons(false);
       return;
     }
     for (const file of files) {
@@ -1338,10 +1380,10 @@ async function loadMeetingPreview(node, importButton) {
           el('span', { style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, file.name)),
         el('span', { class: `badge ${file.status}` }, file.status.toUpperCase())));
     }
-    if (importButton) importButton.disabled = false;
+    setButtons(true);
   } catch (err) {
     node.append(el('div', { class: 'muted' }, String(err.message || err)));
-    if (importButton) importButton.disabled = true;
+    setButtons(false);
   }
 }
 
@@ -1498,7 +1540,7 @@ function wireStaticHandlers() {
       toast('The macwhisper script is not configured.', true);
       return;
     }
-    if (!confirm('Pulling meeting transcripts will quit MacWhisper (it relaunches automatically when done). Continue?')) return;
+    if (!await appConfirm('Pulling meeting transcripts will quit MacWhisper (it relaunches automatically when done). Continue?')) return;
     try {
       await api(`/api/script/${script.id}/run`, { method: 'POST', body: { options: [] } });
       openDrawer('meetings');

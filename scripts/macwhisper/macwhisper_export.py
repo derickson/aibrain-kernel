@@ -508,20 +508,23 @@ def check_required(live: dict) -> list[str]:
     return out
 
 
-def check_data_shapes(conn: sqlite3.Connection) -> list[str]:
+def check_data_shapes(conn: sqlite3.Connection) -> list[tuple[bool, str]]:
     """(c) Semantic checks on live rows. Cheap, and they catch changes that
-    leave the schema intact (e.g. seconds instead of milliseconds)."""
-    out = []
+    leave the schema intact (e.g. seconds instead of milliseconds).
+
+    Returns (blocking, message) pairs. blocking=False items are informational;
+    the export proceeds despite them."""
+    out: list[tuple[bool, str]] = []
     q = lambda sql, *a: conn.execute(sql, a).fetchall()
 
     # ids are 16-byte UUID blobs
     for t in ("session", "transcriptline", "speaker", "recordedmeeting"):
         bad = q(f"SELECT count(*) FROM {t} WHERE typeof(id)!='blob' OR length(id)!=16")[0][0]
         if bad:
-            out.append(f"{t}.id: {bad} row(s) are not 16-byte blobs")
+            out.append((True, f"{t}.id: {bad} row(s) are not 16-byte blobs"))
     bad = q("SELECT count(*) FROM transcriptline WHERE typeof(sessionId)!='blob' OR length(sessionId)!=16")[0][0]
     if bad:
-        out.append(f"transcriptline.sessionId: {bad} row(s) are not 16-byte blobs")
+        out.append((True, f"transcriptline.sessionId: {bad} row(s) are not 16-byte blobs"))
 
     # datetimes parse with our format
     for t, c in (("session", "dateCreated"), ("recordedmeeting", "date")):
@@ -529,25 +532,25 @@ def check_data_shapes(conn: sqlite3.Connection) -> list[str]:
             try:
                 parse_db_datetime(v)
             except Exception:
-                out.append(f"{t}.{c}: unparseable value {v!r}")
+                out.append((True, f"{t}.{c}: unparseable value {v!r}"))
                 break
     for (v,) in q("SELECT typeof(dateCreated) FROM session GROUP BY 1"):
         if v != "text":
-            out.append(f"session.dateCreated stored as {v}, expected text")
+            out.append((True, f"session.dateCreated stored as {v}, expected text"))
 
     # transcript timing/text types
     bad = q("SELECT count(*) FROM transcriptline WHERE typeof(start)!='integer' OR typeof(\"end\")!='integer'")[0][0]
     if bad:
-        out.append(f"transcriptline.start/end: {bad} row(s) are not integers")
+        out.append((True, f"transcriptline.start/end: {bad} row(s) are not integers"))
     bad = q("SELECT count(*) FROM transcriptline WHERE start > \"end\"")[0][0]
     if bad:
-        out.append(f"transcriptline: {bad} row(s) have start > end")
+        out.append((True, f"transcriptline: {bad} row(s) have start > end"))
     bad = q("SELECT count(*) FROM transcriptline WHERE typeof(text)!='text'")[0][0]
     if bad:
-        out.append(f"transcriptline.text: {bad} row(s) are not text")
+        out.append((True, f"transcriptline.text: {bad} row(s) are not text"))
     bad = q("SELECT count(*) FROM speaker WHERE typeof(name)!='text'")[0][0]
     if bad:
-        out.append(f"speaker.name: {bad} row(s) are not text")
+        out.append((True, f"speaker.name: {bad} row(s) are not text"))
 
     # millisecond sanity: transcript span vs recorded meeting duration (seconds)
     rows = q("""
@@ -561,25 +564,35 @@ def check_data_shapes(conn: sqlite3.Connection) -> list[str]:
     for sid, dur, max_end in rows:
         ratio = max_end / (dur * 1000.0)
         if not (0.2 <= ratio <= 1.5):
-            out.append(f"session {sid[:8]}: transcript ends at {max_end} ms but meeting lasted {dur:.1f} s "
-                       f"(ratio {ratio:.2f}); start/end may no longer be milliseconds")
+            out.append((True, f"session {sid[:8]}: transcript ends at {max_end} ms but meeting lasted {dur:.1f} s "
+                        f"(ratio {ratio:.2f}); start/end may no longer be milliseconds"))
 
-    # exportable sessions should have lines and speaker joins should resolve
+    # Exportable sessions with no transcript lines are skipped gracefully during
+    # export, so a small count is informational. A large count would suggest
+    # MacWhisper moved transcript storage to a new table; treat that as blocking.
     orphan_sessions = q("""
         SELECT count(*) FROM session s
         WHERE s.dateDeleted IS NULL AND s.isTransient = 0 AND s.transcriptionDidSucceed = 1
           AND NOT EXISTS (SELECT 1 FROM transcriptline tl WHERE tl.sessionId = s.id)
     """)[0][0]
+    total_sessions = q("""
+        SELECT count(*) FROM session s
+        WHERE s.dateDeleted IS NULL AND s.isTransient = 0 AND s.transcriptionDidSucceed = 1
+    """)[0][0]
     if orphan_sessions:
-        out.append(f"{orphan_sessions} exportable session(s) have no transcriptline rows; "
-                   f"transcript storage may have moved")
+        orphan_pct = orphan_sessions / total_sessions if total_sessions else 1.0
+        blocking = orphan_pct > 0.5
+        out.append((blocking,
+                    f"{orphan_sessions}/{total_sessions} exportable session(s) have no transcriptline rows"
+                    + ("; transcript storage may have moved" if blocking
+                       else " (will be skipped during export)")))
     dangling = q("""
         SELECT count(*) FROM transcriptline tl
         WHERE tl.speakerID IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM speaker sp WHERE sp.id = tl.speakerID)
     """)[0][0]
     if dangling:
-        out.append(f"{dangling} transcriptline row(s) reference a speakerID with no speaker row")
+        out.append((True, f"{dangling} transcriptline row(s) reference a speakerID with no speaker row"))
     return out
 
 
@@ -591,7 +604,13 @@ def validate(conn: sqlite3.Connection, baseline_path: Path) -> tuple[bool, dict]
     else is printed as informational and the export proceeds."""
     live = capture_schema(conn)
     required = check_required(live)
-    shapes = check_data_shapes(conn) if not required else ["(skipped: required-field contract failed)"]
+    if not required:
+        raw_shapes = check_data_shapes(conn)
+        blocking_shapes = [m for b, m in raw_shapes if b]
+        info_shapes = [m for b, m in raw_shapes if not b]
+    else:
+        blocking_shapes = ["(skipped: required-field contract failed)"]
+        info_shapes = []
 
     if baseline_path.exists():
         base = json.loads(baseline_path.read_text())
@@ -603,17 +622,17 @@ def validate(conn: sqlite3.Connection, baseline_path: Path) -> tuple[bool, dict]
 
     blocking_drift = [m for b, m in drift if b]
     info_drift = [m for b, m in drift if not b]
-    ok = not (required or blocking_drift or shapes)
+    all_info = info_drift + info_shapes
+    ok = not (required or blocking_drift or blocking_shapes)
 
     print(f"validation: live MacWhisper {live['app_version']}, {len(live['tables'])} tables, "
           f"{len(live['migrations'])} migrations")
     print(baseline_note)
 
     if ok:
-        if info_drift:
-            print(f"validation: OK, with {len(info_drift)} informational change(s) outside the tables this "
-                  f"script reads (export continues; run --write-baseline to silence):")
-            for line in info_drift:
+        if all_info:
+            print(f"validation: OK, with {len(all_info)} informational note(s) (export continues):")
+            for line in all_info:
                 print(f"  ~ {line}")
         else:
             print("validation: OK (schema, required fields, and data shapes all match)")
@@ -626,16 +645,16 @@ def validate(conn: sqlite3.Connection, baseline_path: Path) -> tuple[bool, dict]
     print("=" * 78)
     for title, items in (("Required-field contract", required),
                          ("Schema drift in tracked tables", blocking_drift),
-                         ("Data-shape checks", shapes)):
+                         ("Data-shape checks", blocking_shapes)):
         print(f"\n[{title}] BLOCKING")
         if items:
             for line in items:
                 print(f"  {line}")
         else:
             print("  ok")
-    print("\n[Other drift] informational")
-    if info_drift:
-        for line in info_drift:
+    print("\n[Other drift / data notes] informational")
+    if all_info:
+        for line in all_info:
             print(f"  ~ {line}")
     else:
         print("  none")

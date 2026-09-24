@@ -26,9 +26,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .agents import Registry
-from .config import (AGENT_COLORS, REPO_ROOT, VAULT_LINK_DIR, Config,
-                     ScriptConfig, AgentConfig, BrainConfig, discover_vaults,
-                     link_problems, reconcile_brains, slugify)
+from .config import (AGENT_COLORS, DEFAULT_CONFIG_DIR, REPO_ROOT, VAULT_LINK_DIR,
+                     Config, ScriptConfig, AgentConfig, BrainConfig,
+                     discover_vaults, link_problems, reconcile_brains, slugify)
 from .corpus import Corpus, CorpusError
 from .jobs import JobRunner
 
@@ -36,6 +36,32 @@ WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 # Where scripts/macwhisper/macwhisper_export.py stages raw transcripts —
 # see that script's DEFAULT_OUT for the source of truth.
 RAW_TRANSCRIPTS_DIR = REPO_ROOT / "raw_transcripts"
+IMPORT_LEDGER_PATH = DEFAULT_CONFIG_DIR / "meeting_import_ledger.json"
+
+_VOLATILE_FM_RE = re.compile(r"^script_exported_at:.*\n", re.M)
+
+
+def _file_content_hash(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    stripped = _VOLATILE_FM_RE.sub("", text, count=1)
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+
+
+def _load_import_ledger() -> dict[str, str]:
+    """Return {filename: content_hash} for all files previously imported to the vault."""
+    if IMPORT_LEDGER_PATH.exists():
+        try:
+            return json.loads(IMPORT_LEDGER_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_import_ledger(ledger: dict[str, str]) -> None:
+    IMPORT_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = IMPORT_LEDGER_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(IMPORT_LEDGER_PATH)
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("font/woff2", ".woff2")
@@ -1064,20 +1090,36 @@ def build_router(state: State) -> Router:
         """What absorbing raw_transcripts/ into the target vault would do.
 
         Preview only — nothing is copied here; see import_meetings for that.
+
+        Only files that require action are returned:
+          new    — not yet imported into the meeting folder (Inbox)
+          update — still in the meeting folder but content has changed since
+                   the last import (e.g. speaker names were edited in MacWhisper)
+
+        Files already imported and unchanged are silently omitted, as are files
+        the user has moved out of the meeting folder into a project — those are
+        tracked in the import ledger so they do not resurface as "new".
         """
         target = next((b for b in state.cfg.brains if b.meeting_target), None)
         if target is None:
             h.fail("no brain is set as the meeting recording target", 409)
             return
         dest = target.resolved_meeting_folder()
+        ledger = _load_import_ledger()
         files = []
         if RAW_TRANSCRIPTS_DIR.is_dir():
             for path in sorted(RAW_TRANSCRIPTS_DIR.glob("*.md")):
-                files.append({
-                    "name": path.name,
-                    "status": "overwrite" if (dest / path.name).exists() else "new",
-                    "size": path.stat().st_size,
-                })
+                raw_hash = _file_content_hash(path)
+                inbox_path = dest / path.name
+                if inbox_path.exists():
+                    if raw_hash == _file_content_hash(inbox_path):
+                        continue  # in Inbox, no diff — nothing to do
+                    status = "update"
+                else:
+                    if path.name in ledger:
+                        continue  # previously imported and sorted out of Inbox
+                    status = "new"
+                files.append({"name": path.name, "status": status, "size": path.stat().st_size})
         h.json({
             "brainId": target.id, "brainName": target.name,
             "folder": str(dest), "files": files,
@@ -1120,22 +1162,48 @@ def build_router(state: State) -> Router:
         def run(emit: Callable[[str], None]) -> None:
             dest = target.resolved_meeting_folder()
             dest.mkdir(parents=True, exist_ok=True)
+            ledger = _load_import_ledger()
             added = overwritten = 0
             for name in selected:
                 dest_path = dest / name
                 was_there = dest_path.exists()
                 shutil.copy2(staged[name], dest_path)
+                ledger[name] = _file_content_hash(staged[name])
                 if was_there:
                     overwritten += 1
                     emit(f"overwrote {name}")
                 else:
                     added += 1
                     emit(f"added {name}")
+            _save_import_ledger(ledger)
             emit(f"{added} added, {overwritten} overwritten in {dest}")
             state.reindex(emit)
 
         job = state.jobs.run_task(job_name, run)
         h.json({"job": job.to_dict()})
+
+    def dismiss_meetings(h: Handler) -> None:
+        """Mark staged files as already handled without copying them into the vault.
+
+        Adds each named file to the import ledger so it no longer appears in the
+        preview. Use this to clear out transcripts that were imported before the
+        ledger existed, or that the user has already dealt with outside the app.
+        """
+        payload = h.body()
+        staged = {p.name: p for p in RAW_TRANSCRIPTS_DIR.glob("*.md")} if RAW_TRANSCRIPTS_DIR.is_dir() else {}
+        names = payload.get("files")
+        if not isinstance(names, list):
+            h.fail("files must be a list of names")
+            return
+        selected = [n for n in names if isinstance(n, str) and n in staged]
+        if not selected:
+            h.fail("none of the named files are in the staging folder")
+            return
+        ledger = _load_import_ledger()
+        for name in selected:
+            ledger[name] = _file_content_hash(staged[name])
+        _save_import_ledger(ledger)
+        h.json({"ok": True, "dismissed": len(selected)})
 
     def save_agent(h: Handler, agent_id: str) -> None:
         payload = h.body()
@@ -1236,6 +1304,7 @@ def build_router(state: State) -> Router:
     router.get("/api/brains/discover", discover)
     router.get("/api/meetings/preview", meeting_preview)
     router.post("/api/meetings/import", import_meetings)
+    router.post("/api/meetings/dismiss", dismiss_meetings)
     router.post("/api/agent/<agent_id>", save_agent)
     router.post("/api/agent/<agent_id>/remove", remove_agent)
     router.post("/api/agent/<agent_id>/move", move_agent)
