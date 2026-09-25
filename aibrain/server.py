@@ -711,6 +711,10 @@ def build_router(state: State) -> Router:
                     "protocol": a.label(), "enabled": a.enabled,
                     "command": " ".join(a.command), "url": a.url, "cwd": a.cwd,
                     "intro": a.intro, "suggestions": a.suggestions,
+                    # The key itself never leaves the server once saved; the
+                    # UI only needs to know one is configured.
+                    "hasApiKey": bool(a.headers.get("Authorization")),
+                    "groundWithContext": a.ground_with_context,
                 }
                 for a in state.cfg.agents
             ],
@@ -883,6 +887,7 @@ def build_router(state: State) -> Router:
             answer: list[str] = []
             cites: list[dict] = []
             html = ""
+            started = time.monotonic()
             yield {"type": "open", "agent": agent_id}
             try:
                 for event in agent.ask(question, history[:-1]):
@@ -892,11 +897,16 @@ def build_router(state: State) -> Router:
                     if event.type == "cites":
                         cites = payload.get("cites", [])
                         html = payload.get("html", "")
+                    if event.type == "done":
+                        # However the agent measures itself (an a2a agent may
+                        # report its own token usage on the cites event), how
+                        # long the whole turn took is ours to know regardless.
+                        payload["elapsedMs"] = round((time.monotonic() - started) * 1000)
                     yield payload
             except Exception as exc:
                 traceback.print_exc()
                 yield {"type": "error", "text": f"{type(exc).__name__}: {exc}"}
-                yield {"type": "done"}
+                yield {"type": "done", "elapsedMs": round((time.monotonic() - started) * 1000)}
             history.append({"role": "agent", "text": "".join(answer), "cites": cites,
                             "html": html})
 
@@ -1399,6 +1409,19 @@ def _apply_agent(agent: AgentConfig, payload: dict) -> None:
             [s.strip() for s in str(raw).splitlines() if s.strip()]
     if "headers" in payload and isinstance(payload["headers"], dict):
         agent.headers = payload["headers"]
+    if "apiKey" in payload:
+        # The UI sends this only when the field was actually touched, so an
+        # untouched field never wipes a key set in an earlier save. An
+        # explicit clear arrives as "".
+        key = payload["apiKey"]
+        if not isinstance(key, str):
+            raise BadRequest("apiKey must be text")
+        if key:
+            agent.headers = {**agent.headers, "Authorization": f"ApiKey {key}"}
+        else:
+            agent.headers = {k: v for k, v in agent.headers.items() if k != "Authorization"}
+    if "groundWithContext" in payload:
+        agent.ground_with_context = bool(payload["groundWithContext"])
     if "brains" in payload and isinstance(payload["brains"], list):
         agent.brains = payload["brains"]
     if "contextNotes" in payload:

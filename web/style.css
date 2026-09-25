@@ -189,22 +189,35 @@ button { cursor: pointer; background: none; border: none; }
 }
 @keyframes blink { 50% { opacity: 0; } }
 
-.trace {
-  font: 500 10px/1.5 'JetBrains Mono', monospace; letter-spacing: .08em;
-  color: var(--fg-mute); text-transform: uppercase;
-  display: flex; align-items: flex-start; gap: 7px;
-  max-width: 96%; word-break: break-word;
+/* The road to an answer — reasoning, tool calls, plain progress narration —
+   shown as it happens while streaming, then collapsed behind one line once
+   the answer is in. Each step is tagged by kind so "the agent was thinking"
+   reads differently at a glance from "the agent called a tool". */
+.steps { display: flex; flex-direction: column; gap: 5px; max-width: 96%; margin-bottom: 2px; }
+.step {
+  display: flex; align-items: flex-start; gap: 8px;
+  font: 400 12px/1.5 Manrope, system-ui, sans-serif; color: var(--fg-dim);
+  word-break: break-word;
 }
-.trace > span { flex: 1; min-width: 0; }
-.trace::before {
-  content: ''; width: 5px; height: 5px; border-radius: 50%; margin-top: 5px;
-  background: var(--fg-mute); flex: none;
+.step-tag {
+  flex: none; margin-top: 1px; padding: 1px 7px; border-radius: 999px;
+  font: 600 8px 'JetBrains Mono', monospace; letter-spacing: .1em;
+  background: rgba(127, 216, 232, .08); color: var(--fg-mute);
+  border: 1px solid transparent;
 }
-.trace.live::before { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
-@keyframes pulse { 0%, 100% { opacity: .3; } 50% { opacity: 1; } }
-.trace.err { color: #ff8a80; }
-.trace.err::before { background: #ff8a80; }
-.thought { color: var(--fg-faint); font-style: italic; font-size: 13px; line-height: 1.55; }
+.step-text { flex: 1; min-width: 0; }
+.step.live .step-tag { animation: pulse 1.1s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
+.step.k-tool .step-tag { background: rgba(127, 216, 232, .14); color: var(--accent); }
+.step.k-thought { color: var(--fg-faint); font-style: italic; }
+.step.k-thought .step-tag { background: rgba(180, 140, 255, .14); color: #b48cff; }
+.step.k-error { color: #ff8a80; }
+.step.k-error .step-tag { background: rgba(255, 122, 89, .14); color: #ff8a80; }
+
+.msg-meta {
+  font: 500 10px 'JetBrains Mono', monospace; letter-spacing: .08em;
+  color: var(--fg-mute); margin-top: 2px;
+}
 
 .cites-label {
   font-size: 9px; letter-spacing: .18em; color: var(--fg-mute); margin-top: 2px;
@@ -592,7 +605,8 @@ button { cursor: pointer; background: none; border: none; }
 
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field > label { font: 500 9px 'JetBrains Mono', monospace; letter-spacing: .16em; color: var(--fg-mute); }
-.field input[type=text], .field input[type=number], .field textarea, .field select {
+.field input[type=text], .field input[type=number], .field input[type=password],
+.field textarea, .field select {
   background: rgba(10, 16, 26, .7); border: 1px solid rgba(127, 216, 232, .14);
   border-radius: 8px; padding: 8px 11px; outline: none;
   font: 400 13px Manrope, system-ui, sans-serif; color: var(--fg); width: 100%;

@@ -64,14 +64,20 @@ class A2AClient:
         return urllib.request.urlopen(request, timeout=TIMEOUT)
 
     def fetch_card(self) -> dict:
+        # Most A2A servers publish the card at a well-known path under the
+        # origin. Elastic Agent Builder does not: its card lives at
+        # /api/agent_builder/a2a/<agentId>.json, a per-agent URL the user
+        # pastes as-is into "Base URL". Try that literal URL first, then fall
+        # back to the well-known conventions relative to it.
+        candidates = [self.url] + [self.url + path for path in CARD_PATHS]
         errors = []
-        for path in CARD_PATHS:
+        for candidate in candidates:
             try:
-                with self._open(self.url + path) as response:
+                with self._open(candidate) as response:
                     self.card = json.loads(response.read().decode("utf-8"))
                     return self.card
             except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-                errors.append(f"{path}: {exc}")
+                errors.append(f"{candidate}: {exc}")
         raise A2AError("no agent card at " + self.url + " (" + "; ".join(errors[:2]) + ")")
 
     def endpoint(self) -> str:
@@ -209,6 +215,67 @@ def result_text(result: dict) -> tuple[str, str]:
     return parts_text(result), ""
 
 
+def progress_events(message: Any) -> list[Event]:
+    """A status-update's structured step data, as thought/tool events.
+
+    Captured traffic from Elastic Agent Builder shows its status-updates
+    re-announcing, as plain text, exactly what the artifact stream already
+    delivered live — so plain text here is a duplicate and is not turned
+    into an event. A `data` part shaped like one of Agent Builder's own step
+    types (reasoning, tool_call, tool_result) is not duplicated anywhere
+    else, so that part of the split still applies.
+    """
+    if not isinstance(message, dict):
+        return []
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return []
+    events: list[Event] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if (part.get("kind") or part.get("type")) == "data" and isinstance(part.get("data"), dict):
+            events.extend(_step_event(part["data"]))
+    return events
+
+
+def _step_event(data: dict) -> list[Event]:
+    """One Agent Builder step (reasoning / tool_call / tool_result) as an Event."""
+    step = data.get("type") or data.get("step") or ""
+    if step == "reasoning":
+        text = str(data.get("reasoning") or data.get("text") or "").strip()
+        return [Event("thought", text)] if text else []
+    if step in ("tool_call", "tool_result"):
+        tool = data.get("tool_id") or data.get("toolId") or data.get("tool_name") or "tool"
+        call_id = str(data.get("tool_call_id") or data.get("toolCallId") or tool)
+        if step == "tool_call":
+            params = data.get("params") or data.get("arguments") or {}
+            args = ", ".join(f"{k}={v!r}" for k, v in params.items()) if isinstance(params, dict) else ""
+            return [Event("tool", f"{tool}({args})" if args else f"{tool}(…)",
+                          data={"id": call_id, "status": "running"})]
+        return [Event("tool", str(tool), data={"id": call_id, "status": "completed"})]
+    return []
+
+
+def extract_usage(result: dict) -> dict | None:
+    """Token counts, if the server reports them.
+
+    Field names vary by implementation and are not yet pinned down for
+    Elastic Agent Builder specifically, so this checks the shapes seen
+    across agent frameworks rather than one exact one; the summary line
+    just omits token counts when none of them match.
+    """
+    if not isinstance(result, dict):
+        return None
+    for holder in (result, result.get("status") or {}, result.get("metadata") or {}):
+        if not isinstance(holder, dict):
+            continue
+        usage = holder.get("usage") or holder.get("tokenUsage")
+        if isinstance(usage, dict) and usage:
+            return usage
+    return None
+
+
 class A2AAgent(Agent):
     kind = "a2a"
 
@@ -224,8 +291,10 @@ class A2AAgent(Agent):
             yield Event("done")
             return
 
-        yield Event("status", "retrieving context from your brains…")
-        hits = self.retrieve(question)
+        hits = []
+        if self.cfg.ground_with_context:
+            yield Event("status", "retrieving context from your brains…")
+            hits = self.retrieve(question)
 
         try:
             if self.client.card is None:
@@ -242,31 +311,93 @@ class A2AAgent(Agent):
         prompt = _build_prompt(question, self.context_block(hits))
         answer: list[str] = []
         seen_state = ""
+        usage: dict | None = None
+
+        # Elastic Agent Builder streams *everything* — every tool-use round's
+        # narration, and the eventual real synthesis — as `artifact-update`
+        # chunks, all shaped identically. The only way to tell them apart is
+        # `artifactId` plus the spec's own `append` flag: a fresh id, or
+        # `append: false`, starts a new block; nothing in the wire format
+        # says which block is the final one, since even the closing
+        # `lastChunk: true` pings for every block arrive bunched up at the
+        # very end, long after each block's own text finished. So every
+        # block streams live as a "thought" as it's built; whichever one is
+        # still open when the stream ends was never superseded by a later
+        # block, which makes it the answer by elimination — at that point
+        # its thought step is retracted and its text becomes the answer.
+        artifact_id: str | None = None
+        artifact_key = 0
+        artifact_text = ""
 
         try:
             for result in self.client.stream(prompt, self.context_id):
                 cid = result.get("contextId") or (result.get("status") or {}).get("contextId")
                 if cid:
                     self.context_id = cid
-                text, state = result_text(result)
-                if state and state != seen_state:
-                    seen_state = state
-                    if state not in ("completed", "failed"):
-                        yield Event("status", f"task {state}")
+                usage = usage or extract_usage(result)
+
+                kind = result.get("kind") or result.get("type") or ""
+                if kind in ("status-update", "task-status-update"):
+                    # Progress narration lives in the artifact stream below;
+                    # Agent Builder's status-updates just re-announce the
+                    # same text again once a block finishes, so their text is
+                    # not re-emitted here — only the state transition, and
+                    # any step data no other channel carries.
+                    status = result.get("status") or {}
+                    state = status.get("state", "")
+                    if state == "failed":
+                        yield Event("error", parts_text(status.get("message"))
+                                    or "the remote task failed")
+                        continue
+                    if state and state != seen_state:
+                        seen_state = state
+                        if state != "completed":
+                            yield Event("status", f"task {state}")
+                    for evt in progress_events(status.get("message")):
+                        yield evt
+                    continue
+
+                if kind in ("artifact-update", "task-artifact-update"):
+                    aid = (result.get("artifact") or {}).get("artifactId")
+                    text = parts_text(result.get("artifact"))
+                    if not text:
+                        continue
+                    if aid != artifact_id or result.get("append") is False:
+                        artifact_id = aid
+                        artifact_key += 1
+                        artifact_text = ""
+                    artifact_text += text
+                    yield Event("thought", text, data={"key": f"a{artifact_key}"})
+                    continue
+
+                # A plain message (or the non-streaming send() fallback) is
+                # answer content on its own, independent of the artifact
+                # bookkeeping above — most A2A agents that don't use
+                # artifacts at all send their whole reply this way.
+                text, _ = result_text(result)
                 if text:
                     # Streamed chunks are usually cumulative in A2A; only send
-                    # what is genuinely new.
+                    # what is genuinely new. A server that sends true deltas
+                    # instead (never resending the cumulative text) falls
+                    # through to appending the chunk as-is, which is still
+                    # correct — it just means every chunk is "new".
                     joined = "".join(answer)
                     delta = text[len(joined):] if text.startswith(joined) else text
                     if delta:
                         answer.append(delta)
                         yield Event("delta", delta)
-                if state == "failed":
-                    yield Event("error", text or "the remote task failed")
         except A2AError as exc:
             yield Event("error", str(exc))
             yield Event("done")
             return
+
+        if artifact_text:
+            # The last artifact block was still open at the end, so nothing
+            # ever superseded it — promote it: drop its thought step, and use
+            # what it was holding as the answer instead.
+            yield Event("retract", "", data={"key": f"a{artifact_key}"})
+            answer.append(artifact_text)
+            yield Event("delta", artifact_text)
 
         text = "".join(answer)
         if not text.strip():
@@ -278,7 +409,8 @@ class A2AAgent(Agent):
         yield Event("cites", cites=cites,
                     data={"context": [c.to_dict() for c in
                                       self.context_citations(hits, cites)],
-                          "html": self.render_html(text, cites)})
+                          "html": self.render_html(text, cites),
+                          "usage": usage})
         yield Event("done")
 
     def probe(self) -> dict:

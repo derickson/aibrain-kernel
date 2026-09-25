@@ -621,16 +621,45 @@ function renderChat() {
   log.scrollTop = log.scrollHeight;
 }
 
+// What each kind of step means, and how to badge it — the whole point being
+// that a reader can tell "the agent was thinking" from "the agent called a
+// tool" from "the agent said this is the answer" at a glance.
+const STEP_KIND = {
+  status:  { label: 'STEP', cls: 'k-status' },
+  tool:    { label: 'TOOL', cls: 'k-tool' },
+  thought: { label: 'THINKING', cls: 'k-thought' },
+  error:   { label: 'ERROR', cls: 'k-error' },
+};
+
+function stepList(steps) {
+  const box = el('div', { class: 'steps' });
+  for (const step of steps) {
+    const kind = STEP_KIND[step.type] || STEP_KIND.status;
+    box.append(el('div', { class: `step ${kind.cls}${step.live ? ' live' : ''}` },
+      el('span', { class: 'step-tag' }, kind.label),
+      el('span', { class: 'step-text' }, step.text)));
+  }
+  return box;
+}
+
 function renderMessage(message, agent) {
   const wrap = el('div', { class: `msg ${message.role}` });
 
-  for (const line of (message.trace || [])) {
-    wrap.append(el('div', {
-      class: `trace${line.live ? ' live' : ''}${line.kind === 'error' ? ' err' : ''}`,
-    }, el('span', {}, line.text)));
-  }
-  if (message.thought) {
-    wrap.append(el('div', { class: 'bubble thought' }, message.thought));
+  const steps = message.trace || [];
+  if (steps.length && message.streaming) {
+    // Still going: show every step as it happens, most recent still "live".
+    wrap.append(stepList(steps));
+  } else if (steps.length) {
+    // Finished: collapse the whole run behind one line, closed by default —
+    // the answer is the point, not the road that got there.
+    const list = stepList(steps);
+    list.hidden = true;
+    const label = closed => `${closed ? '▸' : '▾'} ${steps.length} step${steps.length === 1 ? '' : 's'}`;
+    const toggle = el('button', {
+      class: 'context-toggle mono',
+      onclick: () => { list.hidden = !list.hidden; toggle.textContent = label(list.hidden); },
+    }, label(true));
+    wrap.append(toggle, list);
   }
 
   if (message.html && !message.streaming) {
@@ -680,7 +709,30 @@ function renderMessage(message, agent) {
     }
     wrap.append(toggle, list);
   }
+
+  if (!message.streaming && message.role === 'agent' && (message.elapsedMs != null || message.usage)) {
+    wrap.append(el('div', { class: 'msg-meta mono' }, formatMeta(message)));
+  }
   return wrap;
+}
+
+// "1.8s · 512 tokens", the way Agent Builder's own chat footer reads —
+// omitting whichever half nobody reported rather than showing a zero.
+function formatMeta(message) {
+  const parts = [];
+  if (message.elapsedMs != null) {
+    parts.push(message.elapsedMs < 1000
+      ? `${message.elapsedMs}ms`
+      : `${(message.elapsedMs / 1000).toFixed(1)}s`);
+  }
+  const usage = message.usage;
+  if (usage) {
+    const total = usage.total_tokens ?? usage.totalTokens ?? usage.total ??
+      ((usage.prompt_tokens ?? usage.promptTokens ?? usage.input_tokens ?? 0)
+        + (usage.completion_tokens ?? usage.completionTokens ?? usage.output_tokens ?? 0));
+    if (total) parts.push(`${total.toLocaleString()} tokens`);
+  }
+  return parts.join(' · ');
 }
 
 // What we can actually back up about each citation. `read` is the only tier
@@ -772,34 +824,55 @@ function send(text) {
     switch (event.type) {
       case 'status':
         reply.trace = [...reply.trace.map(t => ({ ...t, live: false })),
-          { text: event.text, live: true }].slice(-5);
+          { type: 'status', text: event.text, live: true }].slice(-40);
         break;
       case 'tool': {
         // Tool calls report repeatedly as they progress. Key the line by the
         // call's id so it updates in place instead of stacking up, and keep
-        // only the last few so the trace stays a status line, not a log.
+        // only the last few so the trace stays a run of steps, not a log.
         const key = event.id || event.text;
         const line = {
-          key, live: true,
-          text: `⚙ ${event.text}${event.status ? ` · ${event.status}` : ''}`,
+          type: 'tool', key, live: true,
+          text: `${event.text}${event.status ? ` · ${event.status}` : ''}`,
         };
         const rest = reply.trace
           .filter(t => t.key !== key)
           .map(t => ({ ...t, live: false }));
-        reply.trace = [...rest, line].slice(-5);
+        reply.trace = [...rest, line].slice(-40);
         break;
       }
-      case 'thought':
-        reply.thought = (reply.thought || '') + event.text;
+      case 'thought': {
+        // ACP streams a thought token by token with no key, so consecutive
+        // chunks grow the same line. A2A instead sends one complete,
+        // already-separate remark per event, each with its own key, so it
+        // never gets glued onto the previous one even if it arrives right
+        // after it — that gluing (no space between sentences) is the bug
+        // this is fixing.
+        const last = reply.trace[reply.trace.length - 1];
+        const sameLine = last && last.type === 'thought' && last.live
+          && (event.key == null ? last.key == null : last.key === event.key);
+        if (sameLine) {
+          last.text += event.text;
+        } else {
+          reply.trace = [...reply.trace.map(t => ({ ...t, live: false })),
+            { type: 'thought', key: event.key, text: event.text, live: true }].slice(-40);
+        }
         break;
+      }
       case 'delta':
         reply.text += event.text;
         reply.trace = reply.trace.map(t => ({ ...t, live: false }));
+        break;
+      case 'retract':
+        // What was streaming live as a thought turned out to be the answer
+        // instead — drop it from the steps so it isn't shown twice.
+        reply.trace = reply.trace.filter(t => t.key !== event.key);
         break;
       case 'cites':
         reply.cites = event.cites || [];
         reply.context = event.context || [];
         reply.html = event.html || '';
+        reply.usage = event.usage || null;
         // Only real citations pulse in the universe. Lighting up the supplied
         // context too would re-create the impression we are trying to remove.
         if (reply.cites.length) {
@@ -809,9 +882,10 @@ function send(text) {
         break;
       case 'error':
         reply.trace = [...reply.trace.map(t => ({ ...t, live: false })),
-          { text: event.text, kind: 'error' }];
+          { type: 'error', text: event.text }];
         break;
       case 'done':
+        reply.elapsedMs = event.elapsedMs ?? null;
         finish();
         return;
     }
@@ -1102,6 +1176,15 @@ function agentCard(agent) {
     el('input', { type: 'text', 'data-key': key, value: value ?? '', placeholder })
   );
 
+  const groundToggle = hint => el('div', { class: 'field' },
+    el('label', { class: 'switch' },
+      el('input', {
+        type: 'checkbox', 'data-key': 'groundWithContext',
+        ...(agent.groundWithContext ? { checked: true } : {}),
+      }),
+      el('span', {}, 'Ground the question with vault passages (RAG)')),
+    el('div', { class: 'hint' }, hint));
+
   fields.append(
     el('div', { class: 'card-head' },
       el('span', { class: 'pip', style: `background:${agent.color};color:${agent.color}` }),
@@ -1119,13 +1202,48 @@ function agentCard(agent) {
       el('div', { class: 'field' }, el('div', { class: 'hint' },
         'Spoken over stdio. The agent may read and write files under the working '
         + 'directory; tool calls it asks permission for are approved automatically.')),
+      groundToggle(
+        'Off by default: the agent gets the plain question, plus file access to the '
+        + 'vaults and a search_notes tool, so it can look something up itself when it '
+        + 'decides the question needs it. Turn this on to instead hand it passages '
+        + "we searched for up front, on every question, whether it asked or not."),
     );
   } else if (agent.kind === 'a2a') {
+    const apiKeyInput = el('input', {
+      type: 'password', 'data-key': 'apiKey', autocomplete: 'off',
+      style: 'flex:1;min-width:160px',
+      placeholder: agent.hasApiKey ? '•••••••••••• (unchanged)' : 'ApiKey value from Elasticsearch',
+    });
     fields.append(
       input('BASE URL', 'url', agent.url, 'http://localhost:9000'),
       el('div', { class: 'field' }, el('div', { class: 'hint' },
         'The agent card is read from /.well-known/agent-card.json, then messages go '
-        + 'to the endpoint it advertises.')),
+        + 'to the endpoint it advertises. For Elastic Agent Builder, paste its own card '
+        + 'URL instead, e.g. https://kibana:5601/api/agent_builder/a2a/<agent-id>.json.')),
+      el('div', { class: 'field' },
+        el('label', {}, 'ELASTICSEARCH API KEY'),
+        el('div', { class: 'card-actions' },
+          apiKeyInput,
+          agent.hasApiKey ? el('button', {
+            class: 'btn ghost', type: 'button',
+            onclick: async () => {
+              if (!confirm('Clear the stored API key?')) return;
+              try {
+                await api(`/api/agent/${agent.id}`, { method: 'POST', body: { apiKey: '' } });
+                toast('API key cleared');
+                await loadUniverse(true);
+                renderDrawer();
+              } catch (err) { toast(String(err.message || err), true); }
+            },
+          }, 'Clear') : null)),
+      el('div', { class: 'field' }, el('div', { class: 'hint' },
+        'Sent as "Authorization: ApiKey …". Stored server-side only; left blank, a '
+        + 'previously saved key is kept.')),
+      groundToggle(
+        'Off by default: most A2A agents — Elastic Agent Builder among them — run '
+        + 'their own retrieval over their own index, so attaching Obsidian passages '
+        + 'just mixes in an unrelated corpus. Turn this on only for an agent that '
+        + 'expects your notes handed to it.'),
     );
   } else {
     fields.append(el('div', { class: 'field' }, el('div', { class: 'hint' },
@@ -1177,6 +1295,9 @@ function agentCard(agent) {
         onclick: async () => {
           const body = {};
           for (const node of fields.querySelectorAll('[data-key]')) {
+            // An untouched password field must not overwrite a saved key —
+            // only send it when the user actually typed something.
+            if (node.dataset.key === 'apiKey' && !node.value) continue;
             body[node.dataset.key] = node.type === 'checkbox' ? node.checked : node.value;
           }
           try {

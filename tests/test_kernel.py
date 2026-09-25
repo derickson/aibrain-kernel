@@ -39,7 +39,7 @@ from aibrain.agents import LocalAgent                               # noqa: E402
 from aibrain.agents.base import EVIDENCE_ORDER, normalize           # noqa: E402
 from aibrain.config import (AgentConfig, BrainConfig, Config,       # noqa: E402
                             ScriptConfig, default_agents)
-from aibrain.corpus import Corpus, CorpusError, unreachable_message  # noqa: E402
+from aibrain.corpus import Corpus, CorpusError, Hit, unreachable_message  # noqa: E402
 from aibrain.jobs import JobRunner                                  # noqa: E402
 from aibrain.server import (Handler, State, build_router,           # noqa: E402
                             link_name)
@@ -418,6 +418,16 @@ class ServerTests(unittest.TestCase):
         events = self.sse("/api/stream/chat?agent=nope&q=hi")
         self.assertEqual(events[0]["type"], "error")
         self.assertEqual(events[-1]["type"], "done")
+
+    def test_the_done_event_reports_how_long_the_turn_took(self):
+        # However an agent measures itself (an a2a agent may report token
+        # usage on its own), wall-clock elapsed time is the server's to know
+        # regardless of which agent kind answered.
+        events = self.sse("/api/stream/chat?agent=kernel&q=protocols")
+        done = events[-1]
+        self.assertEqual(done["type"], "done")
+        self.assertIsInstance(done["elapsedMs"], int)
+        self.assertGreaterEqual(done["elapsedMs"], 0)
 
     def test_chat_history_is_kept_and_clearable(self):
         self.sse("/api/stream/chat?agent=kernel&q=ramen")
@@ -1000,6 +1010,263 @@ class A2AEndpointTests(unittest.TestCase):
             with self.assertRaises(A2AError, msg=elsewhere):
                 client.endpoint()
 
+    def test_fetch_card_tries_the_configured_url_before_well_known_paths(self):
+        # Elastic Agent Builder publishes the card at a per-agent URL the
+        # user pastes verbatim (/api/agent_builder/a2a/<id>.json), not under
+        # /.well-known/. That literal URL must be tried first.
+        client = self.client(url="https://kibana.example.com/api/agent_builder/a2a/my-agent.json")
+        seen = []
+
+        class FakeResponse:
+            def __init__(self, body: bytes):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(url, data=None, accept="application/json"):
+            seen.append(url)
+            if url == client.url:
+                return FakeResponse(json.dumps({"name": "kibana-agent"}).encode())
+            raise urllib.error.URLError("not found")
+
+        client._open = fake_open
+        card = client.fetch_card()
+        self.assertEqual(card["name"], "kibana-agent")
+        self.assertEqual(seen[0], client.url)
+
+
+class A2AGroundingTests(unittest.TestCase):
+    """Whether the outgoing message carries Obsidian passages at all.
+
+    Most A2A servers — Elastic Agent Builder among them — run their own
+    retrieval over their own index; handing them our passages too just mixes
+    in an unrelated corpus. `ground_with_context` gates that, off by default
+    for new a2a connections.
+    """
+
+    class NoCallCorpus:
+        def search(self, *args, **kwargs):
+            raise AssertionError("must not retrieve local context")
+
+        def render(self, text, resolved):
+            return text
+
+    def make_agent(self, ground_with_context: bool):
+        from aibrain.agents.a2a import A2AAgent
+        cfg = AgentConfig(id="a", name="A", kind="a2a",
+                           url="https://agent.example.com/card.json",
+                           ground_with_context=ground_with_context)
+        agent = A2AAgent(cfg, self.NoCallCorpus(), {})
+        agent.client.card = {"name": "Test agent"}  # skip fetch_card
+        sent = {}
+
+        def fake_stream(text, context_id=None):
+            sent["text"] = text
+            yield {"kind": "message", "role": "agent",
+                   "parts": [{"kind": "text", "text": "ok"}]}
+
+        agent.client.stream = fake_stream
+        return agent, sent
+
+    def test_grounding_off_sends_the_bare_question(self):
+        agent, sent = self.make_agent(ground_with_context=False)
+        list(agent.ask("what is the speed of an A-Wing starfighter?", []))
+        self.assertEqual(sent["text"], "what is the speed of an A-Wing starfighter?")
+
+    def test_grounding_on_retrieves_local_context_first(self):
+        agent, _ = self.make_agent(ground_with_context=True)
+        with self.assertRaises(AssertionError):
+            list(agent.ask("what is the speed of an A-Wing starfighter?", []))
+
+
+class A2AStreamSplitTests(unittest.TestCase):
+    """Progress narration — reasoning, tool calls, "still working" — must
+    never leak into the answer text as raw JSON; each becomes its own event.
+
+    This is the bug behind "the streamed answer has an ugly thinking/tool
+    section mixed into it": every text-bearing status-update used to be
+    concatenated straight into the answer alongside the real message.
+    """
+
+    def test_a_reasoning_step_becomes_a_thought(self):
+        from aibrain.agents.a2a import progress_events
+        events = progress_events({"parts": [
+            {"kind": "data", "data": {"type": "reasoning",
+                                      "reasoning": "Checking the ship registry…"}},
+        ]})
+        self.assertEqual([(e.type, e.text) for e in events],
+                         [("thought", "Checking the ship registry…")])
+
+    def test_a_tool_call_and_its_result_share_one_id(self):
+        from aibrain.agents.a2a import progress_events
+        call = progress_events({"parts": [
+            {"kind": "data", "data": {"type": "tool_call", "tool_id": "search_notes",
+                                      "tool_call_id": "call-1", "params": {"query": "a-wing"}}},
+        ]})
+        result = progress_events({"parts": [
+            {"kind": "data", "data": {"type": "tool_result", "tool_id": "search_notes",
+                                      "tool_call_id": "call-1"}},
+        ]})
+        self.assertEqual(call[0].type, "tool")
+        self.assertEqual(call[0].data["status"], "running")
+        self.assertIn("search_notes", call[0].text)
+        self.assertEqual(result[0].data, {"id": "call-1", "status": "completed"})
+        self.assertEqual(call[0].data["id"], result[0].data["id"])
+
+    def test_a_status_updates_plain_text_is_not_re_emitted(self):
+        # Captured traffic: Agent Builder's status-update re-announces, as
+        # plain text, exactly what the artifact stream already delivered —
+        # so this is a duplicate, not a new event.
+        from aibrain.agents.a2a import progress_events
+        events = progress_events({"parts": [{"kind": "text", "text": "Searching the index…"}]})
+        self.assertEqual(events, [])
+
+    def test_full_stream_keeps_progress_out_of_the_answer(self):
+        from aibrain.agents.a2a import A2AAgent
+        cfg = AgentConfig(id="a", name="A", kind="a2a", url="https://agent.example.com/card.json")
+        agent = A2AAgent(cfg, A2AGroundingTests.NoCallCorpus(), {})
+        agent.client.card = {"name": "Test agent"}
+
+        def fake_stream(text, context_id=None):
+            yield {"kind": "status-update", "status": {"state": "working", "message": {
+                "parts": [{"kind": "data", "data": {
+                    "type": "reasoning", "reasoning": "Thinking about A-Wings"}}]}}}
+            yield {"kind": "status-update", "status": {"state": "working", "message": {
+                "parts": [{"kind": "data", "data": {
+                    "type": "tool_call", "tool_id": "search_notes",
+                    "tool_call_id": "c1", "params": {"query": "a-wing"}}}]}}}
+            yield {"kind": "message", "role": "agent",
+                   "parts": [{"kind": "text", "text": "An A-Wing does Mach 1,300."}]}
+
+        agent.client.stream = fake_stream
+        events = list(agent.ask("what is the speed of an A-Wing?", []))
+        deltas = "".join(e.text for e in events if e.type == "delta")
+        self.assertEqual(deltas, "An A-Wing does Mach 1,300.")
+        self.assertTrue(any(e.type == "thought" for e in events))
+        self.assertTrue(any(e.type == "tool" for e in events))
+
+    def test_artifact_streams_are_grouped_by_id_and_the_last_open_one_wins(self):
+        # Captured from the real "RPG Expert" (Elastic Agent Builder) agent:
+        # every tool-use round's narration AND the eventual real synthesis
+        # all stream as `artifact-update` chunks, indistinguishable in shape.
+        # A fresh artifactId (or an explicit append:false) starts a new
+        # block; true per-token deltas within one block never "look" like
+        # they extend each other textually, which is exactly why grouping
+        # has to go by id/append and not by string prefix-matching.
+        from aibrain.agents.a2a import A2AAgent
+
+        def artifact(aid, text, append):
+            return {"kind": "artifact-update", "append": append, "lastChunk": False,
+                    "artifact": {"artifactId": aid, "parts": [{"kind": "text", "text": text}]}}
+
+        cfg = AgentConfig(id="a", name="A", kind="a2a", url="https://agent.example.com/card.json")
+        agent = A2AAgent(cfg, A2AGroundingTests.NoCallCorpus(), {})
+        agent.client.card = {"name": "Test agent"}
+
+        def fake_stream(text, context_id=None):
+            # First block: narration, several true (non-cumulative) deltas.
+            yield artifact("art-1", "I'll", False)
+            yield artifact("art-1", " start by", True)
+            yield artifact("art-1", " searching the rules.", True)
+            # Second block: the real answer, also many small true deltas.
+            yield artifact("art-2", "An", False)
+            yield artifact("art-2", " A-Wing", True)
+            yield artifact("art-2", " does Mach 1,300.", True)
+            # Both blocks' closing pings arrive bunched up at the very end,
+            # well after each one's own text was already fully sent.
+            yield artifact("art-1", "", True)
+            yield artifact("art-2", "", True)
+
+        agent.client.stream = fake_stream
+        events = list(agent.ask("what is the speed of an A-Wing?", []))
+
+        deltas = "".join(e.text for e in events if e.type == "delta")
+        self.assertEqual(deltas, "An A-Wing does Mach 1,300.")
+
+        thoughts = "".join(e.text for e in events if e.type == "thought" and e.data.get("key") == "a1")
+        self.assertEqual(thoughts, "I'll start by searching the rules.")
+        # The second block streamed live as a thought too — until it turned
+        # out to be the answer, at which point it must be retracted so the
+        # UI doesn't show it twice.
+        self.assertTrue(any(e.type == "thought" and e.data.get("key") == "a2" for e in events))
+        self.assertTrue(any(e.type == "retract" and e.data.get("key") == "a2" for e in events))
+
+    def test_a_single_artifact_block_streams_live_as_it_grows(self):
+        # No second block ever arrives — the one open block simply is the
+        # answer, and its individual delta chunks should still have gone
+        # out live as thought events with a stable key (for merging) before
+        # being retracted and promoted at the end.
+        from aibrain.agents.a2a import A2AAgent
+
+        def artifact(text, append):
+            return {"kind": "artifact-update", "append": append, "lastChunk": False,
+                    "artifact": {"artifactId": "only", "parts": [{"kind": "text", "text": text}]}}
+
+        cfg = AgentConfig(id="a", name="A", kind="a2a", url="https://agent.example.com/card.json")
+        agent = A2AAgent(cfg, A2AGroundingTests.NoCallCorpus(), {})
+        agent.client.card = {"name": "Test agent"}
+
+        def fake_stream(text, context_id=None):
+            yield artifact("Mach", False)
+            yield artifact(" 1,300", True)
+            yield artifact(".", True)
+
+        agent.client.stream = fake_stream
+        events = list(agent.ask("how fast?", []))
+        thought_keys = {e.data.get("key") for e in events if e.type == "thought"}
+        self.assertEqual(thought_keys, {"a1"})
+        self.assertTrue(any(e.type == "retract" and e.data.get("key") == "a1" for e in events))
+        deltas = "".join(e.text for e in events if e.type == "delta")
+        self.assertEqual(deltas, "Mach 1,300.")
+
+
+class AcpGroundingTests(unittest.TestCase):
+    """The clean question goes out; a search tool is offered instead, not a
+    prompt we pre-stuffed with our own keyword search on every turn."""
+
+    class NoCallCorpus:
+        def search(self, *args, **kwargs):
+            raise AssertionError("must not retrieve local context")
+
+        def render(self, text, resolved):
+            return text
+
+    class FakeConnection:
+        def __init__(self):
+            self.opened: dict = {}
+            self.sent: str | None = None
+
+        def prompt(self, text):
+            self.sent = text
+            yield {"update": {"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "ok"}}}
+
+    def make_agent(self, ground_with_context: bool):
+        from aibrain.agents.acp import ACPAgent
+        cfg = AgentConfig(id="a", name="A", kind="acp", command=["true"],
+                           ground_with_context=ground_with_context)
+        agent = ACPAgent(cfg, self.NoCallCorpus(), {})
+        conn = self.FakeConnection()
+        agent._ensure = lambda: conn
+        return agent, conn
+
+    def test_grounding_off_sends_the_bare_question(self):
+        agent, conn = self.make_agent(ground_with_context=False)
+        list(agent.ask("what is the speed of an A-Wing starfighter?", []))
+        self.assertEqual(conn.sent, "what is the speed of an A-Wing starfighter?")
+
+    def test_grounding_on_retrieves_local_context_first(self):
+        agent, _ = self.make_agent(ground_with_context=True)
+        with self.assertRaises(AssertionError):
+            list(agent.ask("what is the speed of an A-Wing starfighter?", []))
+
 
 class LinkNameTests(unittest.TestCase):
     """`add_brain` turns a supplied name into a file inside obsidian_vaults/."""
@@ -1522,29 +1789,107 @@ class McpProtocolTests(unittest.TestCase):
         self.assertEqual(replies[1]["id"], 9)
 
 
-class AcpRegistrationTests(unittest.TestCase):
-    """The to-do server has to reach the agent through `session/new`."""
+class McpSearchTests(unittest.TestCase):
+    """`search_notes`: what an ACP agent gets back when it decides to look
+    something up, instead of us handing it passages unasked."""
 
-    def connection(self):
+    class FakeSearchCorpus:
+        def __init__(self, hits: list[Hit]):
+            self.hits = hits
+            self.seen_brain_ids: list[str] | None = "not called"
+            self.seen_limit: int | None = None
+
+        def search(self, query, limit=60, brain_ids=None, any_terms=False):
+            self.seen_brain_ids = brain_ids
+            self.seen_limit = limit
+            return self.hits[:limit]
+
+        def status(self):
+            return {"brains": [{"id": "grognard", "name": "Grognard"}]}
+
+    def test_a_match_lists_title_brain_path_and_a_snippet(self):
+        from aibrain.mcp_search import SearchTools
+        hits = [Hit(note_id=1, title="Interceptor", brain_id="grognard",
+                    source="grognard", rel_path="wiki/is/wiki/Interceptor.md",
+                    snippet="takes a beating and gives one back")]
+        tools = SearchTools(self.FakeSearchCorpus(hits))
+        text = tools.call("search_notes", {"query": "interceptor"})
+        self.assertIn("[[Interceptor]]", text)
+        self.assertIn("Grognard", text)
+        self.assertIn("wiki/is/wiki/Interceptor.md", text)
+        self.assertIn("takes a beating", text)
+
+    def test_no_matches_says_so_plainly(self):
+        from aibrain.mcp_search import SearchTools
+        tools = SearchTools(self.FakeSearchCorpus([]))
+        text = tools.call("search_notes", {"query": "nothing like this exists"})
+        self.assertIn("No notes match", text)
+
+    def test_brain_scoping_reaches_the_search_call(self):
+        from aibrain.mcp_search import SearchTools
+        corpus = self.FakeSearchCorpus([])
+        SearchTools(corpus, brain_ids=["grognard"]).call(
+            "search_notes", {"query": "anything"})
+        self.assertEqual(corpus.seen_brain_ids, ["grognard"])
+
+    def test_the_limit_is_clamped_not_trusted(self):
+        from aibrain.mcp_search import MAX_LIMIT, SearchTools
+        corpus = self.FakeSearchCorpus([])
+        SearchTools(corpus).call("search_notes", {"query": "n", "limit": 9999})
+        self.assertEqual(corpus.seen_limit, MAX_LIMIT)
+
+    def test_an_empty_query_is_not_sent_to_the_corpus(self):
+        from aibrain.mcp_search import SearchTools
+
+        class RefusingCorpus:
+            def search(self, *a, **k):
+                raise AssertionError("must not search for an empty query")
+
+        text = SearchTools(RefusingCorpus()).call("search_notes", {"query": "  "})
+        self.assertIn("Nothing to search for", text)
+
+
+class AcpRegistrationTests(unittest.TestCase):
+    """Both MCP servers have to reach the agent through `session/new`."""
+
+    def connection(self, brains=()):
         from aibrain.agents.acp import ACPConnection
         return ACPConnection(["true"], "/tmp", {},
-                             core_url="http://127.0.0.1:8781")
+                             core_url="http://127.0.0.1:8781", brains=list(brains))
 
-    def test_the_todo_server_is_offered_as_a_stdio_server(self):
-        servers = self.connection().mcp_servers()
-        self.assertEqual(len(servers), 1)
-        server = servers[0]
-        self.assertEqual(server["type"], "stdio")
-        self.assertEqual(server["name"], "aibrain-todo")
-        self.assertEqual(server["args"], ["-m", "aibrain.mcp_todo"])
-        self.assertTrue(server["command"])
+    def servers_by_name(self, brains=()):
+        return {s["name"]: s for s in self.connection(brains).mcp_servers()}
+
+    def test_the_todo_and_search_servers_are_offered_as_stdio_servers(self):
+        servers = self.servers_by_name()
+        self.assertEqual(set(servers), {"aibrain-todo", "aibrain-search"})
+        for name, args in (("aibrain-todo", ["-m", "aibrain.mcp_todo"]),
+                           ("aibrain-search", ["-m", "aibrain.mcp_search"])):
+            self.assertEqual(servers[name]["type"], "stdio")
+            self.assertEqual(servers[name]["args"], args)
+            self.assertTrue(servers[name]["command"])
 
     def test_the_child_is_told_where_the_corpus_and_the_package_are(self):
-        env = {e["name"]: e["value"] for e in self.connection().mcp_servers()[0]["env"]}
-        self.assertEqual(env["AIBRAIN_CORE_URL"], "http://127.0.0.1:8781")
-        # The agent starts the child in the user's project, so the import path
-        # has to be spelled out or `-m aibrain.mcp_todo` finds nothing.
-        self.assertTrue((Path(env["PYTHONPATH"]) / "aibrain" / "mcp_todo.py").is_file())
+        for server in self.servers_by_name().values():
+            env = {e["name"]: e["value"] for e in server["env"]}
+            self.assertEqual(env["AIBRAIN_CORE_URL"], "http://127.0.0.1:8781")
+            # The agent starts the child in the user's project, so the import
+            # path has to be spelled out or `-m aibrain.mcp_*` finds nothing.
+            module = server["args"][1].rsplit(".", 1)[1]
+            self.assertTrue((Path(env["PYTHONPATH"]) / "aibrain" / f"{module}.py").is_file())
+
+    def test_the_search_server_is_scoped_to_the_agents_own_brains(self):
+        servers = self.servers_by_name()
+        env = {e["name"]: e["value"] for e in servers["aibrain-search"]["env"]}
+        self.assertNotIn("AIBRAIN_SEARCH_BRAINS", env)
+
+        scoped = self.servers_by_name(brains=["alpha", "beta"])
+        env = {e["name"]: e["value"] for e in scoped["aibrain-search"]["env"]}
+        self.assertEqual(env["AIBRAIN_SEARCH_BRAINS"], "alpha,beta")
+        # The to-do server sees the same corpus regardless; brain scoping is
+        # a search-tool concern, not a to-do-list one.
+        self.assertNotIn("AIBRAIN_SEARCH_BRAINS",
+                         {e["name"] for e in scoped["aibrain-todo"]["env"]})
 
 
 class AcpPermissionTests(unittest.TestCase):

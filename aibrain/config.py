@@ -110,10 +110,16 @@ class AgentConfig:
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
 
-    # retrieval context handed to remote agents
+    # Whether we pre-fetch passages and stuff them into the prompt, versus
+    # sending the clean question and letting the agent search on its own
+    # (an MCP tool for acp, its own retrieval for a2a). Off by default: an
+    # a2a agent like Elastic Agent Builder runs its own index, and an acp
+    # agent like Claude Code or Codex can call `search_notes` itself when it
+    # decides the question needs it, which beats us guessing on every turn.
+    ground_with_context: bool = False
     context_notes: int = 6
     context_chars: int = 1200
-    brains: list[str] = field(default_factory=list)  # empty == all
+    brains: list[str] = field(default_factory=list)  # empty == all; also scopes the acp search tool
 
     def label(self) -> str:
         if self.protocol:

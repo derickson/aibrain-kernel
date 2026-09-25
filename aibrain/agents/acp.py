@@ -52,13 +52,16 @@ class ACPConnection:
 
     def __init__(self, command: list[str], cwd: str, env: dict[str, str],
                  log: Any = None, roots: list[Path] | None = None,
-                 core_url: str | None = None):
+                 core_url: str | None = None, brains: list[str] | None = None):
         self.command = command
         self.cwd = cwd or os.getcwd()
         self.env = env
         # Where our own MCP server should look for the corpus. Held here
         # because `session/new` is what hands it to the agent.
         self.core_url = core_url or ""
+        # Which brains the search tool may see — empty means all of them,
+        # the same scope the agent's own config already applies elsewhere.
+        self.brains = list(brains or [])
         # Directories the agent may read and write. The session directory is
         # always one; the vaults are added because reading the notes behind a
         # brain is the whole point of connecting a coding agent to it.
@@ -373,8 +376,11 @@ class ACPConnection:
     def mcp_servers(self) -> list[dict]:
         """The MCP servers the agent gets for this session.
 
-        One, for now: the to-do list. It travels through the same `session/new`
-        field `additionalDirectories` does, so the adapter is already known to
+        The to-do list, and a search tool over the note index so the agent
+        can look something up when it decides it needs to, rather than us
+        deciding for it on every turn by stuffing the prompt with our own
+        keyword search. Both travel through the same `session/new` field
+        `additionalDirectories` does, so the adapter is already known to
         accept it. The child is launched by the agent, not by us, so it
         inherits none of our environment — PYTHONPATH is spelled out because
         the agent's cwd is the user's project, not this repo.
@@ -382,13 +388,25 @@ class ACPConnection:
         env = [{"name": "PYTHONPATH", "value": str(PACKAGE_ROOT)}]
         if self.core_url:
             env.append({"name": "AIBRAIN_CORE_URL", "value": self.core_url})
-        return [{
-            "type": "stdio",
-            "name": "aibrain-todo",
-            "command": sys.executable or "python3",
-            "args": ["-m", "aibrain.mcp_todo"],
-            "env": env,
-        }]
+        search_env = list(env)
+        if self.brains:
+            search_env.append({"name": "AIBRAIN_SEARCH_BRAINS", "value": ",".join(self.brains)})
+        return [
+            {
+                "type": "stdio",
+                "name": "aibrain-todo",
+                "command": sys.executable or "python3",
+                "args": ["-m", "aibrain.mcp_todo"],
+                "env": env,
+            },
+            {
+                "type": "stdio",
+                "name": "aibrain-search",
+                "command": sys.executable or "python3",
+                "args": ["-m", "aibrain.mcp_search"],
+                "env": search_env,
+            },
+        ]
 
     def new_session(self, cwd: str) -> str:
         # Tell the agent which directories are legitimately part of this
@@ -503,7 +521,8 @@ class ACPAgent(Agent):
             cwd = self.cfg.cwd or str(Path.cwd())
             conn = ACPConnection(self.cfg.command, cwd, self.cfg.env, self._note,
                                  roots=self.vault_roots,
-                                 core_url=self.corpus.base_url)
+                                 core_url=self.corpus.base_url,
+                                 brains=self.cfg.brains)
             conn.start()
             conn.initialize()
             conn.new_session(cwd)
@@ -511,8 +530,10 @@ class ACPAgent(Agent):
             return conn
 
     def ask(self, question: str, history: list[dict]) -> Iterator[Event]:
-        yield Event("status", "retrieving context from your brains…")
-        hits = self.retrieve(question)
+        hits = []
+        if self.cfg.ground_with_context:
+            yield Event("status", "retrieving context from your brains…")
+            hits = self.retrieve(question)
 
         try:
             yield Event("status", f"connecting over ACP ({self.cfg.command[0]})…")
@@ -522,7 +543,12 @@ class ACPAgent(Agent):
             yield Event("done")
             return
 
-        prompt = _build_prompt(question, self.context_block(hits), self.brain_names)
+        # The clean question, not a prompt we stuffed with our own keyword
+        # search: the agent has file access to the vaults and the
+        # `search_notes` MCP tool, so it can look something up itself when it
+        # decides the question needs it, rather than us guessing on every turn.
+        prompt = _build_prompt(question, self.context_block(hits), self.brain_names) \
+            if self.cfg.ground_with_context else question
         answer: list[str] = []
         conn.opened.clear()   # evidence is per-turn, not per-session
 
