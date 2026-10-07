@@ -39,6 +39,8 @@ WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 # see that script's DEFAULT_OUT for the source of truth.
 RAW_TRANSCRIPTS_DIR = REPO_ROOT / "raw_transcripts"
 IMPORT_LEDGER_PATH = DEFAULT_CONFIG_DIR / "meeting_import_ledger.json"
+# Written once the pre-ledger backfill has run, so it never runs again.
+LEDGER_BACKFILL_MARKER = DEFAULT_CONFIG_DIR / "meeting_import_ledger.backfilled"
 MACWHISPER_STATE_DB = REPO_ROOT / "scripts/macwhisper/export_state.sqlite3"
 
 _VOLATILE_FM_RE = re.compile(r"^script_exported_at:.*\n", re.M)
@@ -84,7 +86,13 @@ def _backfill_ledger(ledger: dict[str, str]) -> bool:
 
     Files exported after the ledger was created are left alone; they are either
     genuinely new or already in the ledger from a recent import.
+
+    Runs once only (see LEDGER_BACKFILL_MARKER). The ledger's mtime moves on
+    every save, so using it as "birth" on every call kept pushing the cutoff
+    forward and silently dismissed genuinely new files.
     """
+    if LEDGER_BACKFILL_MARKER.exists():
+        return False
     if not MACWHISPER_STATE_DB.exists() or not IMPORT_LEDGER_PATH.exists():
         return False
     ledger_birth = IMPORT_LEDGER_PATH.stat().st_mtime
@@ -1176,6 +1184,8 @@ def build_router(state: State) -> Router:
         ledger = _load_import_ledger()
         if _backfill_ledger(ledger):
             _save_import_ledger(ledger)
+        LEDGER_BACKFILL_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        LEDGER_BACKFILL_MARKER.touch()
         files = []
         if RAW_TRANSCRIPTS_DIR.is_dir():
             for path in sorted(RAW_TRANSCRIPTS_DIR.glob("*.md")):

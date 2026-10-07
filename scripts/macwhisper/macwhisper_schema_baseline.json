@@ -1,5 +1,5 @@
 {
-  "app_version": "15.1.1 (1513)",
+  "app_version": "15.3 (1530)",
   "migrations": [
     "Create 'session' table",
     "Create 'transcriptline' table",
@@ -73,7 +73,10 @@
     "Index originalFilename in sessionFTS",
     "Create 'spotlightSyncQueue' table and triggers",
     "Watch isIncomingLiveStream in the spotlightSyncQueue session trigger",
-    "Add virtual library folders"
+    "Add virtual library folders",
+    "Link finalized live meetings to recordedmeeting rows",
+    "Add speakerRecognitionModel column to session table",
+    "Add isFromWatchFolder column to session table"
   ],
   "tables": {
     "dictation": {
@@ -846,9 +849,21 @@
           "notnull": 1,
           "pk": 0,
           "type": "BOOLEAN"
+        },
+        {
+          "name": "speakerRecognitionModel",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "name": "isFromWatchFolder",
+          "notnull": 1,
+          "pk": 0,
+          "type": "BOOLEAN"
         }
       ],
-      "sql": "CREATE TABLE \"session\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"dateLastOpened\" DATETIME, \"textPreview\" TEXT, \"aiSummary\" TEXT, \"fullText\" TEXT, \"userChosenTitle\" TEXT, \"transcriptionDidSucceed\" BOOLEAN, \"modelEngine\" TEXT, \"modelIdentifer\" TEXT, \"modelInputLanguage\" TEXT, \"hasBeenDiarized\" BOOLEAN NOT NULL DEFAULT 0, \"detectedLanguage\" TEXT, \"isMergedFromMultipleTracks\" BOOLEAN NOT NULL DEFAULT 0, \"isFromYoutube\" BOOLEAN NOT NULL DEFAULT 0, \"originalFilename\" TEXT, \"originalExtension\" TEXT, \"startTimeOffset\" DOUBLE NOT NULL DEFAULT 0.0, \"wasTranslatedToEnglishDuringTranscription\" BOOLEAN NOT NULL DEFAULT 0, \"timeTakenToTranscribe\" DOUBLE, \"playbackDuration\" DOUBLE, \"sourceAppBundleID\" TEXT, \"aiSummaryShort\" TEXT, \"recordedMeetingID\" BLOB, \"systemAudioRecordingID\" BLOB, \"isTransient\" BOOLEAN NOT NULL DEFAULT 0, \"voiceMemoID\" BLOB, \"podcastID\" BLOB, \"importedFromDefaults\" BOOLEAN NOT NULL DEFAULT 0, \"isBeingRetranscribed\" BOOLEAN NOT NULL DEFAULT 0, \"dateRetranscribed\" DATETIME, \"downloadMetadataID\" BLOB, \"aiTitle\" TEXT, \"originalFileHash\" TEXT, \"dateDeleted\" DOUBLE, \"wasImportedFromWhisperFile\" BOOLEAN NOT NULL DEFAULT 0, \"isIncomingLiveStream\" BOOLEAN NOT NULL DEFAULT 0)"
+      "sql": "CREATE TABLE \"session\" (\"id\" BLOB PRIMARY KEY NOT NULL, \"dateCreated\" DATETIME NOT NULL, \"dateUpdated\" DATETIME, \"dateLastOpened\" DATETIME, \"textPreview\" TEXT, \"aiSummary\" TEXT, \"fullText\" TEXT, \"userChosenTitle\" TEXT, \"transcriptionDidSucceed\" BOOLEAN, \"modelEngine\" TEXT, \"modelIdentifer\" TEXT, \"modelInputLanguage\" TEXT, \"hasBeenDiarized\" BOOLEAN NOT NULL DEFAULT 0, \"detectedLanguage\" TEXT, \"isMergedFromMultipleTracks\" BOOLEAN NOT NULL DEFAULT 0, \"isFromYoutube\" BOOLEAN NOT NULL DEFAULT 0, \"originalFilename\" TEXT, \"originalExtension\" TEXT, \"startTimeOffset\" DOUBLE NOT NULL DEFAULT 0.0, \"wasTranslatedToEnglishDuringTranscription\" BOOLEAN NOT NULL DEFAULT 0, \"timeTakenToTranscribe\" DOUBLE, \"playbackDuration\" DOUBLE, \"sourceAppBundleID\" TEXT, \"aiSummaryShort\" TEXT, \"recordedMeetingID\" BLOB, \"systemAudioRecordingID\" BLOB, \"isTransient\" BOOLEAN NOT NULL DEFAULT 0, \"voiceMemoID\" BLOB, \"podcastID\" BLOB, \"importedFromDefaults\" BOOLEAN NOT NULL DEFAULT 0, \"isBeingRetranscribed\" BOOLEAN NOT NULL DEFAULT 0, \"dateRetranscribed\" DATETIME, \"downloadMetadataID\" BLOB, \"aiTitle\" TEXT, \"originalFileHash\" TEXT, \"dateDeleted\" DOUBLE, \"wasImportedFromWhisperFile\" BOOLEAN NOT NULL DEFAULT 0, \"isIncomingLiveStream\" BOOLEAN NOT NULL DEFAULT 0, \"speakerRecognitionModel\" TEXT, \"isFromWatchFolder\" BOOLEAN NOT NULL DEFAULT 0)"
     },
     "sessionFTS": {
       "columns": [

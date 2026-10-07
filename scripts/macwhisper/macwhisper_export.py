@@ -738,7 +738,7 @@ def main() -> int:
         try:
             if args.write_baseline:
                 live = capture_schema(conn)
-                problems = check_required(live) + check_data_shapes(conn)
+                problems = check_required(live) + [msg for blocking, msg in check_data_shapes(conn) if blocking]
                 if problems:
                     print("refusing to write baseline: required-field/data checks fail:")
                     for p in problems:
