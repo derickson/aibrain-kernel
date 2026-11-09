@@ -447,14 +447,68 @@ function openSearchView() {
   renderResults();
 }
 
-function toggleWide() {
-  const order = ['', 'wide', 'full'];
+/** The ⇤ button: the notes panel over the whole window, or back. Dragging
+ *  its edge (see makeResizable) sets every width in between. */
+function toggleWide(force) {
   const right = $('#right');
-  const next = order[(order.indexOf(right.dataset.wide || '') + 1) % order.length];
-  right.dataset.wide = next;
-  $('#right-wide').textContent = next === 'full' ? '⇥' : '⇤';
-  $('#right-wide').title = next === 'full' ? 'Narrow the notes panel' : 'Widen the notes panel';
-  try { localStorage.setItem('aibrain.rightWide', next); } catch { /* fine */ }
+  const full = force ?? right.dataset.wide !== 'full';
+  right.dataset.wide = full ? 'full' : '';
+  $('#right-wide').textContent = full ? '⇥' : '⇤';
+  $('#right-wide').title = full ? 'Back to the side' : 'Fill the window';
+  try { localStorage.setItem('aibrain.rightWide', full ? 'full' : ''); } catch { /* fine */ }
+}
+
+/**
+ * A drag handle on a panel's inner edge. The width is kept as a share of
+ * the window (so it scales with it) in localStorage; double-click the
+ * handle to go back to the default.
+ */
+function makeResizable(panel, edge) {
+  const key = `aibrain.width.${panel.id}`;
+  const MIN = 260;
+  const apply = frac => {
+    if (frac == null) { panel.style.removeProperty('--user-w'); delete panel.dataset.sized; return; }
+    const px = Math.max(MIN, Math.min(window.innerWidth - 160, frac * window.innerWidth));
+    panel.style.setProperty('--user-w', `${Math.round(px)}px`);
+    panel.dataset.sized = '';
+  };
+  let saved = null;
+  try { saved = parseFloat(localStorage.getItem(key)); } catch { /* fine */ }
+  if (saved > 0 && saved < 1) apply(saved);
+
+  const handle = el('div', { class: `resize-handle ${edge}`, title: 'Drag to resize · double-click to reset' });
+  panel.append(handle);
+  handle.addEventListener('pointerdown', event => {
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    document.body.classList.add('resizing');
+    if (panel.dataset.wide === 'full') toggleWide(false);
+    const rect = panel.getBoundingClientRect();
+    const move = e => {
+      const width = edge === 'left' ? rect.right - e.clientX : e.clientX - rect.left;
+      apply(width / window.innerWidth);
+    };
+    const up = () => {
+      handle.releasePointerCapture(event.pointerId);
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      document.body.classList.remove('resizing');
+      const width = parseFloat(panel.style.getPropertyValue('--user-w'));
+      try { if (width) localStorage.setItem(key, String(width / window.innerWidth)); } catch { /* fine */ }
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
+  handle.addEventListener('dblclick', () => {
+    apply(null);
+    try { localStorage.removeItem(key); } catch { /* fine */ }
+  });
+  // Re-clamp on window resize; the stored share stays the same.
+  window.addEventListener('resize', debounce(() => {
+    let frac = null;
+    try { frac = parseFloat(localStorage.getItem(key)); } catch { /* fine */ }
+    if (frac > 0 && frac < 1) apply(frac);
+  }, 100));
 }
 
 function renderNote() {
@@ -1767,11 +1821,11 @@ function wireStaticHandlers() {
     renderResults();
   };
 
-  $('#right-wide').onclick = toggleWide;
-  try {
-    const wide = localStorage.getItem('aibrain.rightWide') || '';
-    if (wide) { $('#right').dataset.wide = wide === 'full' ? 'wide' : ''; toggleWide(); }
-  } catch { /* fine */ }
+  $('#right-wide').onclick = () => toggleWide();
+  try { if (localStorage.getItem('aibrain.rightWide') === 'full') toggleWide(true); } catch { /* fine */ }
+  makeResizable($('#shelf'), 'right');
+  makeResizable($('#left'), 'right');
+  makeResizable($('#right'), 'left');
 
   window.addEventListener('keydown', event => {
     const active = document.activeElement;

@@ -893,7 +893,27 @@ button { cursor: pointer; background: none; border: none; }
 
 /* Wider panel modes for writing: "wide" pushes the universe over, "full"
    covers it, with the text held to a readable measure like Obsidian's. */
-.panel-right[data-wide="wide"] { --right-w: clamp(480px, 52vw, 980px); }
+/* A width dragged by hand (makeResizable in app.js) wins over the default;
+   full-window mode, below, wins over both. */
+.panel { position: relative; }
+.panel-shelf[data-sized] { --shelf-w: var(--user-w); }
+.panel-left[data-sized] { --left-w: var(--user-w); }
+.panel-right[data-sized] { --right-w: var(--user-w); }
+.resize-handle {
+  position: absolute; top: 0; bottom: 0; width: 7px; z-index: 5;
+  cursor: col-resize; touch-action: none;
+}
+.resize-handle.right { right: -1px; }
+.resize-handle.left { left: -1px; }
+.resize-handle::after {
+  content: ''; position: absolute; top: 0; bottom: 0; width: 2px; left: 2px;
+  background: var(--accent); opacity: 0; transition: opacity .15s;
+}
+.resize-handle:hover::after, body.resizing .resize-handle::after { opacity: .5; }
+.panel[data-open="false"] .resize-handle { display: none; }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing .panel { transition: none; }
+body.resizing .canvas { pointer-events: none; }
 .panel-right[data-wide="full"] { --right-w: 100vw; }
 .panel-right[data-wide="full"][data-open="true"] { position: absolute; inset: 0 0 0 auto; z-index: 40; }
 .panel-right[data-wide="full"] .right-body > section { max-width: 820px; margin: 0 auto; }
@@ -1031,4 +1051,8 @@ button { cursor: pointer; background: none; border: none; }
   .panel-right[data-open="true"] { inset: 0 0 0 auto; }
   .hints { display: none; }
   .agent-rail { display: none; }
+  .resize-handle { display: none; }
+  .panel-shelf[data-sized] { --shelf-w: 88vw; }
+  .panel-left[data-sized] { --left-w: 88vw; }
+  .panel-right[data-sized] { --right-w: 88vw; }
 }
