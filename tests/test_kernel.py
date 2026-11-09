@@ -1086,6 +1086,261 @@ class A2AGroundingTests(unittest.TestCase):
             list(agent.ask("what is the speed of an A-Wing starfighter?", []))
 
 
+class FakeA2AServer:
+    """A real HTTP server that plays an A2A agent, so the transport code runs
+    for real: card fetch, message/stream, message/send, SSE framing.
+
+    `card` is the agent card; `stream` and `send` are callables returning
+    (status, content_type, body_bytes) for the respective JSON-RPC method.
+    `calls` records the method of every POST, in order.
+    """
+
+    def __init__(self, card, stream, send):
+        import http.server
+        outer = self
+        self.calls: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = json.dumps(outer.card).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                method = json.loads(self.rfile.read(length))["method"]
+                outer.calls.append(method)
+                handler = outer.stream if method == "message/stream" else outer.send
+                status, ctype, body = handler()
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+        self.card, self.stream, self.send = card, stream, send
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/agent"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def a2a_json(result=None, error=None, status=200):
+    body = {"jsonrpc": "2.0", "id": "x"}
+    body["error" if error else "result"] = error or result
+    return status, "application/json", json.dumps(body).encode()
+
+
+def a2a_reply(text):
+    return {"kind": "message", "role": "agent", "parts": [{"kind": "text", "text": text}]}
+
+
+def a2a_sse(*events, tail=b""):
+    body = b"".join(b"data: " + json.dumps({"jsonrpc": "2.0", "id": "x", "result": e}).encode()
+                    + b"\n\n" for e in events)
+    return 200, "text/event-stream", body + tail
+
+
+class A2ATransportTests(unittest.TestCase):
+    """Whether to stream is decided from the card and from what the server
+    says, and the user is told when the answer will not stream.
+
+    The bug behind these: an agent whose card says `streaming: false` answers
+    message/stream with HTTP 200 and a JSON-RPC error, which used to be read
+    as an empty reply — "(the agent returned no text)".
+    """
+
+    def setUp(self):
+        self.servers: list[FakeA2AServer] = []
+
+    def tearDown(self):
+        for server in self.servers:
+            server.close()
+
+    def serve(self, card, stream, send):
+        server = FakeA2AServer(card, stream, send)
+        self.servers.append(server)
+        return server
+
+    def agent(self, server):
+        from aibrain.agents.a2a import A2AAgent
+        cfg = AgentConfig(id="a", name="A", kind="a2a", url=server.url)
+        return A2AAgent(cfg, A2AGroundingTests.NoCallCorpus(), {})
+
+    def ask(self, agent, question="hi"):
+        events = list(agent.ask(question, []))
+        answer = "".join(e.text for e in events if e.type == "delta")
+        return events, answer
+
+    def notices(self, events):
+        return [e.text for e in events if e.type == "status" and "streaming unavailable" in e.text]
+
+    def test_a_card_that_declines_streaming_goes_straight_to_send(self):
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("message/stream must not be attempted"),
+                            send=lambda: a2a_json(a2a_reply("hello")))
+        events, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "hello")
+        self.assertEqual(server.calls, ["message/send"])
+        self.assertEqual(len(self.notices(events)), 1)
+        self.assertIn("agent card", self.notices(events)[0])
+
+    def test_the_notice_comes_before_the_reply_so_it_shows_during_the_wait(self):
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("unreachable"),
+                            send=lambda: a2a_json(a2a_reply("hello")))
+        events, _ = self.ask(self.agent(server))
+        kinds = [e.type for e in events]
+        self.assertLess(kinds.index("status", 2), kinds.index("delta"))
+        notice = next(i for i, e in enumerate(events) if "streaming unavailable" in e.text)
+        self.assertLess(notice, kinds.index("delta"))
+
+    def test_a_server_that_refuses_streaming_with_a_200_error_falls_back(self):
+        # The card is silent, so streaming is tried — and refused the way
+        # Agent Builder 9.5 refuses it.
+        server = self.serve({"name": "N"},
+                            stream=lambda: a2a_json(error={"code": -32004, "message": "no streaming"}),
+                            send=lambda: a2a_json(a2a_reply("hello")))
+        events, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "hello")
+        self.assertEqual(server.calls, ["message/stream", "message/send"])
+        self.assertEqual(len(self.notices(events)), 1)
+
+    def test_a_refusal_is_remembered_so_the_next_turn_does_not_retry_it(self):
+        server = self.serve({"name": "N"},
+                            stream=lambda: a2a_json(error={"code": -32004, "message": "no"}),
+                            send=lambda: a2a_json(a2a_reply("hello")))
+        agent = self.agent(server)
+        self.ask(agent)
+        events, answer = self.ask(agent)
+        self.assertEqual(answer, "hello")
+        self.assertEqual(server.calls, ["message/stream", "message/send", "message/send"])
+        self.assertEqual(len(self.notices(events)), 1)
+
+    def test_http_statuses_that_mean_unsupported_fall_back_too(self):
+        for status in (404, 405, 501):
+            with self.subTest(status=status):
+                server = self.serve({"name": "N"},
+                                    stream=lambda s=status: (s, "text/plain", b"nope"),
+                                    send=lambda: a2a_json(a2a_reply("hello")))
+                _, answer = self.ask(self.agent(server))
+                self.assertEqual(answer, "hello")
+
+    def test_a_real_stream_is_used_and_not_announced_as_missing(self):
+        server = self.serve({"name": "N", "capabilities": {"streaming": True}},
+                            stream=lambda: a2a_sse(a2a_reply("An A-Wing"),
+                                                   a2a_reply("An A-Wing is fast")),
+                            send=lambda: self.fail("send must not be attempted"))
+        events, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "An A-Wing is fast")
+        self.assertEqual(server.calls, ["message/stream"])
+        self.assertEqual(self.notices(events), [])
+        cites = next(e for e in events if e.type == "cites")
+        self.assertEqual(cites.data["transport"], "stream")
+
+    def test_the_final_event_counts_even_without_its_blank_line(self):
+        payload = json.dumps({"jsonrpc": "2.0", "id": "x", "result": a2a_reply("done")}).encode()
+        server = self.serve({"name": "N"},
+                            stream=lambda: (200, "text/event-stream", b"data: " + payload),
+                            send=lambda: self.fail("send must not be attempted"))
+        _, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "done")
+
+    def test_a_json_reply_to_a_stream_request_is_used_and_labelled(self):
+        server = self.serve({"name": "N"},
+                            stream=lambda: a2a_json(a2a_reply("once")),
+                            send=lambda: self.fail("send must not be attempted"))
+        events, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "once")
+        self.assertEqual(len(self.notices(events)), 1)
+
+    def test_a_real_error_is_reported_and_never_retried_as_a_send(self):
+        # Re-sending after a genuine failure could run the remote task twice.
+        server = self.serve({"name": "N"},
+                            stream=lambda: a2a_json(error={"code": -32603, "message": "boom"}),
+                            send=lambda: self.fail("send must not be attempted"))
+        events, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "")
+        self.assertIn("boom", next(e.text for e in events if e.type == "error"))
+        self.assertEqual(server.calls, ["message/stream"])
+
+    def test_an_empty_stream_is_an_error_not_a_blank_answer(self):
+        server = self.serve({"name": "N"},
+                            stream=lambda: (200, "text/event-stream", b""),
+                            send=lambda: self.fail("send must not be attempted"))
+        events, _ = self.ask(self.agent(server))
+        self.assertIn("without a reply", next(e.text for e in events if e.type == "error"))
+
+    def test_an_auth_failure_names_the_api_key(self):
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("unreachable"),
+                            send=lambda: (401, "text/plain", b"no"))
+        events, _ = self.ask(self.agent(server))
+        self.assertIn("API key", next(e.text for e in events if e.type == "error"))
+
+    def test_a_non_json_reply_is_an_error_not_a_crash(self):
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("unreachable"),
+                            send=lambda: (200, "text/html", b"<html>login</html>"))
+        events, _ = self.ask(self.agent(server))
+        self.assertIn("JSON", next(e.text for e in events if e.type == "error"))
+
+    def test_a_reply_with_no_result_is_an_error(self):
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("unreachable"),
+                            send=lambda: (200, "application/json", b'{"jsonrpc":"2.0","id":"x"}'))
+        events, _ = self.ask(self.agent(server))
+        self.assertIn("no result", next(e.text for e in events if e.type == "error"))
+
+    def test_a_failed_task_from_send_is_an_error(self):
+        task = {"kind": "task", "id": "t", "status": {"state": "failed", "message": {
+            "parts": [{"kind": "text", "text": "the tool blew up"}]}}}
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("unreachable"),
+                            send=lambda: a2a_json(task))
+        events, answer = self.ask(self.agent(server))
+        self.assertEqual(answer, "")
+        self.assertIn("blew up", next(e.text for e in events if e.type == "error"))
+
+    def test_an_unfinished_task_says_where_it_stopped(self):
+        task = {"kind": "task", "id": "t", "status": {"state": "working"}}
+        server = self.serve({"name": "N", "capabilities": {"streaming": False}},
+                            stream=lambda: self.fail("unreachable"),
+                            send=lambda: a2a_json(task))
+        _, answer = self.ask(self.agent(server))
+        self.assertIn("still working", answer)
+
+    def test_malformed_pieces_of_a_task_do_not_crash_the_parser(self):
+        from aibrain.agents.a2a import result_text
+        for task in ({"kind": "task", "status": "oops"},
+                     {"kind": "task", "artifacts": "oops"},
+                     {"kind": "task", "history": ["oops", 3]},
+                     {"kind": "task", "status": {"state": 7, "message": {"parts": [{"text": 5}]}}}):
+            with self.subTest(task=task):
+                self.assertEqual(result_text(task)[0], "")
+
+    def test_the_probe_reports_what_the_card_declares(self):
+        for caps, expect in (({"streaming": True}, "streaming"),
+                             ({"streaming": False}, "no streaming"),
+                             ({}, "not declared")):
+            with self.subTest(caps=caps):
+                server = self.serve({"name": "N", "capabilities": caps},
+                                    stream=lambda: self.fail("unreachable"),
+                                    send=lambda: self.fail("unreachable"))
+                detail = self.agent(server).probe()["detail"]
+                self.assertIn(expect, detail)
+
+
 class A2AStreamSplitTests(unittest.TestCase):
     """Progress narration — reasoning, tool calls, "still working" — must
     never leak into the answer text as raw JSON; each becomes its own event.

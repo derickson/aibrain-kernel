@@ -11,6 +11,7 @@ rather than pinning one.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -48,11 +49,42 @@ def _default_port(scheme: str) -> int:
     return 443 if scheme == "https" else 80
 
 
+# How a server says "I don't do that" rather than "that went wrong": the
+# JSON-RPC codes for unsupported operation / method not found, and the HTTP
+# statuses that mean the same thing one layer down. Only these trigger the
+# fall back from message/stream to message/send — anything else is a real
+# failure, and re-sending after one could run the remote task twice.
+UNSUPPORTED_CODES = {-32004, -32601}
+UNSUPPORTED_STATUSES = {404, 405, 415, 501}
+FAILED_STATES = {"failed", "rejected", "canceled"}
+
+
+class _Unsupported(A2AError):
+    """The server refused message/stream outright; message/send may still work."""
+
+
+def error_message(error: Any) -> str:
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error)
+
+
+def is_unsupported(error: Any) -> bool:
+    return isinstance(error, dict) and error.get("code") in UNSUPPORTED_CODES
+
+
 class A2AClient:
     def __init__(self, url: str, headers: dict[str, str] | None = None):
         self.url = url.rstrip("/")
         self.headers = headers or {}
         self.card: dict | None = None
+        # How the most recent turn was carried ("stream" or "send") and, when
+        # it was not streamed, why. The agent reads these to tell the user.
+        self.mode: str | None = None
+        self.fallback_reason = ""
+        # Set once the server has refused message/stream, so later turns go
+        # straight to message/send instead of failing the same way first.
+        self._no_stream = ""
 
     def _open(self, url: str, data: bytes | None = None, accept: str = "application/json"):
         request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
@@ -74,10 +106,16 @@ class A2AClient:
         for candidate in candidates:
             try:
                 with self._open(candidate) as response:
-                    self.card = json.loads(response.read().decode("utf-8"))
-                    return self.card
-            except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+                    card = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, OSError, ValueError) as exc:
                 errors.append(f"{candidate}: {exc}")
+                continue
+            if not isinstance(card, dict):
+                errors.append(f"{candidate}: not an agent card")
+                continue
+            self.card = card
+            self._no_stream = ""  # a fresh card may describe an upgraded server
+            return card
         raise A2AError("no agent card at " + self.url + " (" + "; ".join(errors[:2]) + ")")
 
     def endpoint(self) -> str:
@@ -100,6 +138,21 @@ class A2AClient:
                     )
         return self.url
 
+    def streaming_declared(self) -> bool | None:
+        """What the card says about streaming: True, False, or None if silent."""
+        capabilities = self.card.get("capabilities") if self.card else None
+        value = capabilities.get("streaming") if isinstance(capabilities, dict) else None
+        return value if isinstance(value, bool) else None
+
+    def plan(self) -> tuple[str, str]:
+        """("stream" | "send", why not streaming). A card that says nothing
+        about streaming is tried with it and falls back if the server refuses."""
+        if self._no_stream:
+            return "send", self._no_stream
+        if self.streaming_declared() is False:
+            return "send", "the agent card says it does not support streaming"
+        return "stream", ""
+
     def _envelope(self, method: str, text: str, context_id: str | None) -> dict:
         message: dict[str, Any] = {
             "role": "user",
@@ -116,54 +169,120 @@ class A2AClient:
             "params": {"message": message},
         }
 
+    def _http_error(self, exc: urllib.error.HTTPError) -> A2AError:
+        hint = " — check the API key in this agent's headers" if exc.code in (401, 403) else ""
+        return A2AError(f"HTTP {exc.code} from {self.endpoint()}{hint}")
+
+    def _read_json(self, response) -> dict:
+        try:
+            payload = json.loads(response.read().decode("utf-8"))
+        except ValueError as exc:  # bad JSON and bad UTF-8 alike
+            raise A2AError(f"{self.endpoint()} did not answer with JSON") from exc
+        if not isinstance(payload, dict):
+            raise A2AError(f"{self.endpoint()} answered with an unexpected shape")
+        return payload
+
     def send(self, text: str, context_id: str | None = None) -> dict:
         body = json.dumps(self._envelope("message/send", text, context_id)).encode()
         try:
             with self._open(self.endpoint(), body) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                payload = self._read_json(response)
         except urllib.error.HTTPError as exc:
-            raise A2AError(f"HTTP {exc.code} from {self.endpoint()}") from exc
-        except (urllib.error.URLError, OSError) as exc:
+            raise self._http_error(exc) from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
             raise A2AError(f"cannot reach {self.endpoint()}: {exc}") from exc
         if "error" in payload:
-            raise A2AError(str(payload["error"].get("message", payload["error"])))
-        return payload.get("result") or {}
+            raise A2AError(error_message(payload["error"]))
+        result = payload.get("result")
+        if not isinstance(result, dict) or not result:
+            raise A2AError("the agent's reply carried no result")
+        return result
+
+    def _send_instead(self, text: str, context_id: str | None, reason: str) -> dict:
+        self.mode, self.fallback_reason = "send", reason
+        return self.send(text, context_id)
 
     def stream(self, text: str, context_id: str | None = None) -> Iterator[dict]:
-        """message/stream as server-sent events; falls back to message/send."""
+        """One turn's results: message/stream where the server has it,
+        otherwise one message/send. `mode` and `fallback_reason` say which."""
+        mode, reason = self.plan()
+        if mode == "send":
+            yield self._send_instead(text, context_id, reason)
+            return
+        try:
+            yield from self._stream_events(text, context_id)
+        except _Unsupported as exc:
+            # Refused before anything was delivered, so nothing has run yet
+            # and a plain send is safe. Remember it for the next turn.
+            self._no_stream = str(exc)
+            yield self._send_instead(text, context_id, self._no_stream)
+
+    def _stream_events(self, text: str, context_id: str | None) -> Iterator[dict]:
         body = json.dumps(self._envelope("message/stream", text, context_id)).encode()
         try:
             response = self._open(self.endpoint(), body, accept="text/event-stream")
         except urllib.error.HTTPError as exc:
-            if exc.code in (404, 405, 501):
-                yield self.send(text, context_id)
-                return
-            raise A2AError(f"HTTP {exc.code} from {self.endpoint()}") from exc
-        except (urllib.error.URLError, OSError) as exc:
+            if exc.code in UNSUPPORTED_STATUSES:
+                raise _Unsupported(f"the server answered HTTP {exc.code} to message/stream") from exc
+            raise self._http_error(exc) from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
             raise A2AError(f"cannot reach {self.endpoint()}: {exc}") from exc
 
-        ctype = response.headers.get("Content-Type", "")
-        if "text/event-stream" not in ctype:
-            payload = json.loads(response.read().decode("utf-8"))
-            yield payload.get("result") or {}
-            return
+        with response:
+            if "text/event-stream" not in response.headers.get("Content-Type", ""):
+                # Not a stream: either a JSON-RPC error (some servers send
+                # "streaming unsupported" as a 200) or a one-shot reply.
+                payload = self._read_json(response)
+                if "error" in payload:
+                    if is_unsupported(payload["error"]):
+                        raise _Unsupported(error_message(payload["error"]))
+                    raise A2AError(error_message(payload["error"]))
+                result = payload.get("result")
+                if not isinstance(result, dict) or not result:
+                    raise A2AError("the agent's reply carried no result")
+                self.mode = "send"
+                self.fallback_reason = "the server replied once instead of streaming"
+                yield result
+                return
 
-        data_lines: list[str] = []
-        for raw in response:
-            line = raw.decode("utf-8", errors="replace").rstrip("\n")
-            if line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
-                continue
-            if line == "" and data_lines:
-                blob = "\n".join(data_lines)
-                data_lines = []
+            self.mode, self.fallback_reason = "stream", ""
+            delivered = False
+            data_lines: list[str] = []
+
+            def flush() -> dict | None:
+                nonlocal data_lines
+                blob, data_lines = "\n".join(data_lines), []
                 try:
                     payload = json.loads(blob)
-                except json.JSONDecodeError:
-                    continue
+                except ValueError:
+                    return None
+                if not isinstance(payload, dict):
+                    return None
                 if "error" in payload:
-                    raise A2AError(str(payload["error"].get("message", payload["error"])))
-                yield payload.get("result") or payload
+                    raise A2AError(error_message(payload["error"]))
+                result = payload.get("result") or payload
+                return result if isinstance(result, dict) else None
+
+            try:
+                for raw in response:
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                    elif line == "" and data_lines:
+                        result = flush()
+                        if result is not None:
+                            delivered = True
+                            yield result
+                if data_lines:  # a last event the server never terminated
+                    result = flush()
+                    if result is not None:
+                        delivered = True
+                        yield result
+            except (OSError, http.client.HTTPException) as exc:
+                raise A2AError(f"the stream from {self.endpoint()} was interrupted: {exc}") from exc
+
+            if not delivered:
+                raise A2AError("the stream ended without a reply")
 
 
 def parts_text(container: Any) -> str:
@@ -180,7 +299,8 @@ def parts_text(container: Any) -> str:
         return parts_text(container["parts"])
     kind = container.get("kind") or container.get("type")
     if kind == "text" or "text" in container:
-        return container.get("text", "")
+        text = container.get("text", "")
+        return text if isinstance(text, str) else ""
     if kind == "data":
         data = container.get("data")
         return json.dumps(data, indent=2) if data is not None else ""
@@ -196,22 +316,22 @@ def result_text(result: dict) -> tuple[str, str]:
     if kind == "message" or result.get("role") == "agent":
         return parts_text(result), ""
     if kind in ("status-update", "task-status-update"):
-        status = result.get("status") or {}
-        return parts_text(status.get("message")), status.get("state", "")
+        status = _as_dict(result.get("status"))
+        return parts_text(status.get("message")), _state(status)
     if kind in ("artifact-update", "task-artifact-update"):
         return parts_text(result.get("artifact")), ""
     if kind == "task" or "status" in result or "artifacts" in result:
-        status = result.get("status") or {}
+        status = _as_dict(result.get("status"))
         text = parts_text(status.get("message"))
         if not text:
-            for artifact in result.get("artifacts") or []:
+            for artifact in _as_list(result.get("artifacts")):
                 text += parts_text(artifact)
         if not text:
-            for message in reversed(result.get("history") or []):
-                if message.get("role") == "agent":
+            for message in reversed(_as_list(result.get("history"))):
+                if isinstance(message, dict) and message.get("role") == "agent":
                     text = parts_text(message)
                     break
-        return text, status.get("state", "")
+        return text, _state(status)
     return parts_text(result), ""
 
 
@@ -301,16 +421,28 @@ class A2AAgent(Agent):
                 yield Event("status", f"fetching agent card from {self.cfg.url}…")
                 card = self.client.fetch_card()
                 name = card.get("name", "agent")
-                skills = ", ".join(s.get("name", "") for s in (card.get("skills") or [])[:3])
+                skills = ", ".join(str(s.get("name", "")) for s in _as_list(card.get("skills"))[:3]
+                                   if isinstance(s, dict))
                 yield Event("status", f"connected to {name}{f' · {skills}' if skills else ''}")
         except A2AError as exc:
             yield Event("error", str(exc))
             yield Event("done")
             return
 
+        # Say how the reply will arrive before the wait starts, so a missing
+        # stream reads as a property of this agent rather than a hang. A
+        # server that only reveals it lacks streaming when refused is
+        # announced from the loop below instead.
+        announced = False
+        mode, reason = self.client.plan()
+        if mode == "send":
+            announced = True
+            yield _no_stream_notice(reason)
+
         prompt = _build_prompt(question, self.context_block(hits))
         answer: list[str] = []
         seen_state = ""
+        failed = False
         usage: dict | None = None
 
         # Elastic Agent Builder streams *everything* — every tool-use round's
@@ -331,7 +463,13 @@ class A2AAgent(Agent):
 
         try:
             for result in self.client.stream(prompt, self.context_id):
-                cid = result.get("contextId") or (result.get("status") or {}).get("contextId")
+                if not isinstance(result, dict):
+                    continue
+                if not announced and self.client.mode == "send":
+                    announced = True
+                    yield _no_stream_notice(self.client.fallback_reason)
+                result_status = _as_dict(result.get("status"))
+                cid = result.get("contextId") or result_status.get("contextId")
                 if cid:
                     self.context_id = cid
                 usage = usage or extract_usage(result)
@@ -343,11 +481,12 @@ class A2AAgent(Agent):
                     # same text again once a block finishes, so their text is
                     # not re-emitted here — only the state transition, and
                     # any step data no other channel carries.
-                    status = result.get("status") or {}
-                    state = status.get("state", "")
-                    if state == "failed":
+                    status = result_status
+                    state = _state(status)
+                    if state in FAILED_STATES:
+                        failed = True
                         yield Event("error", parts_text(status.get("message"))
-                                    or "the remote task failed")
+                                    or f"the remote task {state}")
                         continue
                     if state and state != seen_state:
                         seen_state = state
@@ -358,7 +497,7 @@ class A2AAgent(Agent):
                     continue
 
                 if kind in ("artifact-update", "task-artifact-update"):
-                    aid = (result.get("artifact") or {}).get("artifactId")
+                    aid = _as_dict(result.get("artifact")).get("artifactId")
                     text = parts_text(result.get("artifact"))
                     if not text:
                         continue
@@ -374,7 +513,15 @@ class A2AAgent(Agent):
                 # answer content on its own, independent of the artifact
                 # bookkeeping above — most A2A agents that don't use
                 # artifacts at all send their whole reply this way.
-                text, _ = result_text(result)
+                text, state = result_text(result)
+                if state in FAILED_STATES:
+                    failed = True
+                    # A non-streamed reply is a whole Task, so a failure
+                    # arrives here rather than as a status-update.
+                    yield Event("error", text or f"the remote task {state}")
+                    continue
+                if state and state != seen_state:
+                    seen_state = state
                 if text:
                     # Streamed chunks are usually cumulative in A2A; only send
                     # what is genuinely new. A server that sends true deltas
@@ -390,6 +537,12 @@ class A2AAgent(Agent):
             yield Event("error", str(exc))
             yield Event("done")
             return
+        except (AttributeError, TypeError, KeyError, ValueError) as exc:
+            # A reply shaped unlike anything above. Report it rather than let
+            # the exception cut the chat stream off mid-answer.
+            yield Event("error", f"unexpected reply from the agent ({type(exc).__name__}: {exc})")
+            yield Event("done")
+            return
 
         if artifact_text:
             # The last artifact block was still open at the end, so nothing
@@ -400,8 +553,10 @@ class A2AAgent(Agent):
             yield Event("delta", artifact_text)
 
         text = "".join(answer)
-        if not text.strip():
-            yield Event("delta", "(the agent returned no text)")
+        if not text.strip() and not failed:
+            unfinished = seen_state and seen_state not in ("completed", *FAILED_STATES)
+            yield Event("delta", f"(the agent returned no text — its task is still {seen_state})"
+                        if unfinished else "(the agent returned no text)")
 
         # A remote agent reads nothing of ours, so the only evidence available
         # is what it wrote. Anything it did not name stays in the context list.
@@ -410,7 +565,8 @@ class A2AAgent(Agent):
                     data={"context": [c.to_dict() for c in
                                       self.context_citations(hits, cites)],
                           "html": self.render_html(text, cites),
-                          "usage": usage})
+                          "usage": usage,
+                          **({"transport": self.client.mode} if self.client.mode else {})})
         yield Event("done")
 
     def probe(self) -> dict:
@@ -420,12 +576,32 @@ class A2AAgent(Agent):
             card = self.client.fetch_card()
         except A2AError as exc:
             return {"ok": False, "detail": str(exc)}
-        skills = len(card.get("skills") or [])
+        skills = len(_as_list(card.get("skills")))
+        streaming = self.client.streaming_declared()
         return {
             "ok": True,
             "detail": f"{card.get('name', 'agent')} · {card.get('version', '?')}"
-                      f"{f' · {skills} skills' if skills else ''}",
+                      f"{f' · {skills} skills' if skills else ''}"
+                      f" · {'streaming' if streaming else 'no streaming (replies arrive at once)' if streaming is False else 'streaming not declared'}",
         }
+
+
+def _state(status: dict) -> str:
+    state = status.get("state", "")
+    return state if isinstance(state, str) else ""
+
+
+def _as_dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _no_stream_notice(reason: str) -> Event:
+    return Event("status", f"streaming unavailable ({reason}) — the reply will arrive all at once",
+                 data={"transport": "send"})
 
 
 def _build_prompt(question: str, context: str) -> str:
