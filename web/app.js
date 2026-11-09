@@ -116,7 +116,7 @@ const WS = createWorkspace({
   brainName: id => S.data?.brains?.find(b => b.id === id)?.name || '',
 });
 $('#ws-strip').append(WS.strip);
-$('#note-editor').append(WS.nav, WS.banner, WS.title, WS.host);
+$('#note-editor').append(WS.nav, WS.banner, WS.title, WS.host, WS.fallback);
 
 // ───────────────────────────── boot ─────────────────────────────────────
 

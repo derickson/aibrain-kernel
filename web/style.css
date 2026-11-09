@@ -975,6 +975,9 @@ body.resizing .canvas { pointer-events: none; }
 .ws-banner span { flex: 1; min-width: 160px; }
 .btn.sm { padding: 4px 10px; font-size: 11px; }
 
+.ws-fallback { color: var(--fg-mute); font-size: 13px; padding: 8px 0 24px; }
+.ws-fallback-why { font-size: 9px; color: #f0c070; margin-bottom: 14px; }
+
 .ws-title {
   font: 700 22px/1.3 Manrope, system-ui, sans-serif; letter-spacing: -.015em;
   color: #fff; margin: 12px 0 10px; overflow-wrap: anywhere;

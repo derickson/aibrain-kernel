@@ -11,6 +11,19 @@ import { createEditor } from './editor.js';
 
 const STORE_KEY = 'aibrain.workspace.v1';
 const SAVE_DELAY = 1200;
+// Browsers cap the bodies of all in-flight keepalive requests at 64 KiB
+// together, so keepalive is kept for the page-closing save, and only small.
+const KEEPALIVE_MAX = 60 * 1024;
+
+/** The separator a file uses, so saving it does not rewrite every line. */
+const lineSeparatorOf = text => (text.includes('\r\n') ? '\r\n' : null);
+/** What goes to disk: CodeMirror splits on any line break and joins with
+ *  `\n`, so a CRLF file is joined back with CRLF — every line, pasted ones
+ *  included — instead of being rewritten as LF. */
+const textOf = (state, sep) => {
+  const text = state.doc.toString();
+  return sep ? text.replace(/\n/g, sep) : text;
+};
 
 export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainName }) {
   const W = {
@@ -31,21 +44,31 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
   const banner = el('div', { class: 'ws-banner', hidden: true });
   const title = el('h1', { class: 'ws-title' });
   const host = el('div', { class: 'ws-editor' });
+  // Shown instead of the editor while a note loads, or when it cannot be
+  // edited here (too large, not UTF-8, gone): then a read-only render.
+  const fallback = el('div', { class: 'ws-fallback', hidden: true });
+  fallback.addEventListener('click', event => {
+    const link = event.target.closest?.('a.wiki[data-note]');
+    if (!link) return;
+    event.preventDefault();
+    open(Number(link.dataset.note), { newTab: event.metaKey || event.ctrlKey });
+  });
+  // The note whose state is in the editor right now. Edits are credited to
+  // this, never to "the active tab", which may still be loading.
+  let shownNid = null;
 
   const editor = createEditor(host, {
     onChange: state => {
-      const tab = activeTab();
-      if (!tab) return;
-      const doc = W.docs.get(tab.nid);
+      const nid = shownNid;
+      const doc = nid != null && W.docs.get(nid);
       if (!doc) return;
       doc.state = state;
-      const text = state.doc.toString();
-      doc.dirty = text !== doc.savedText;
+      doc.dirty = textOf(state, doc.sep) !== doc.savedText;
       renderSave();
       clearTimeout(doc.timer);
-      if (doc.dirty && !doc.conflict) doc.timer = setTimeout(() => save(tab.nid), SAVE_DELAY);
+      if (doc.dirty && !doc.conflict) doc.timer = setTimeout(() => save(nid), SAVE_DELAY);
     },
-    onSave: () => { const t = activeTab(); if (t) save(t.nid); },
+    onSave: () => { if (shownNid != null) save(shownNid); },
     onOpenLink: (target, how) => followLink(target, how),
     onOpenUrl: href => onOpenUrl?.(href),
     searchTitles: async query => {
@@ -91,45 +114,62 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     let doc = W.docs.get(nid);
     if (doc && !force) return doc;
     const src = await api(`/api/note/${nid}/source`);
-    if (doc) {
+    const sep = lineSeparatorOf(src.text);
+    if (doc && sep === doc.sep) {
       // reload over an open doc: keep its undo history by editing in place
       doc.hash = src.hash;
-      doc.savedText = src.text;
       doc.dirty = false;
       doc.conflict = null;
-      if (doc.state.doc.toString() !== src.text) {
-        if (activeTab()?.nid === nid) {
+      if (textOf(doc.state, doc.sep) !== src.text) {
+        if (shownNid === nid) {
           editor.replaceDoc(src.text);
           doc.state = editor.state;
         } else {
           doc.state = doc.state.update({ changes: { from: 0, to: doc.state.doc.length, insert: src.text } }).state;
         }
       }
+      doc.savedText = textOf(doc.state, doc.sep);
     } else {
-      doc = { name: src.name, state: editor.newState(src.text), hash: src.hash, savedText: src.text,
-              dirty: false, saving: null, timer: null, conflict: null };
-      W.docs.set(nid, doc);
+      const state = editor.newState(src.text);
+      // `savedText` is the file as the editor would write it back. For a
+      // file with consistent line endings that is the file itself; for one
+      // with mixed endings it differs, but only an actual edit saves it.
+      const fresh = { name: src.name, state, sep, hash: src.hash, savedText: textOf(state, sep),
+                      dirty: false, saving: null, timer: null, conflict: null };
+      if (doc) {
+        Object.assign(doc, fresh);
+        if (shownNid === nid) editor.setState(doc.state);
+      } else {
+        doc = fresh;
+        W.docs.set(nid, doc);
+      }
     }
     for (const tab of W.tabs) if (tab.nid === nid) { tab.title = src.name || tab.title; tab.brainId = src.brainId; }
     return doc;
   }
 
-  async function save(nid, { overwrite = false } = {}) {
+  /**
+   * Write a note. Saves of one note run strictly one after another: each
+   * waits for any save in flight, then re-reads the text and the hash that
+   * save left behind, so a queued save never sends a stale `baseHash`.
+   */
+  async function save(nid, { overwrite = false, unloading = false } = {}) {
     const doc = W.docs.get(nid);
     if (!doc) return;
     clearTimeout(doc.timer);
-    if (doc.saving) { await doc.saving.catch(() => {}); }
-    const text = doc.state.doc.toString();
+    while (doc.saving) await doc.saving.catch(() => {});
+    const text = textOf(doc.state, doc.sep);
     if (text === doc.savedText && !overwrite) { doc.dirty = false; renderSave(); return; }
     if (doc.conflict && !overwrite) return;
     const run = (async () => {
       try {
         const base = overwrite && doc.conflict ? doc.conflict.hash : doc.hash;
+        const body = JSON.stringify({ text, baseHash: base });
         const out = await fetch(`/api/note/${nid}/source`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text, baseHash: base }),
-          keepalive: text.length < 60000,
+          body,
+          keepalive: unloading && new TextEncoder().encode(body).length < KEEPALIVE_MAX,
         });
         const data = await out.json().catch(() => ({}));
         if (out.status === 409) {
@@ -141,7 +181,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
         doc.hash = data.hash;
         doc.savedText = text;
         doc.conflict = null;
-        doc.dirty = doc.state.doc.toString() !== text;
+        doc.dirty = textOf(doc.state, doc.sep) !== text;
         renderBanner();
       } catch (err) {
         toast(`Not saved: ${err.message || err}`, true);
@@ -149,8 +189,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     })();
     doc.saving = run;
     renderSave();
-    await run;
-    doc.saving = null;
+    try { await run; } finally { if (doc.saving === run) doc.saving = null; }
     renderSave();
   }
 
@@ -216,11 +255,18 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     const tab = activeTab();
     renderTabs();
     persist();
-    if (!tab) { onActivate?.(null); return; }
+    // Nothing typed from here until the new note is in the editor can be
+    // credited to the old one; hide the editor so nothing can be typed.
+    shownNid = null;
+    if (!tab) { showFallback(null); onActivate?.(null); return; }
+    title.textContent = tab.title || '';
+    if (!W.docs.has(tab.nid)) showFallback('Loading…');
     try {
       const doc = await loadDoc(tab.nid);
       if (W.active !== key) return;           // another click beat us
       editor.setState(doc.state);
+      shownNid = tab.nid;
+      showFallback(null);
       tab.title = doc.name || tab.title;
       title.textContent = tab.title;
       renderTabs();
@@ -229,8 +275,41 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
       persist();
       onActivate?.(tab);
     } catch (err) {
-      toast(`Could not open note: ${err.message || err}`, true);
+      if (W.active !== key) return;
+      renderSave();
+      renderBanner();
+      showReadOnly(tab, err);
+      onActivate?.(tab);
     }
+  }
+
+  /** Editor hidden behind a message, or (message = null) the editor back. */
+  function showFallback(message) {
+    host.hidden = message != null;
+    fallback.hidden = message == null;
+    fallback.className = 'ws-fallback';
+    fallback.textContent = message ?? '';
+  }
+
+  /** A note the editor cannot open (too large, not UTF-8, deleted, its brain
+   *  disabled) still reads: the rendered page, without editing. */
+  async function showReadOnly(tab, err) {
+    showFallback(null);
+    host.hidden = true;
+    fallback.hidden = false;
+    fallback.className = 'ws-fallback';
+    fallback.innerHTML = '';
+    fallback.append(el('div', { class: 'ws-fallback-why mono' },
+      `CAN'T EDIT HERE — ${String(err?.message || err || 'unavailable').toUpperCase()}`));
+    try {
+      const page = await api(`/api/note/${tab.nid}`);
+      if (W.active !== tab.key || shownNid != null) return;
+      tab.title = page.name || tab.title;
+      title.textContent = tab.title;
+      renderTabs();
+      // `html` is the server's sanitized render, the same the old reader used.
+      fallback.append(el('article', { class: 'note', html: page.html || '' }));
+    } catch { /* the message above is all there is */ }
   }
 
   async function go(step) {
@@ -432,13 +511,13 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
 
   window.addEventListener('beforeunload', event => {
     let pending = false;
-    for (const [nid, doc] of W.docs) if (doc.dirty) { pending = true; save(nid); }
+    for (const [nid, doc] of W.docs) if (doc.dirty) { pending = true; save(nid, { unloading: true }); }
     if (pending) event.preventDefault();
   });
   window.addEventListener('blur', saveAll);
 
   return {
-    strip, nav, banner, title, host,
+    strip, nav, banner, title, host, fallback,
     open, close, activate, restore, externalChange, onKey, saveAll,
     get activeTab() { return activeTab(); },
     get hasTabs() { return W.tabs.length > 0; },
