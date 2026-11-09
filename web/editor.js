@@ -233,6 +233,11 @@ function buildDecorations(view) {
           }
           case 'Link': {
             // [text](url): show only the text, styled as a link.
+            // The grammar reads the inside of a [[wikilink]] as a `[text]`
+            // link; leave those to the wikilink pass below, or its hidden
+            // brackets collide with these and a stray `]` shows.
+            if (node.from > 0 && doc.sliceString(node.from - 1, node.from) === '['
+                && doc.sliceString(node.to, node.to + 1) === ']') return false;
             const marks = [];
             let url = null;
             for (let c = node.node.firstChild; c; c = c.nextSibling) {
