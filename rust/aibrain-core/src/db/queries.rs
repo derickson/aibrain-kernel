@@ -643,6 +643,47 @@ pub async fn note_by_path(
     }))
 }
 
+/// Where a note lives on disk, as the database knows it: the brain's root and
+/// the note's path inside it. The editor derives every path it reads or
+/// writes from this row and nothing a caller sent.
+#[derive(Debug, Clone)]
+pub struct NoteLocation {
+    pub nid: i64,
+    pub brain_id: String,
+    pub rel_path: String,
+    pub title: String,
+    pub root: String,
+    pub brain_enabled: bool,
+}
+
+pub async fn note_location(pool: &PgPool, note_id: i64) -> Result<Option<NoteLocation>> {
+    let row = sqlx::query(
+        "SELECT n.id, n.brain_id, n.rel_path, n.title, b.root, b.enabled
+           FROM note n JOIN brain b ON b.id = n.brain_id
+          WHERE n.id = $1",
+    )
+    .bind(note_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| NoteLocation {
+        nid: r.get("id"),
+        brain_id: r.get("brain_id"),
+        rel_path: r.get("rel_path"),
+        title: r.get("title"),
+        root: r.get("root"),
+        brain_enabled: r.get("enabled"),
+    }))
+}
+
+/// A brain's root and whether it is enabled, by id.
+pub async fn brain_root(pool: &PgPool, brain_id: &str) -> Result<Option<(String, bool)>> {
+    let row = sqlx::query("SELECT root, enabled FROM brain WHERE id = $1")
+        .bind(brain_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| (r.get("root"), r.get("enabled"))))
+}
+
 /// One note with everything the reader needs, in a single round trip.
 pub async fn note_page(pool: &PgPool, note_id: i64) -> Result<Option<NotePage>> {
     let Some(row) = sqlx::query(

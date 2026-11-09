@@ -16,6 +16,7 @@ container is an environment problem, not a broken build.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import ThreadingHTTPServer
@@ -711,6 +713,257 @@ class LiveUpdateTests(unittest.TestCase):
         agent.pos = [round(agent.pos[0] + 3.0, 3) if agent.pos else 3.0, 1.0, 2.0]
         _, moved, _ = self.universe(rebuild=True)
         self.assertNotEqual(moved, etag)
+
+
+class EditorTests(unittest.TestCase):
+    """The editor's write surface: raw source, conditional save, create, resolve.
+
+    The fixture runs `aibrain-core serve` without `--watch`, so every check
+    that the index caught up after a save proves the route re-ingested the
+    note itself rather than leaning on the watcher.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus()
+        cls.addClassCleanup(cls.fixture.stop)
+        cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        cls.addClassCleanup(cls.state.close)
+        handler = type("H", (Handler,),
+                       {"state": cls.state, "router": build_router(cls.state)})
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.addClassCleanup(cls.httpd.shutdown)
+        cls.httpd.daemon_threads = True
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    # ---- helpers ---------------------------------------------------------
+    def call(self, method, path, body=None, headers=None):
+        """`(status, payload)` whatever the status."""
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read().decode() or "null")
+
+    def nid(self, rel_path):
+        row = self.fixture.corpus.note_by_path(self.fixture.brain_id, rel_path)
+        self.assertIsNotNone(row, rel_path)
+        return int(row["nid"])
+
+    def fresh_note(self, name, text):
+        """A note of this test's own, so tests never edit each other's."""
+        (self.fixture.vault / name).write_text(text, encoding="utf-8")
+        self.fixture.reindex()
+        return self.nid(name)
+
+    # ---- reading ---------------------------------------------------------
+    def test_source_is_the_raw_file_with_its_sha256(self):
+        nid = self.nid("Index.md")
+        status, src = self.call("GET", f"/api/note/{nid}/source")
+        self.assertEqual(status, 200)
+        raw = (self.fixture.vault / "Index.md").read_bytes()
+        self.assertEqual(src["text"], raw.decode("utf-8"))
+        self.assertTrue(src["text"].startswith("---\ntitle: Index"), "frontmatter kept")
+        self.assertEqual(src["hash"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(src["nid"], nid)
+        self.assertEqual(src["brainId"], self.fixture.brain_id)
+        self.assertEqual(src["relPath"], "Index.md")
+        self.assertEqual(src["name"], "Index")
+        self.assertIsInstance(src["mtime"], float)
+
+    def test_an_unknown_note_is_a_404(self):
+        status, _ = self.call("GET", "/api/note/999999999/source")
+        self.assertEqual(status, 404)
+
+    # ---- saving ----------------------------------------------------------
+    def test_a_save_writes_the_file_and_the_index_catches_up(self):
+        nid = self.fresh_note("Saved.md", "# Saved\n\nfirst draft\n")
+        path = self.fixture.vault / "Saved.md"
+        os.chmod(path, 0o640)
+        _, src = self.call("GET", f"/api/note/{nid}/source")
+
+        new_text = "# Saved\n\nsecond draft mentioning [[Agents]]\n"
+        status, out = self.call("POST", f"/api/note/{nid}/source",
+                                {"text": new_text, "baseHash": src["hash"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(set(out), {"hash", "mtime"})
+        self.assertEqual(path.read_text(encoding="utf-8"), new_text)
+        self.assertEqual(out["hash"], hashlib.sha256(new_text.encode()).hexdigest())
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o640, "permissions kept")
+        leftovers = [p.name for p in self.fixture.vault.iterdir()
+                     if p.name.startswith(".") and p.name.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+        # No watcher is running: only the route's own re-ingest can do this.
+        page = self.call("GET", f"/api/note/{nid}")[1]
+        self.assertIn("second draft", page["html"])
+        self.assertIn("Agents", [row["name"] for row in page["linked"]])
+
+        # The new hash is the base for the next save.
+        status, again = self.call("POST", f"/api/note/{nid}/source",
+                                  {"text": new_text + "more\n", "baseHash": out["hash"]})
+        self.assertEqual(status, 200, again)
+
+    def test_a_stale_base_hash_is_a_conflict_carrying_the_disk_text(self):
+        nid = self.fresh_note("Contested.md", "# Contested\n\noriginal\n")
+        path = self.fixture.vault / "Contested.md"
+        _, src = self.call("GET", f"/api/note/{nid}/source")
+        # Someone else (Obsidian) saves in between.
+        path.write_text("# Contested\n\nchanged in Obsidian\n", encoding="utf-8")
+
+        status, out = self.call("POST", f"/api/note/{nid}/source",
+                                {"text": "# Contested\n\nmine\n", "baseHash": src["hash"]})
+        self.assertEqual(status, 409)
+        self.assertEqual(out["error"], "conflict")
+        self.assertEqual(out["text"], "# Contested\n\nchanged in Obsidian\n")
+        self.assertEqual(out["hash"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         "# Contested\n\nchanged in Obsidian\n", "nothing written")
+
+    def test_a_large_note_saves_and_an_oversized_one_is_refused(self):
+        nid = self.fresh_note("Big.md", "# Big\n")
+        _, src = self.call("GET", f"/api/note/{nid}/source")
+        # ~1.9 MB, well past the 256 KiB / 1 MiB general limits, with
+        # non-ASCII so the JSON-escaped hop to Rust is larger still.
+        big = "# Big\n\n" + ("café ünïcode line of text\n" * 70000)
+        self.assertLess(len(big.encode()), 2 * 1024 * 1024)
+        status, out = self.call("POST", f"/api/note/{nid}/source",
+                                {"text": big, "baseHash": src["hash"]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual((self.fixture.vault / "Big.md").read_text(encoding="utf-8"), big)
+
+        huge = "x" * (2 * 1024 * 1024 + 1)
+        status, _ = self.call("POST", f"/api/note/{nid}/source",
+                              {"text": huge, "baseHash": out["hash"]})
+        self.assertEqual(status, 413)
+        self.assertEqual((self.fixture.vault / "Big.md").read_text(encoding="utf-8"), big)
+
+    def test_a_save_needs_text_and_a_base_hash(self):
+        nid = self.nid("Agents.md")
+        for body in ({"text": "x"}, {"baseHash": "abc"}, {"text": 5, "baseHash": "abc"}):
+            status, _ = self.call("POST", f"/api/note/{nid}/source", body)
+            self.assertEqual(status, 400, body)
+
+    def test_a_note_swapped_for_a_symlink_out_of_the_vault_is_refused(self):
+        nid = self.fresh_note("Swapped.md", "# Swapped\n")
+        outside = Path(self.fixture.tmp.name) / "outside"
+        outside.mkdir(exist_ok=True)
+        secret = outside / "secret.md"
+        secret.write_text("do not touch\n", encoding="utf-8")
+        link = self.fixture.vault / "Swapped.md"
+        link.unlink()
+        link.symlink_to(secret)
+        try:
+            status, out = self.call("GET", f"/api/note/{nid}/source")
+            self.assertEqual(status, 403, out)
+            self.assertNotIn("text", out)
+            status, _ = self.call("POST", f"/api/note/{nid}/source",
+                                  {"text": "pwned", "baseHash": hashlib.sha256(
+                                      secret.read_bytes()).hexdigest()})
+            self.assertEqual(status, 403)
+            self.assertEqual(secret.read_text(encoding="utf-8"), "do not touch\n")
+        finally:
+            link.unlink()
+
+    def test_a_disabled_brain_is_not_writable(self):
+        nid = self.fresh_note("Gated.md", "# Gated\n")
+        _, src = self.call("GET", f"/api/note/{nid}/source")
+        brain = self.fixture.cfg.brains[0]
+        brain.enabled = False
+        self.fixture.cfg.save()
+        try:
+            status, _ = self.call("POST", f"/api/note/{nid}/source",
+                                  {"text": "nope", "baseHash": src["hash"]})
+            self.assertEqual(status, 403)
+            status, _ = self.call("POST", "/api/note/create",
+                                  {"brain": self.fixture.brain_id, "title": "Nope"})
+            self.assertEqual(status, 403)
+        finally:
+            brain.enabled = True
+            self.fixture.cfg.save()
+        self.assertEqual((self.fixture.vault / "Gated.md").read_text(encoding="utf-8"),
+                         "# Gated\n")
+        self.assertFalse((self.fixture.vault / "Nope.md").exists())
+
+    def test_writes_from_another_origin_are_refused(self):
+        nid = self.nid("Agents.md")
+        before = (self.fixture.vault / "Agents.md").read_bytes()
+        for headers in ({"Origin": "http://evil.com"}, {"Sec-Fetch-Site": "cross-site"}):
+            status, _ = self.call("POST", f"/api/note/{nid}/source",
+                                  {"text": "x", "baseHash": hashlib.sha256(before).hexdigest()},
+                                  headers)
+            self.assertEqual(status, 403, headers)
+            status, _ = self.call("POST", "/api/note/create",
+                                  {"brain": self.fixture.brain_id, "title": "Evil"}, headers)
+            self.assertEqual(status, 403, headers)
+        status, _ = self.call("GET", f"/api/note/{nid}/source", headers={"Host": "evil.com"})
+        self.assertEqual(status, 403)
+        self.assertEqual((self.fixture.vault / "Agents.md").read_bytes(), before)
+        self.assertFalse((self.fixture.vault / "Evil.md").exists())
+
+    # ---- creating --------------------------------------------------------
+    def test_create_makes_an_empty_note_at_the_vault_root(self):
+        status, out = self.call("POST", "/api/note/create",
+                                {"brain": self.fixture.brain_id, "title": "Brand New Idea"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(set(out), {"nid"})
+        path = self.fixture.vault / "Brand New Idea.md"
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.read_bytes(), b"")
+        status, src = self.call("GET", f"/api/note/{out['nid']}/source")
+        self.assertEqual(status, 200)
+        self.assertEqual(src["relPath"], "Brand New Idea.md")
+        self.assertEqual(src["text"], "")
+        # And it resolves like any other link target, straight away.
+        status, hit = self.call("GET", "/api/resolve?brain=%s&title=Brand%%20New%%20Idea"
+                                % self.fixture.brain_id)
+        self.assertEqual((status, hit), (200, {"nid": out["nid"]}))
+
+        status, again = self.call("POST", "/api/note/create",
+                                  {"brain": self.fixture.brain_id, "title": "Brand New Idea"})
+        self.assertEqual(status, 409, again)
+
+    def test_create_refuses_titles_that_are_not_one_plain_name(self):
+        for title in ("../escape", "a/b", "a\\b", ".hidden", "x..y", "bad\x00", "line\nbreak", ""):
+            status, _ = self.call("POST", "/api/note/create",
+                                  {"brain": self.fixture.brain_id, "title": title})
+            self.assertEqual(status, 400, repr(title))
+        self.assertFalse((Path(self.fixture.tmp.name) / "escape.md").exists())
+
+    def test_create_in_an_unknown_brain_is_a_404(self):
+        status, _ = self.call("POST", "/api/note/create",
+                              {"brain": "no-such-brain", "title": "Orphan"})
+        self.assertEqual(status, 404)
+
+    # ---- resolving -------------------------------------------------------
+    def test_resolve_matches_wikilink_rendering(self):
+        want = self.nid("Protocols.md")
+        brain = self.fixture.brain_id
+        for title in ("Protocols", "protocols", "Protocols#Transport",
+                      "Protocols|the protocols", "Protocols#H|alias"):
+            status, out = self.call("GET", "/api/resolve?" + urllib.parse.urlencode(
+                {"brain": brain, "title": title}))
+            self.assertEqual((status, out), (200, {"nid": want}), title)
+
+    def test_resolve_falls_back_to_any_brain(self):
+        want = self.nid("Protocols.md")
+        status, out = self.call("GET", "/api/resolve?brain=elsewhere&title=Protocols")
+        self.assertEqual((status, out), (200, {"nid": want}))
+
+    def test_resolve_of_an_unknown_target_is_a_404(self):
+        status, _ = self.call("GET", "/api/resolve?" + urllib.parse.urlencode(
+            {"brain": self.fixture.brain_id, "title": "Nothing Here"}))
+        self.assertEqual(status, 404)
+        status, _ = self.call("GET", "/api/resolve?brain=x&title=")
+        self.assertEqual(status, 400)
 
 
 class CitationTests(unittest.TestCase):

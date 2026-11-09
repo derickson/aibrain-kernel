@@ -147,6 +147,9 @@ pub fn router(ctx: Shared) -> Router {
         // The day's list keeps its own module; merged before the state so it
         // shares this one Ctx.
         .merge(crate::todo::routes())
+        // The editor: raw source, conditional save, create, wikilink resolve.
+        // Its save route raises the body limit below for itself only.
+        .merge(crate::edit::routes())
         .layer(axum::middleware::from_fn(guard_host))
         // A JSON body here is a to-do or a reindex flag. axum defaults to 2 MB;
         // say the smaller number rather than inherit one chosen for uploads.

@@ -148,6 +148,11 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 # Nothing this API accepts is large: the biggest body is a to-do with a handful
 # of note references. A cap stops an unbounded read into memory.
 MAX_BODY_BYTES = 1 << 20
+# The one exception: saving a note from the editor carries the whole file. The
+# text itself is capped at MAX_NOTE_BYTES (matching aibrain-core's limit); the
+# body cap sits above it because JSON escaping can grow the text on the wire.
+MAX_NOTE_BYTES = 2 * 1024 * 1024
+MAX_NOTE_BODY_BYTES = 8 * 1024 * 1024
 MAX_TODO_BODY = 4000
 
 
@@ -438,12 +443,12 @@ class Handler(BaseHTTPRequestHandler):
             for candidate in header.split(",") if candidate.strip()
         )
 
-    def body(self) -> dict:
+    def body(self, limit: int = MAX_BODY_BYTES) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise BadRequest("Content-Length is not a number")
-        if length < 0 or length > MAX_BODY_BYTES:
+        if length < 0 or length > limit:
             # Refused without reading it, so the bytes are still in the socket;
             # the connection has to go with them or the next request on it
             # would start mid-body.
@@ -766,6 +771,52 @@ def build_router(state: State) -> Router:
             "relPath": page.get("rel_path", ""),
             "linked": [state.decorate(row) for row in page.get("linked", [])],
         })
+
+    # ---- the editor ------------------------------------------------------
+    # Proxies to aibrain-core, which owns every check that matters: the path
+    # is derived from the note's database row, confined to its vault after
+    # symlinks are resolved, and only enabled brains are writable. What is
+    # checked here is shape and size, so a bad request fails before it costs a
+    # hop. The POSTs go through `_dispatch`'s host and origin checks like
+    # every other state-changing route.
+    def relay(h: Handler, status: int, payload: dict) -> None:
+        h.json(payload if isinstance(payload, dict) else {}, status)
+
+    def note_source(h: Handler, nid: str) -> None:
+        status, payload = state.corpus.note_source(_int_id(nid, "note id"))
+        relay(h, status, payload)
+
+    def save_note_source(h: Handler, nid: str) -> None:
+        note_id = _int_id(nid, "note id")
+        payload = h.body(limit=MAX_NOTE_BODY_BYTES)
+        text, base_hash = payload.get("text"), payload.get("baseHash")
+        if not isinstance(text, str):
+            raise BadRequest("text must be a string")
+        if not isinstance(base_hash, str) or not base_hash:
+            raise BadRequest("baseHash is required")
+        if len(text.encode("utf-8", "surrogatepass")) > MAX_NOTE_BYTES:
+            h.fail("that note is too large to save here", 413)
+            return
+        status, out = state.corpus.save_note_source(note_id, text, base_hash[:128])
+        relay(h, status, out)
+
+    def create_note(h: Handler) -> None:
+        payload = h.body()
+        brain_id, title = payload.get("brain"), payload.get("title")
+        if not isinstance(brain_id, str) or not brain_id or len(brain_id) > 256:
+            raise BadRequest("brain is required")
+        if not isinstance(title, str) or not title.strip():
+            raise BadRequest("title is required")
+        status, out = state.corpus.create_note(brain_id, title[:1024])
+        relay(h, status, out)
+
+    def resolve(h: Handler) -> None:
+        q = h.query()
+        title = q.get("title", "")
+        if not title.strip():
+            raise BadRequest("title is required")
+        status, out = state.corpus.resolve(q.get("brain", "")[:256], title[:1024])
+        relay(h, status, out)
 
     def node(h: Handler, gid: str) -> None:
         """Universe node id → note id, so a click in 3D opens the right note."""
@@ -1355,6 +1406,10 @@ def build_router(state: State) -> Router:
     router.get("/api/search", search)
     router.get("/api/recent", recent)
     router.get("/api/note/<nid>", note)
+    router.get("/api/note/<nid>/source", note_source)
+    router.post("/api/note/<nid>/source", save_note_source)
+    router.post("/api/note/create", create_note)
+    router.get("/api/resolve", resolve)
     router.get("/api/node/<gid>", node)
     # The history route is registered before /api/todos/<tid> so "history" is
     # never read as an id.

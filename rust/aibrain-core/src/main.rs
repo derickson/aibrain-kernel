@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod db;
+mod edit;
 mod es;
 mod events;
 mod graph;

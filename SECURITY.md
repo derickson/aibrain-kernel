@@ -29,10 +29,14 @@ A single-user desktop app. Two servers on loopback with no authentication:
 | `aibrain/server.py` | 127.0.0.1:8760 | the browser, the user's shell |
 | `rust/aibrain-core` | 127.0.0.1:8781 | the Python server, the user's shell |
 
-The corpus is the user's Obsidian vaults: personal notes, read-only to this
-app. The data of value is the notes themselves; the capability of value is
-that the app can start subprocesses (maintenance scripts, ACP agents) as the
-user.
+The corpus is the user's Obsidian vaults: personal notes. Until the note
+editor was added the app only ever read them; it now writes to them through
+exactly two routes — saving an existing note and creating an empty one at a
+vault's root (see [The note editor's write surface](#the-note-editors-write-surface)).
+Nothing else writes into a vault. The data of value is the notes themselves;
+the capabilities of value are that the app can start subprocesses
+(maintenance scripts, ACP agents) as the user, and that it can now overwrite a
+note.
 
 **In scope.** Anything reachable from a web page the user did not write, and
 anything the *contents of a note* can do — a note is untrusted input, because
@@ -40,7 +44,8 @@ it can be anything you pasted. Concretely:
 
 - a page on another origin reading or driving the API (CSRF, DNS rebinding),
 - a note whose text becomes markup in the reader (XSS),
-- a request making the servers read or write outside the vaults,
+- a request making the servers read or write outside the vaults, or write
+  a file inside one that is not a note,
 - a request choosing what subprocess runs,
 - credentials reaching a log, a response or the repository.
 
@@ -50,6 +55,80 @@ runs; whoever writes it has already won, and no check here would change that.
 Multi-user or network deployment is not a supported configuration: the checks
 below assume loopback and would need real authentication before this could be
 bound anywhere else.
+
+## The note editor's write surface
+
+Added after the review above, on the `obsidian-editor` branch. Four routes,
+each a thin Python proxy (`aibrain/server.py`) in front of a Rust handler
+(`rust/aibrain-core/src/edit.rs`), which is where every check that matters
+lives:
+
+| Python | Rust | Does |
+|---|---|---|
+| `GET /api/note/<nid>/source` | `GET /note/:id/source` | the raw file and its sha256 |
+| `POST /api/note/<nid>/source` | `POST /note/:id/source` | replace the file, if it still has `baseHash` |
+| `POST /api/note/create` | `POST /notes/create` | create an empty `<title>.md` at a vault root |
+| `GET /api/resolve` | `GET /resolve` | a wikilink target to a note id (read-only) |
+
+What a hostile caller would want — write somewhere outside a vault, write a
+non-note file, overwrite a note in a vault the user switched off, or drive any
+of it from another origin — and what stops it:
+
+- **The path is never the caller's.** A save names a note *id*; the file is
+  `brain.root` + `note.rel_path` from that database row (`db::note_location`).
+  The row came from our own scan, and is still re-checked
+  (`check_rel_path`): every component must be a plain name — no `..`, no
+  root, no `.` — and the extension `.md` or `.markdown`.
+- **Confinement after symlinks.** `confine_existing` canonicalises the brain
+  root and the target and requires the one to be a strict prefix of the
+  other, so a symlink inside a vault that points out of it — to a file or to
+  a directory — is refused, not followed. The extension is checked again on
+  the resolved path, so `Alias.md -> notes.txt` is refused too. The write
+  then goes to the resolved real file.
+- **A create takes a title, not a path.** `validate_title` refuses (rather
+  than sanitises) an empty title, one over 200 characters, or one containing
+  `/`, `\`, `..`, a control character, or a leading `.`. `confine_new` puts
+  `<title>.md` directly under the canonical root and refuses if anything at
+  all is at that name, including a dangling symlink; the file is then opened
+  `create_new` (`O_EXCL`), which neither overwrites nor follows a link planted
+  between the check and the open.
+- **Only enabled brains.** The brain must be enabled in the database *and* be
+  in the current `config.json` (which only yields enabled brains whose
+  directory exists), and the two must canonicalise to the same root. A brain
+  switched off in the UI is refused immediately, before any reindex retires
+  its rows.
+- **Origin and host.** Both POSTs go through `Handler._dispatch`, so the
+  `Host` must be loopback and a browser request must be same-origin
+  (`Origin`/`Sec-Fetch-Site`), exactly as for every other state-changing
+  route. The Rust side keeps `guard_host`.
+- **No lost writes.** A save is conditional: the caller sends the sha256 of
+  the text it started from, and if the file no longer has it the answer is a
+  409 with the text now on disk; nothing is written. Our own saves are
+  serialised (`WRITE_LOCK`) so the check and the replace cannot interleave
+  between two tabs.
+- **Atomic, permission-preserving replace.** `atomic_replace` writes a hidden
+  `.<name>.aibrain-<pid>-<nonce>.tmp` in the same directory (`create_new`),
+  copies the original's permissions onto it, `fsync`s, and renames it over
+  the original. A crash leaves either the old file or the new one, and the
+  temp name is invisible to the scanner (dot-file) and the watcher (not
+  markdown).
+- **Bounded.** A note is at most 2 MiB to load or save (`MAX_NOTE_BYTES`,
+  enforced in both Python and Rust). Only the save route raises its body
+  limit — to 8 MiB in both servers, because JSON escaping inflates the text
+  on the wire; every other route keeps 1 MiB (Python) / 256 KiB (Rust). A
+  file that is not valid UTF-8 is not offered for editing (422), because
+  saving lossily decoded text would corrupt it.
+- **Errors stay vague.** Refusals carry a fixed sentence; none carries an
+  absolute path.
+
+Still true and accepted: an editor outside the app (Obsidian itself) can
+change the file between our hash check and our rename. The window is a few
+milliseconds and the outcome is the same as two Obsidian windows saving at
+once; the next save from the browser would then see the conflict.
+
+After a write the note is re-ingested at once through the same path the
+watcher uses (`watch::apply_located`), so the index, `/events` and the
+universe catch up whether or not `--watch` is running.
 
 ## Found and fixed
 
@@ -223,7 +302,8 @@ also what applies `_confine`. `line`/`limit` are now parsed defensively.
   `db::redact` before they reach a log line. The Elasticsearch key is only
   ever a request header.
 - **The ingester and the watcher never write into a vault.** Every filesystem
-  write under `vault/` is inside a `#[cfg(test)]` module.
+  write under `vault/` is inside a `#[cfg(test)]` module. The only code that
+  writes into a vault is `rust/aibrain-core/src/edit.rs`, described above.
 - **The ACP agent is confined** to the session directory and the linked vaults
   by `_confine`, which resolves before comparing, and the vault roots are
   generated from the enabled brains rather than hardcoded.
@@ -300,3 +380,16 @@ Every fix above has a test. New ones:
   and refuses every rebinding spelling; an `ApiError` carries no detail.
 - `rust/aibrain-core/src/vault/render.rs` — script URLs in markdown links and
   images are defused; ordinary links are untouched.
+- `rust/aibrain-core/src/edit.rs` — title rules, database-path rules,
+  symlinks out of the vault (file, directory, and a markdown-named link to a
+  non-markdown file) refused, symlinks within it resolved, a vault reached
+  through a symlink still confines, a create never overwrites anything (not
+  even a dangling link), and an atomic replace keeps permissions and leaves
+  no temp file.
+- `tests/test_kernel.py::EditorTests` — raw source and hash, save and
+  immediate re-index without a watcher, permissions kept, stale `baseHash`
+  is a 409 carrying the disk text, a ~1.9 MB save accepted and a >2 MiB one
+  refused, a note swapped for an escaping symlink refused for read and
+  write, a disabled brain refused, cross-origin and rebound-host requests
+  refused, create rules, and resolve (heading, alias, case, brain fallback,
+  404).

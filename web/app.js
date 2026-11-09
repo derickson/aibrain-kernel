@@ -5,6 +5,7 @@
 // browser. State lives in one object and every change goes through render().
 
 import { createUniverse } from './universe.js';
+import { createWorkspace } from './workspace.js';
 
 // ───────────────────────────── helpers ──────────────────────────────────
 
@@ -106,6 +107,17 @@ const S = {
   live: null,          // the /api/events subscription, while it is open
 };
 
+// The note tabs and their editor. Mounted once; renderNote shows or hides
+// the section it lives in.
+const WS = createWorkspace({
+  api, toast, el,
+  onActivate: tab => onTabActivated(tab),
+  onOpenUrl: href => { if (/^(https?|mailto|obsidian):/i.test(href || '')) window.open(href, '_blank', 'noopener'); },
+  brainName: id => S.data?.brains?.find(b => b.id === id)?.name || '',
+});
+$('#ws-strip').append(WS.strip);
+$('#note-editor').append(WS.nav, WS.banner, WS.title, WS.host);
+
 // ───────────────────────────── boot ─────────────────────────────────────
 
 async function boot() {
@@ -126,6 +138,8 @@ async function boot() {
   }
   await loadUniverse();
   subscribeEvents();
+  // Tabs from last time come back, closed; the panel shows them when opened.
+  if (WS.restore() && WS.activeTab) WS.activate(WS.activeTab.key);
 }
 
 function bootText(title, sub) {
@@ -290,7 +304,10 @@ async function refreshUniverse(event) {
   refreshStatus().then(renderStatus).catch(() => {});
   // The results list holds titles and snippets that may have just changed.
   if (S.query.trim()) runSearch(S.query);
-  if (S.note && event?.note_id === S.note.nid) openNote(S.note.nid, S.noteFrom);
+  // An edit on disk (Obsidian, an agent, our own save) reaches the open tab
+  // without clobbering anything typed here; the workspace decides.
+  if (event?.note_id != null && WS.hasNid(event.note_id)) WS.externalChange(event.note_id);
+  if (S.note && event?.note_id === S.note.nid) onTabActivated(WS.activeTab);
   pulseStatus(event);
 }
 
@@ -391,24 +408,53 @@ function openRight() {
 }
 
 function closeRight() {
+  WS.saveAll();
   S.rightOpen = false;
   $('#right').dataset.open = 'false';
   S.note = null;
   S.universe?.focusNode(-1);
 }
 
-async function openNote(nid, from) {
+/**
+ * Open a note in the editor tabs. `event` is the click that asked for it:
+ * ⌘/Ctrl-click (or middle-click) opens a new tab, as in Obsidian.
+ */
+async function openNote(nid, from, event) {
   if (nid == null || nid < 0) return;
   openRight();
+  S.noteFrom = from ?? (S.results.length ? 'results' : null);
+  const newTab = !!(event && (event.metaKey || event.ctrlKey || event.button === 1));
+  await WS.open(nid, { newTab });
+}
+
+/** The workspace switched tabs (or closed the last one). The editor already
+ *  shows the text; this fetches the page around it — meta, links, the star. */
+async function onTabActivated(tab) {
+  if (!tab) { S.note = null; renderNote(); if (!S.query.trim()) openSearchView(); return; }
   try {
-    const note = await api(`/api/note/${nid}`);
+    const note = await api(`/api/note/${tab.nid}`);
+    if (WS.activeTab?.nid !== tab.nid) return;
     S.note = note;
-    S.noteFrom = from ?? (S.results.length ? 'results' : null);
     renderNote();
-    if (note.gid != null && note.gid >= 0) S.universe?.focusNode(note.gid);
+    if (S.rightOpen && note.gid != null && note.gid >= 0) S.universe?.focusNode(note.gid);
   } catch (err) {
     toast(String(err.message || err), true);
   }
+}
+
+function openSearchView() {
+  refreshRecentResults();
+  renderResults();
+}
+
+function toggleWide() {
+  const order = ['', 'wide', 'full'];
+  const right = $('#right');
+  const next = order[(order.indexOf(right.dataset.wide || '') + 1) % order.length];
+  right.dataset.wide = next;
+  $('#right-wide').textContent = next === 'full' ? '⇥' : '⇤';
+  $('#right-wide').title = next === 'full' ? 'Narrow the notes panel' : 'Widen the notes panel';
+  try { localStorage.setItem('aibrain.rightWide', next); } catch { /* fine */ }
 }
 
 function renderNote() {
@@ -432,22 +478,14 @@ function renderNote() {
   ].filter(Boolean);
   $('#note-meta').textContent = bits.join('  ·  ');
 
-  const body = $('#note-body');
-  body.innerHTML = `<h1>${esc(note.name)}</h1>` + note.html;
-  body.onclick = event => {
-    const link = event.target.closest('a.wiki[data-note]');
-    if (link) {
-      event.preventDefault();
-      openNote(Number(link.dataset.note), S.noteFrom);
-    }
-  };
+  // The text itself is the workspace's editor, already mounted.
 
   $('#linked-label').textContent =
     `LINKED NOTES · ${note.linked.length}${note.unresolved.length ? ` · ${note.unresolved.length} UNRESOLVED` : ''}`;
   const linked = $('#linked');
   linked.innerHTML = '';
   for (const item of note.linked) {
-    linked.append(noteRow(item, () => openNote(item.nid, S.noteFrom)));
+    linked.append(noteRow(item, e => openNote(item.nid, S.noteFrom, e)));
   }
   for (const target of note.unresolved) {
     linked.append(el('div', { class: 'row', style: 'opacity:.5;cursor:default' },
@@ -462,7 +500,10 @@ function renderNote() {
 
 function noteRow(item, onClick) {
   const color = item.color || colorForBrain(item.brainId) || 'var(--accent)';
-  const row = el('button', { class: 'row', onclick: onClick },
+  const row = el('button', {
+    class: 'row', onclick: onClick,
+    onauxclick: e => { if (e.button === 1) { e.preventDefault(); onClick(e); } },
+  },
     el('span', { class: 'pip', style: `background:${color}` }),
     el('span', { class: 'col' },
       el('div', { class: 'nm', title: item.name }, item.name),
@@ -508,11 +549,18 @@ const runSearch = debounce(async text => {
     S.results = data.results;
     S.searchMeta = { engine: data.engine || '', ms: Math.round(performance.now() - started) };
     S.universe?.highlight(data.results.map(r => r.gid).filter(g => g != null));
-    renderResults();
+    // A refresh behind an open note (a save, a live event) updates the list
+    // without taking the note off screen; typing in the box shows it anyway.
+    if (resultsShowing()) renderResults();
   } catch (err) {
     toast(String(err.message || err), true);
   }
 }, 160);
+
+/** Is the list (not a note) what the right panel is showing? */
+function resultsShowing() {
+  return $('#note-view').hidden;
+}
 
 function renderResults() {
   S.note = null;
@@ -531,7 +579,7 @@ function renderResults() {
     $('#results-label').textContent = `RECENT${scope}`;
     meta.hidden = true;
     for (const item of S.recentResults) {
-      list.append(noteRow(item, () => openNote(item.nid, 'results')));
+      list.append(noteRow(item, e => openNote(item.nid, 'results', e)));
     }
     return;
   }
@@ -548,7 +596,7 @@ function renderResults() {
     meta.hidden = true;
   }
   for (const item of S.results) {
-    list.append(noteRow(item, () => openNote(item.nid, 'results')));
+    list.append(noteRow(item, e => openNote(item.nid, 'results', e)));
   }
 }
 
@@ -557,7 +605,7 @@ async function loadRecent() {
     const { results } = await api('/api/recent?limit=14');
     const list = $('#recent');
     list.innerHTML = '';
-    for (const item of results) list.append(noteRow(item, () => openNote(item.nid, null)));
+    for (const item of results) list.append(noteRow(item, e => openNote(item.nid, null, e)));
   } catch { /* the panel is still usable without it */ }
 }
 
@@ -566,7 +614,7 @@ async function refreshRecentResults() {
     const scope = S.brainFocus ? `&brains=${encodeURIComponent(S.brainFocus)}` : '';
     const { results } = await api(`/api/recent?limit=60${scope}`);
     S.recentResults = results;
-    if (!S.query.trim()) renderResults();
+    if (!S.query.trim() && resultsShowing()) renderResults();
   } catch { /* non-fatal */ }
 }
 
@@ -1719,8 +1767,20 @@ function wireStaticHandlers() {
     renderResults();
   };
 
+  $('#right-wide').onclick = toggleWide;
+  try {
+    const wide = localStorage.getItem('aibrain.rightWide') || '';
+    if (wide) { $('#right').dataset.wide = wide === 'full' ? 'wide' : ''; toggleWide(); }
+  } catch { /* fine */ }
+
   window.addEventListener('keydown', event => {
-    const typing = /INPUT|TEXTAREA/.test(document.activeElement?.tagName || '');
+    const active = document.activeElement;
+    const inEditor = !!active?.closest?.('.cm-editor');
+    const typing = inEditor || /INPUT|TEXTAREA/.test(active?.tagName || '') || !!active?.isContentEditable;
+    if (S.rightOpen && WS.onKey(event)) return;
+    // The editor handles its own Escape (it lets go of the cursor) and ⌘↩
+    // (it cycles bullet → task → done); neither should reach the app.
+    if (inEditor && (event.key === 'Escape' || event.key === 'Enter')) return;
     if (event.key === '/' && !typing) { event.preventDefault(); openSearch(); }
     if (event.key === 'Escape') {
       if (!$('#drawer').hidden) closeDrawer();
@@ -1739,8 +1799,7 @@ function wireStaticHandlers() {
 function openSearch() {
   openRight();
   S.note = null;
-  refreshRecentResults();
-  renderResults();
+  openSearchView();
   setTimeout(() => $('#query').focus(), 360);
 }
 

@@ -107,6 +107,48 @@ class Corpus:
         except json.JSONDecodeError as exc:
             raise CorpusError(f"{path} did not return JSON: {exc}") from exc
 
+    def _request_status(self, path: str, *, params: dict | None = None,
+                        body: dict | None = None, timeout: float = READ_TIMEOUT,
+                        passthrough: tuple[int, ...] = (400, 403, 404, 409, 413, 422),
+                        ) -> tuple[int, Any]:
+        """`(status, payload)`, for routes whose refusals the caller relays.
+
+        The editor's routes answer a conflict with a body the browser needs
+        (the text now on disk), and a refused title or path with a reason
+        written for the user. `_request` would flatten every one of those to a
+        502; here the statuses in `passthrough` come back as data instead.
+        Anything else still raises `CorpusError`.
+        """
+        url = self.base_url + path
+        if params:
+            clean = {k: v for k, v in params.items() if v not in (None, "")}
+            if clean:
+                url += "?" + urllib.parse.urlencode(clean)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+        if data:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, json.loads(response.read().decode("utf-8") or "null")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in passthrough:
+                raise CorpusError(self._explain(path, exc)) from exc
+            try:
+                payload = json.loads(exc.read().decode("utf-8") or "null")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = None
+            if not isinstance(payload, dict):
+                payload = {"error": f"{path} failed ({exc.code})"}
+            return exc.code, payload
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise CorpusError(
+                f"could not reach aibrain-core at {self.base_url} ({exc}) — "
+                f"is it running?"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise CorpusError(f"{path} did not return JSON: {exc}") from exc
+
     def _explain(self, path: str, exc: urllib.error.HTTPError) -> str:
         """Prefer the service's own error text over an HTTP status code."""
         detail = ""
@@ -244,6 +286,24 @@ class Corpus:
     def note_by_path(self, brain_id: str, rel_path: str) -> dict | None:
         return self._request("/notes/by-path", allow_404=True,
                              params={"brain": brain_id, "path": rel_path})
+
+    # ---- the editor ------------------------------------------------------
+    # Each returns `(status, payload)`: a 409 carries the text on disk, and a
+    # refusal carries a reason, both of which the browser shows.
+    def note_source(self, note_id: int) -> tuple[int, dict]:
+        return self._request_status(f"/note/{note_id}/source")
+
+    def save_note_source(self, note_id: int, text: str, base_hash: str) -> tuple[int, dict]:
+        return self._request_status(f"/note/{note_id}/source",
+                                    body={"text": text, "baseHash": base_hash})
+
+    def create_note(self, brain_id: str, title: str) -> tuple[int, dict]:
+        return self._request_status("/notes/create",
+                                    body={"brain": brain_id, "title": title})
+
+    def resolve(self, brain_id: str, title: str) -> tuple[int, dict]:
+        return self._request_status("/resolve",
+                                    params={"brain": brain_id, "title": title})
 
     def recent(self, limit: int = 24, brain_ids: list[str] | None = None) -> list[dict]:
         params: dict = {"limit": limit}

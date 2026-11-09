@@ -126,8 +126,10 @@
           <input id="query" placeholder="Search notes across all brains…" autocomplete="off" spellcheck="false">
           <button class="clear-q" id="clear-q" hidden>×</button>
         </div>
+        <button class="icon-btn" id="right-wide" title="Widen the notes panel">⇤</button>
         <button class="icon-btn" id="right-close" title="Close">×</button>
       </header>
+      <div id="ws-strip"></div>
 
       <div class="right-body" id="right-body">
 
@@ -139,8 +141,8 @@
               <span id="note-crumb"></span>
             </div>
           </div>
+          <div class="note-editor" id="note-editor"></div>
           <div class="note-meta mono" id="note-meta"></div>
-          <article class="note" id="note-body"></article>
           <div class="label mono" id="linked-label">LINKED NOTES</div>
           <div class="linked" id="linked"></div>
         </section>

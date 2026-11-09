@@ -168,15 +168,25 @@ pub(crate) async fn apply(
     cfg: &crate::config::Config,
     touched: HashSet<PathBuf>,
 ) -> anyhow::Result<()> {
+    let located: Vec<(&crate::config::BrainSpec, String)> =
+        touched.iter().filter_map(|path| locate(&cfg.brains, path)).collect();
+    apply_located(ctx, &located).await
+}
+
+/// The body of [`apply`], for a caller that already knows which brain and
+/// relative path each file is — the editor, which takes both from the note's
+/// database row and so never has to map a real path back to a vault.
+pub(crate) async fn apply_located(
+    ctx: &Arc<Ctx>,
+    located: &[(&crate::config::BrainSpec, String)],
+) -> anyhow::Result<()> {
     let before = crate::db::brain_fingerprints(&ctx.pool).await?;
     // brain id -> the notes in it this round rewrote.
     let mut written: BTreeMap<String, Vec<i64>> = BTreeMap::new();
 
-    for path in touched {
-        let Some((brain, rel)) = locate(&cfg.brains, &path) else {
-            continue;
-        };
-        match ingest::ingest_one(&ctx.pool, brain, &rel).await {
+    for (brain, rel) in located {
+        let (brain, rel) = (*brain, rel.as_str());
+        match ingest::ingest_one(&ctx.pool, brain, rel).await {
             Ok(Some(note_id)) => {
                 tracing::info!("changed {}/{}", brain.name, rel);
                 written.entry(brain.id.clone()).or_default().push(note_id);
