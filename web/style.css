@@ -963,6 +963,13 @@ body.resizing .canvas { pointer-events: none; }
 .icon-btn.sm { width: 26px; height: 26px; font-size: 13px; border-radius: 6px; }
 .icon-btn[disabled] { opacity: .3; cursor: default; }
 .icon-btn.on { color: var(--accent); border-color: var(--line-strong); }
+.ws-mode {
+  height: 26px; padding: 0 10px; border-radius: 13px; flex: none;
+  border: 1px solid rgba(127, 216, 232, .14); color: var(--fg-faint);
+  font: 600 11px Manrope, system-ui, sans-serif;
+}
+.ws-mode:hover { color: #fff; border-color: var(--line-strong); }
+.ws-mode.on { color: var(--accent); border-color: rgba(127, 216, 232, .4); background: rgba(127, 216, 232, .08); }
 .ws-save { font-size: 9px; color: var(--fg-mute); margin-right: 4px; }
 .ws-save[data-state="dirty"] { color: #f0c070; }
 .ws-save[data-state="conflict"] { color: #ff9b8f; }

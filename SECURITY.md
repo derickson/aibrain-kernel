@@ -106,12 +106,17 @@ of it from another origin — and what stops it:
   409 with the text now on disk; nothing is written. Our own saves are
   serialised (`WRITE_LOCK`) so the check and the replace cannot interleave
   between two tabs.
-- **Atomic, permission-preserving replace.** `atomic_replace` writes a hidden
-  `.<name>.aibrain-<pid>-<nonce>.tmp` in the same directory (`create_new`),
-  copies the original's permissions onto it, `fsync`s, and renames it over
-  the original. A crash leaves either the old file or the new one, and the
-  temp name is invisible to the scanner (dot-file) and the watcher (not
-  markdown).
+- **In-place write with a recovery copy.** A save first writes the new text
+  to a hidden `.aibrain-<pid>-<nonce>.tmp` beside the note (`create_new`)
+  and `fsync`s it, *before* the hash check. Under the lock it then checks
+  the hash and writes the bytes over the note itself — same inode, so its
+  creation date, permissions, extended attributes (Finder tags), ACLs and
+  hard links survive, as they do when Obsidian saves — trims it, `fsync`s,
+  and only then deletes the copy. If the write fails or the process dies
+  part-way, the copy is still there with the user's text. The copy is
+  invisible to the scanner (dot-file) and the watcher (not markdown). The
+  trade: a reader racing the write can briefly see the new text before it
+  is trimmed, which is how Obsidian's own writes behave.
 - **Bounded.** A note is at most 2 MiB to load or save (`MAX_NOTE_BYTES`,
   enforced in both Python and Rust). Only the save route raises its body
   limit — to 8 MiB in both servers, because JSON escaping inflates the text
@@ -122,9 +127,10 @@ of it from another origin — and what stops it:
   absolute path.
 
 Still true and accepted: an editor outside the app (Obsidian itself) can
-change the file between our hash check and our rename. The window is a few
-milliseconds and the outcome is the same as two Obsidian windows saving at
-once; the next save from the browser would then see the conflict.
+change the file between our hash check and our write. The slow `fsync` of
+the recovery copy happens before the check, so the window is a read, a hash
+and a write of the note; the outcome is the same as two Obsidian windows
+saving at once.
 
 After a write the note is re-ingested at once through the same path the
 watcher uses (`watch::apply_located`), so the index, `/events` and the
@@ -384,7 +390,7 @@ Every fix above has a test. New ones:
   symlinks out of the vault (file, directory, and a markdown-named link to a
   non-markdown file) refused, symlinks within it resolved, a vault reached
   through a symlink still confines, a create never overwrites anything (not
-  even a dangling link), and an atomic replace keeps permissions and leaves
+  even a dangling link), and a save keeps the inode, permissions and leaves
   no temp file.
 - `tests/test_kernel.py::EditorTests` — raw source and hash, save and
   immediate re-index without a watcher, permissions kept, stale `baseHash`

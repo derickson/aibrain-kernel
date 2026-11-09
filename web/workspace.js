@@ -40,7 +40,8 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
   const fwdBtn = el('button', { class: 'icon-btn sm', title: 'Forward (⌘⌥→)', onclick: () => go(1) }, '→');
   const saveState = el('span', { class: 'ws-save mono' });
   const pinBtn = el('button', { class: 'icon-btn sm', title: 'Pin tab', onclick: () => togglePin(W.active) }, '⌖');
-  nav.append(backBtn, fwdBtn, el('span', { class: 'ws-spacer' }), saveState, pinBtn);
+  const modeBtn = el('button', { class: 'ws-mode', onclick: () => toggleMode() });
+  nav.append(backBtn, fwdBtn, el('span', { class: 'ws-spacer' }), saveState, modeBtn, pinBtn);
   const banner = el('div', { class: 'ws-banner', hidden: true });
   const title = el('h1', { class: 'ws-title' });
   const host = el('div', { class: 'ws-editor' });
@@ -66,7 +67,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
       doc.dirty = textOf(state, doc.sep) !== doc.savedText;
       renderSave();
       clearTimeout(doc.timer);
-      if (doc.dirty && !doc.conflict) doc.timer = setTimeout(() => save(nid), SAVE_DELAY);
+      if (doc.dirty && !doc.conflict && !doc.missing) doc.timer = setTimeout(() => save(nid), SAVE_DELAY);
     },
     onSave: () => { if (shownNid != null) save(shownNid); },
     onOpenLink: (target, how) => followLink(target, how),
@@ -135,7 +136,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
       // file with consistent line endings that is the file itself; for one
       // with mixed endings it differs, but only an actual edit saves it.
       const fresh = { name: src.name, state, sep, hash: src.hash, savedText: textOf(state, sep),
-                      dirty: false, saving: null, timer: null, conflict: null };
+                      dirty: false, saving: null, timer: null, conflict: null, missing: false };
       if (doc) {
         Object.assign(doc, fresh);
         if (shownNid === nid) editor.setState(doc.state);
@@ -161,6 +162,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     const text = textOf(doc.state, doc.sep);
     if (text === doc.savedText && !overwrite) { doc.dirty = false; renderSave(); return; }
     if (doc.conflict && !overwrite) return;
+    if (doc.missing) return;               // the banner offers where to put it
     const run = (async () => {
       try {
         const base = overwrite && doc.conflict ? doc.conflict.hash : doc.hash;
@@ -177,6 +179,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
           renderBanner();
           return;
         }
+        if (out.status === 404) { handleMissing(nid); return; }
         if (!out.ok) throw new Error(data.error || `save failed (${out.status})`);
         doc.hash = data.hash;
         doc.savedText = text;
@@ -200,7 +203,9 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     const doc = W.docs.get(nid);
     if (!doc || doc.saving) return;
     try {
-      const src = await api(`/api/note/${nid}/source`);
+      const { status, data: src } = await call(`/api/note/${nid}/source`);
+      if (status === 404) { handleMissing(nid); return; }
+      if (status !== 200) return;
       if (src.hash === doc.hash) return;       // our own save coming back
       if (doc.dirty) {
         doc.conflict = { text: src.text, hash: src.hash };
@@ -210,6 +215,94 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
         renderBanner();
       }
     } catch { /* deleted or unreachable; leave the text alone */ }
+  }
+
+  // ─────────────────────── renamed / deleted notes ───────────────────
+
+  /** fetch → {status, data}, for the places a 404 or 409 means something. */
+  async function call(path, body) {
+    const out = await fetch(path, body === undefined ? {} : {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    return { status: out.status, data: await out.json().catch(() => ({})) };
+  }
+
+  /**
+   * The note behind an open doc is gone: deleted, renamed or moved outside
+   * the editor (a rename or move gives it a new id). Stop autosaving, and
+   * look for it by title — a note moved to another folder keeps its title,
+   * and the tab and any unsaved text follow it there. Otherwise the banner
+   * offers "Save as new note" and "Copy text"; nothing is thrown away.
+   */
+  async function handleMissing(nid) {
+    const doc = W.docs.get(nid);
+    if (!doc || doc.missing) return;
+    doc.missing = true;
+    clearTimeout(doc.timer);
+    renderBanner();
+    const brain = W.tabs.find(t => t.nid === nid)?.brainId || '';
+    const { status, data } = await call(
+      `/api/resolve?brain=${encodeURIComponent(brain)}&title=${encodeURIComponent(doc.name || '')}`);
+    if (status !== 200 || data.nid === nid || W.docs.get(nid) !== doc || W.docs.has(data.nid)) return;
+    const src = await call(`/api/note/${data.nid}/source`);
+    if (src.status !== 200 || W.docs.get(nid) !== doc) return;
+    rebind(nid, data.nid, src.data);
+    if (src.data.text !== doc.savedText) {
+      // It moved and changed: same as any edit on disk under ours.
+      if (doc.dirty) doc.conflict = { text: src.data.text, hash: src.data.hash };
+      else await loadDoc(data.nid, { force: true });
+    } else if (doc.dirty) {
+      save(data.nid);
+    }
+    toast(`“${doc.name}” moved; its tab follows it.`);
+    renderTabs();
+    renderBanner();
+  }
+
+  /** Point every tab, history entry and the editor from note `from` to `to`. */
+  function rebind(from, to, src) {
+    const doc = W.docs.get(from);
+    W.docs.delete(from);
+    W.docs.set(to, doc);
+    doc.missing = false;
+    doc.hash = src.hash;
+    doc.name = src.name || doc.name;
+    const swap = n => (n === from ? to : n);
+    for (const tab of W.tabs) {
+      tab.nid = swap(tab.nid);
+      tab.back = tab.back.map(swap);
+      tab.fwd = tab.fwd.map(swap);
+      if (tab.nid === to) { tab.title = doc.name; tab.brainId = src.brainId || tab.brainId; }
+    }
+    if (shownNid === from) shownNid = to;
+    persist();
+    const tab = activeTab();
+    if (tab?.nid === to) { title.textContent = tab.title; onActivate?.(tab); }
+  }
+
+  /** Write a missing note's text to a fresh note in the same brain. */
+  async function saveAsNew(nid) {
+    const doc = W.docs.get(nid);
+    const brain = W.tabs.find(t => t.nid === nid)?.brainId;
+    if (!doc || !brain) { toast('Not saved: no brain to put it in', true); return; }
+    const base = doc.name || 'Recovered note';
+    for (const title of [base, `${base} (recovered)`, ...[2, 3, 4, 5].map(n => `${base} (recovered ${n})`)]) {
+      const made = await call('/api/note/create', { brain, title });
+      if (made.status === 409) continue;
+      if (made.status !== 200) { toast(`Not saved: ${made.data.error || made.status}`, true); return; }
+      const src = await call(`/api/note/${made.data.nid}/source`);
+      if (src.status !== 200) { toast(`Not saved: ${src.data.error || src.status}`, true); return; }
+      rebind(nid, made.data.nid, src.data);
+      doc.savedText = src.data.text;      // the new, empty file
+      doc.conflict = null;
+      doc.dirty = true;
+      await save(made.data.nid);
+      renderTabs();
+      renderBanner();
+      toast(`Saved as “${doc.name}”.`);
+      return;
+    }
+    toast('Not saved: every recovered name is taken', true);
   }
 
   // ─────────────────────────── tabs ──────────────────────────────────
@@ -370,6 +463,7 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     } catch {
       // Unresolved: Obsidian makes the note. Ask first; it writes a file.
       if (!brain) return;
+      if (!M.editing) { toast(`“${name}” doesn't exist yet — switch to editing (⌘E) to create it`); return; }
       const make = await confirmCreate(name);
       if (!make) return;
       try {
@@ -462,9 +556,9 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
   function renderSave() {
     const tab = activeTab();
     const doc = tab && W.docs.get(tab.nid);
-    saveState.textContent = !doc ? '' : doc.conflict ? 'CONFLICT' : doc.saving ? 'SAVING…'
+    saveState.textContent = !doc ? '' : doc.missing ? 'NOT SAVED' : doc.conflict ? 'CONFLICT' : doc.saving ? 'SAVING…'
       : doc.dirty ? 'EDITED' : 'SAVED';
-    saveState.dataset.state = !doc ? '' : doc.conflict ? 'conflict' : doc.dirty || doc.saving ? 'dirty' : 'saved';
+    saveState.dataset.state = !doc ? '' : doc.conflict || doc.missing ? 'conflict' : doc.dirty || doc.saving ? 'dirty' : 'saved';
     // the dirty dot on the tab
     const node = strip.querySelector('.ws-tab.on');
     if (node) {
@@ -478,7 +572,21 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
     const tab = activeTab();
     const doc = tab && W.docs.get(tab.nid);
     banner.innerHTML = '';
-    banner.hidden = !doc?.conflict;
+    banner.hidden = !doc?.conflict && !doc?.missing;
+    if (doc?.missing) {
+      banner.append(
+        el('span', {}, 'This note was renamed, moved or deleted outside the editor. Your text is still here.'),
+        el('button', { class: 'btn ghost sm', onclick: async () => {
+          try {
+            await navigator.clipboard.writeText(textOf(doc.state, doc.sep));
+            toast('Copied');
+          } catch { toast('Could not copy', true); }
+        } }, 'Copy text'),
+        el('button', { class: 'btn primary sm', onclick: () => saveAsNew(tab.nid) }, 'Save as new note'),
+      );
+      renderSave();
+      return;
+    }
     if (!doc?.conflict) { renderSave(); return; }
     banner.append(
       el('span', {}, 'This note changed on disk while you were editing.'),
@@ -505,6 +613,9 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
       if (t && !t.pinned) close(t.key);
       return true;
     }
+    if (mod && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'e') {
+      event.preventDefault(); toggleMode(); return true;
+    }
     if (event.ctrlKey && event.key === 'Tab') { event.preventDefault(); cycle(event.shiftKey ? -1 : 1); return true; }
     return false;
   }
@@ -516,7 +627,61 @@ export function createWorkspace({ api, toast, el, onActivate, onOpenUrl, brainNa
   });
   window.addEventListener('blur', saveAll);
 
+  // ─────────────────────── reading vs editing ────────────────────────
+  //
+  // Notes are read-only while Obsidian is running on the server's machine
+  // (or while we cannot tell), and editable when it is closed. The toggle
+  // (⌘E) overrides either way until Obsidian opens or closes, which hands
+  // the decision back to the automatic rule.
+
+  const M = { obsidian: null, choice: null, editing: false };
+
+  function applyMode({ announce = false } = {}) {
+    const editing = M.choice ? M.choice === 'edit' : M.obsidian === false;
+    const was = M.editing;
+    M.editing = editing;
+    if (was && !editing) saveAll();           // flush before locking
+    editor.setEditable(editing);
+    modeBtn.textContent = editing ? '✎ Editing' : '◉ Reading';
+    modeBtn.classList.toggle('on', editing);
+    modeBtn.title = editing
+      ? (M.choice === 'edit' && M.obsidian !== false
+        ? 'Editing even though Obsidian is open — ⌘E to go back to reading'
+        : 'Obsidian is closed, so notes are editable — ⌘E to read only')
+      : (M.obsidian === true ? 'Obsidian is open, so notes are read-only — ⌘E to edit anyway'
+        : M.obsidian === null && !M.choice ? 'Cannot tell whether Obsidian is open — ⌘E to edit anyway'
+          : 'Read only — ⌘E to edit');
+    if (announce && was !== editing) {
+      toast(editing ? 'Obsidian closed — notes are editable'
+                    : 'Obsidian is open — notes are read-only (⌘E to edit anyway)');
+    }
+  }
+
+  function toggleMode() {
+    M.choice = M.editing ? 'read' : 'edit';
+    applyMode();
+    if (M.editing) editor.focus();
+  }
+
+  async function pollObsidian() {
+    let running = null;
+    try {
+      const out = await fetch('/api/obsidian');
+      if (out.ok) running = (await out.json()).running ?? null;
+    } catch { /* server unreachable: stays unknown */ }
+    if (running === M.obsidian) return;
+    const first = M.obsidian === null && M.choice === null;
+    M.obsidian = running;
+    if (running !== null) M.choice = null;    // Obsidian opened or closed: back to auto
+    applyMode({ announce: !first && running !== null });
+  }
+  applyMode();
+  pollObsidian();
+  setInterval(() => { if (!document.hidden) pollObsidian(); }, 4000);
+  window.addEventListener('focus', pollObsidian);
+
   return {
+    get editing() { return M.editing; },
     strip, nav, banner, title, host, fallback,
     open, close, activate, restore, externalChange, onKey, saveAll,
     get activeTab() { return activeTab(); },

@@ -17,6 +17,7 @@ import mimetypes
 import re
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import traceback
@@ -154,6 +155,35 @@ MAX_BODY_BYTES = 1 << 20
 MAX_NOTE_BYTES = 2 * 1024 * 1024
 MAX_NOTE_BODY_BYTES = 8 * 1024 * 1024
 MAX_TODO_BODY = 4000
+
+
+# ---- is Obsidian running? ------------------------------------------------
+# The note editor defaults to read-only while Obsidian is open on this
+# machine, so the two never have the same note under someone's fingers. This
+# asks the OS, here, because the browser may be on another machine. It is a
+# process check and nothing more: Obsidian open on any vault counts.
+_OBSIDIAN_TTL = 2.0
+_obsidian_cache: tuple[float, bool | None] = (0.0, None)
+_obsidian_lock = threading.Lock()
+
+
+def obsidian_running() -> bool | None:
+    """True/False, or None when the check itself could not run."""
+    global _obsidian_cache
+    with _obsidian_lock:
+        at, value = _obsidian_cache
+        if time.monotonic() - at < _OBSIDIAN_TTL:
+            return value
+        try:
+            # -x: the whole process name, -i: "Obsidian" on macOS, "obsidian"
+            # on Linux. Exit 0 = found, 1 = not found, anything else = error.
+            code = subprocess.run(["pgrep", "-xi", "obsidian"], capture_output=True,
+                                  timeout=2).returncode
+            value = True if code == 0 else False if code == 1 else None
+        except (OSError, subprocess.SubprocessError):
+            value = None
+        _obsidian_cache = (time.monotonic(), value)
+        return value
 
 
 def _hostname(netloc: str) -> str:
@@ -1405,6 +1435,7 @@ def build_router(state: State) -> Router:
     router.get("/api/status", status)
     router.get("/api/search", search)
     router.get("/api/recent", recent)
+    router.get("/api/obsidian", lambda h: h.json({"running": obsidian_running()}))
     router.get("/api/note/<nid>", note)
     router.get("/api/note/<nid>/source", note_source)
     router.post("/api/note/<nid>/source", save_note_source)

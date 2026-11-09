@@ -218,42 +218,78 @@ pub fn confine_new(root: &Path, title: &str) -> Result<PathBuf, Refusal> {
     Ok(target)
 }
 
-/// Replace `real` with `bytes` atomically, keeping its permissions.
+/// A save in two steps, so the note itself is updated in place.
 ///
-/// The temp file is hidden and ends in `.tmp`, so neither the scanner (which
-/// skips dot-files) nor the watcher (which only reacts to markdown) ever
-/// ingests it, even if we die before the rename.
-pub fn atomic_replace(real: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Replacing the file by rename (the usual atomic write) gives the note a new
+/// inode on every save: its creation date resets (Obsidian's "created" sort,
+/// Dataview's `file.ctime`), and Finder tags, other extended attributes, ACLs
+/// and hard links are lost. Obsidian itself writes notes in place, so we do
+/// too — and keep what atomicity bought us with a recovery copy instead:
+///
+/// 1. [`write_recovery`] puts the new text in a hidden `.aibrain-<nonce>.tmp`
+///    beside the note and `fsync`s it. This is the slow part, and it runs
+///    before the hash check, outside the window where Obsidian could slip a
+///    write in between our check and our write.
+/// 2. [`overwrite_in_place`] writes the bytes over the note (same inode),
+///    trims it to length and `fsync`s. Only then is the recovery copy removed.
+///    If anything fails, or the process dies, the copy stays: the user's text
+///    is on disk either way.
+///
+/// The copy's name is short (a long note name plus a suffix could exceed the
+/// 255-byte name limit), hidden, and not markdown, so neither the scanner
+/// (skips dot-files) nor the watcher (markdown only) ever ingests it.
+pub fn write_recovery(real: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    let perms = std::fs::metadata(real)?.permissions();
     let dir = real
         .parent()
         .ok_or_else(|| std::io::Error::other("a note always has a parent directory"))?;
-    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(".{name}.aibrain-{}-{nonce}.tmp", std::process::id()));
-
+    let tmp = dir.join(format!(".aibrain-{}-{nonce:x}.tmp", std::process::id()));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         file.write_all(bytes)?;
-        file.set_permissions(perms)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, real)?;
-        // Make the rename itself durable. Best effort: not every filesystem
-        // lets a directory be opened for sync, and the data is already safe.
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
+        file.sync_all()
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(tmp),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
     }
-    result
+}
+
+/// Step 2 of a save: the bytes over the existing file, keeping its inode and
+/// with it the creation date, permissions, extended attributes and links.
+/// The recovery copy is removed only once the note is safely written.
+pub fn overwrite_in_place(real: &Path, bytes: &[u8], recovery: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let result = (|| {
+        // Not `truncate(true)`: writing first and trimming after means a
+        // reader never sees an empty note, only (briefly) the new text.
+        let mut file = std::fs::OpenOptions::new().write(true).open(real)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(bytes)?;
+        file.set_len(bytes.len() as u64)?;
+        file.sync_all()
+    })();
+    match result {
+        Ok(()) => {
+            let _ = std::fs::remove_file(recovery);
+            Ok(())
+        }
+        Err(err) => {
+            tracing::error!(
+                "writing {} failed ({err}); the new text is kept in {}",
+                real.display(),
+                recovery.display()
+            );
+            Err(err)
+        }
+    }
 }
 
 fn mtime_of(path: &Path) -> f64 {
@@ -375,11 +411,21 @@ async fn save_source(
         Err(resp) => return Ok(resp),
     };
 
+    let bytes = body.text.into_bytes();
+    let hash = sha256_hex(&bytes);
+    // The slow, fsync'd copy first, before the check — see `write_recovery`.
+    let recovery = {
+        let target = real.clone();
+        let bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || write_recovery(&target, &bytes)).await??
+    };
+
     let (hash, mtime) = {
         let _guard = WRITE_LOCK.lock().await;
         let current = tokio::fs::read(&real).await?;
         let current_hash = sha256_hex(&current);
         if !current_hash.eq_ignore_ascii_case(body.base_hash.trim()) {
+            let _ = tokio::fs::remove_file(&recovery).await;
             return Ok((
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -390,10 +436,8 @@ async fn save_source(
             )
                 .into_response());
         }
-        let bytes = body.text.into_bytes();
         let target = real.clone();
-        let hash = sha256_hex(&bytes);
-        tokio::task::spawn_blocking(move || atomic_replace(&target, &bytes)).await??;
+        tokio::task::spawn_blocking(move || overwrite_in_place(&target, &bytes, &recovery)).await??;
         (hash, mtime_of(&real))
     };
 
@@ -628,23 +672,61 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_atomic_replace_keeps_permissions_and_leaves_no_temp_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir("atomic");
+    fn a_save_updates_the_note_in_place_and_leaves_no_temp_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempdir("inplace");
         let note = dir.join("Note.md");
-        std::fs::write(&note, "old").unwrap();
+        std::fs::write(&note, "a much longer old text than the new one").unwrap();
         std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("Hard link.md");
+        std::fs::hard_link(&note, &link).unwrap();
+        let before = std::fs::metadata(&note).unwrap();
 
-        atomic_replace(&note, "new text".as_bytes()).unwrap();
-        assert_eq!(std::fs::read_to_string(&note).unwrap(), "new text");
-        let mode = std::fs::metadata(&note).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640);
+        let recovery = write_recovery(&note, "new text".as_bytes()).unwrap();
+        assert_eq!(std::fs::read_to_string(&recovery).unwrap(), "new text");
+        overwrite_in_place(&note, "new text".as_bytes(), &recovery).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "new text", "trimmed to length");
+        let after = std::fs::metadata(&note).unwrap();
+        assert_eq!(after.ino(), before.ino(), "same inode");
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        if let (Ok(a), Ok(b)) = (before.created(), after.created()) {
+            assert_eq!(a, b, "creation date kept");
+        }
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new text", "hard link still shares it");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name() != "Note.md")
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "Note.md" && n != "Hard link.md")
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_save_keeps_extended_attributes() {
+        let dir = tempdir("xattr");
+        let note = dir.join("Tagged.md");
+        std::fs::write(&note, "old").unwrap();
+        let ok = std::process::Command::new("xattr")
+            .args(["-w", "com.example.tag", "red"])
+            .arg(&note)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // no xattr tool here; the inode check above covers it
+        }
+        let recovery = write_recovery(&note, b"new").unwrap();
+        overwrite_in_place(&note, b"new", &recovery).unwrap();
+        let out = std::process::Command::new("xattr")
+            .args(["-p", "com.example.tag"])
+            .arg(&note)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "red");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

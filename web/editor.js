@@ -9,7 +9,7 @@
 // everything about which note is in it.
 
 import {
-  EditorState, EditorSelection, RangeSetBuilder, Prec,
+  EditorState, EditorSelection, RangeSetBuilder, Prec, Compartment,
   EditorView, Decoration, ViewPlugin, WidgetType, keymap, drawSelection,
   dropCursor, rectangularSelection,
   defaultKeymap, history, historyKeymap, indentMore, indentLess,
@@ -34,6 +34,7 @@ const LIST_RE = /^(\s*)(?:([-*+]|\d+[.)])\s+)?(?:\[([ xX])\]\s+)?(.*)$/;
  */
 export function cycleListItem(view) {
   const { state } = view;
+  if (state.readOnly) return true;
   const changes = [];
   const seen = new Set();
   for (const range of state.selection.ranges) {
@@ -73,6 +74,7 @@ function nextListState(text) {
 }
 
 function toggleTaskAt(view, pos) {
+  if (view.state.readOnly) return false;
   const line = view.state.doc.lineAt(pos);
   const m = /^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])\]/.exec(line.text);
   if (!m) return false;
@@ -88,6 +90,7 @@ function toggleTaskAt(view, pos) {
 function wrapWith(mark) {
   return view => {
     const { state } = view;
+    if (state.readOnly) return true;
     view.dispatch(state.changeByRange(range => {
       const len = mark.length;
       const before = state.sliceDoc(range.from - len, range.from);
@@ -461,8 +464,14 @@ function wikiCompletion(searchTitles) {
  * @param opts.onSave()                  Mod-s
  * @param opts.searchTitles(query) → Promise<[{title, detail}]>
  */
+// Reading vs editing. Reconfigured on the live view, not baked into each
+// note's state, so one switch covers whichever note is showing.
+const editability = new Compartment();
+const editable = on => [EditorState.readOnly.of(!on), EditorView.editable.of(on)];
+
 export function createEditor(parent, opts) {
-  const extensions = makeExtensions(opts);
+  const extensions = [editability.of(editable(false)), makeExtensions(opts)];
+  let canEdit = false;
   const view = new EditorView({
     parent,
     state: EditorState.create({ doc: '', extensions }),
@@ -471,7 +480,18 @@ export function createEditor(parent, opts) {
     view,
     /** A fresh state for a newly opened note; the workspace caches these per tab. */
     newState(doc) { return EditorState.create({ doc, extensions }); },
-    setState(state) { view.setState(state); },
+    /** Swap in a note's state, in the current reading/editing mode. */
+    setState(state) {
+      view.setState(state);
+      view.dispatch({ effects: editability.reconfigure(editable(canEdit)) });
+    },
+    /** Reading (false) or editing (true). Leaving editing drops the cursor,
+     *  so the note renders fully, as Obsidian's reading view does. */
+    setEditable(on) {
+      canEdit = !!on;
+      if (!canEdit) view.contentDOM.blur();
+      view.dispatch({ effects: editability.reconfigure(editable(canEdit)) });
+    },
     get state() { return view.state; },
     focus() { view.focus(); },
     /** Replace the text (an edit on disk), keeping the cursor about where it was. */
