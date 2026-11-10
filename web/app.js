@@ -1756,8 +1756,54 @@ async function saveView(patch) {
 
 // ───────────────────────────── wiring ───────────────────────────────────
 
+// The ☰ beside the +: every Absorbitron sticky, alphabetical by title, so
+// they can be reached without chasing the cubes round their brains.
+function wireAbsorbList() {
+  const btn = $('#absorb-list'), menu = $('#absorb-menu');
+  const stickyTitle = name => String(name || '').replace(/^\d{4}-\d{2}-\d{2} \d{4,6}\s*/, '') || 'Untitled';
+  const close = () => { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
+  const render = () => {
+    const brains = S.data?.brains || [];
+    const many = brains.filter(b => (b.absorbitron || []).length).length > 1;
+    const items = brains.flatMap(b => (b.absorbitron || []).map(n => ({
+      nid: n.nid, title: stickyTitle(n.title), brain: b.name || b.id,
+    }))).sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base', numeric: true }));
+    menu.replaceChildren(el('div', { class: 'absorb-menu-head mono' }, `ABSORBITRON · ${items.length}`));
+    if (!items.length) {
+      menu.append(el('div', { class: 'absorb-menu-empty' }, 'No stickies yet — press + to make one.'));
+      return;
+    }
+    for (const it of items) {
+      menu.append(el('button', {
+        class: 'absorb-menu-item', role: 'menuitem', title: it.title,
+        onclick: () => { close(); AB.open(it.nid); },
+      }, el('span', { class: 'absorb-menu-title' }, it.title),
+         many ? el('span', { class: 'absorb-menu-brain' }, it.brain) : null));
+    }
+  };
+  btn.onclick = event => {
+    event.stopPropagation();
+    if (!menu.hidden) { close(); return; }
+    render();
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    menu.querySelector('.absorb-menu-item')?.focus();
+  };
+  document.addEventListener('pointerdown', event => {
+    if (!menu.hidden && !menu.contains(event.target) && !btn.contains(event.target)) close();
+  });
+  menu.addEventListener('keydown', event => {
+    const items = [...menu.querySelectorAll('.absorb-menu-item')];
+    const at = items.indexOf(document.activeElement);
+    if (event.key === 'Escape') { event.stopPropagation(); close(); btn.focus(); }
+    else if (event.key === 'ArrowDown') { event.preventDefault(); items[(at + 1) % items.length]?.focus(); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); items[(at - 1 + items.length) % items.length]?.focus(); }
+  });
+}
+
 function wireStaticHandlers() {
   $('#absorb-new').onclick = () => AB.create();
+  wireAbsorbList();
   $('#chat-close').onclick = closeChat;
   $('#chat-clear').onclick = async () => {
     if (!S.agentId) return;

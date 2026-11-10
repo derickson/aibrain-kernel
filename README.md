@@ -268,12 +268,90 @@ it:
 python3 -m aibrain.mcp_todo
 ```
 
+## The Absorbitron
+
+An intake tray for the links and files people send you, so they land
+somewhere searchable before you have decided where they belong.
+
+**Where it writes.** Into an `Absorbitron/` folder at the top of the brain
+marked as the meeting recording target (☰ → **Brains** → "Meeting recording
+target · Absorbitron intake"). With no target set the + button explains that
+and creates nothing. The folder name is fixed: `FOLDER` in
+`aibrain/absorbitron.py` and `ABSORBITRON_FOLDER` in
+`rust/aibrain-core/src/layout.rs` must agree.
+
+**Making one.** The gold **+** beside the brand at the top left opens a
+yellow sticky over the universe. Type a title and press Enter, or move to the
+body, and the note is created as
+`Absorbitron/<YYYY-MM-DD HHmm> <title>.md`. If a note with that name already
+exists this minute, seconds are added to the stamp (`HHmmss`). The title is
+tidied rather than refused: characters that would break a file name or a
+`[[wikilink]]` (`\ / : * ? " < > | # ^ [ ]`) become spaces, leading dots go,
+and it is capped at 160 characters. Once the note exists the title is fixed.
+
+The body is a CodeMirror editor with the same live preview and `[[`
+autocompletion as the notes panel. It saves itself a second after you stop
+typing, and on close or page unload. Saves are hash-checked like any other
+edit: if the file changed on disk underneath you, the sticky offers **Use
+theirs** or **Keep mine** instead of overwriting, and if it has been moved
+or deleted the sticky says so and stops saving. Drag the header to move the
+sticky; ⤢ opens the note in the notes panel; × closes it.
+
+**The file.** What you type, then the sections the AI step will fill in:
+
+```markdown
+Sam sent this: https://example.com/paper
+
+---
+# AI Notes
+
+_Placeholder — AI expansion and research on the links and attachments above will be added here._
+
+# Attachments
+
+- [[Absorbitron/Attachments/2026-11-10 1432 report.pdf]]
+```
+
+The sticky shows and edits only the part above the rule; everything from
+`---` / `# AI Notes` down is kept as it is on disk and written back
+untouched, so the AI sections and the attachment list are never lost to an
+edit.
+
+**Links and attachments.** Every URL in the body gets an unlit lightbulb
+glyph under the editor (click it to open the link); it is meant to light up
+once that link has been researched. Drop files onto the sticky, or use its
+file button, and each is copied to
+`Absorbitron/Attachments/<YYYY-MM-DD HHmm> <original name>`, linked under
+`# Attachments`, and shown as a black paperclip (meant to glow once
+processed). Uploads are capped at 200 MB each and never overwrite: a name
+already taken gets seconds, then a counter. Neither links nor attachments
+are drawn in the universe.
+
+**In the universe.** Intake notes are not stars in the galaxy swirl. Each is
+a glowing yellow cube, larger than a star, orbiting its brain. Hovering one
+stops it and shows its title; clicking reopens its sticky. Rust excludes
+`Absorbitron/` paths from the layout (`notes_for_layout`) and sends them
+separately as each brain's `absorbitron` list in `/universe`
+(`absorbitron_notes`), so cubes come and go without moving any star.
+
+**Search and agents.** Intake notes are ordinary notes to everything else:
+they are indexed, show up in search (words inside a URL are not split into
+search terms by the Postgres search), and are reachable by ACP agents like
+the rest of the vault.
+
+**Filing one.** Move the file out of `Absorbitron/` (in Obsidian, Finder,
+anywhere) and it becomes a normal note: on the next rescan it leaves its
+orbit and joins the galaxy as a star. Being an intake note is decided by the
+path alone, so nothing else needs updating. It keeps its `# AI Notes` and
+its attachment links, which are full vault paths and still resolve.
+
 ## The pieces
 
 ```
 aibrain-kernel/
 ├── aibrain/                   the UI server (Python 3, standard library only)
 │   ├── __main__.py            entry point; python3 -m aibrain
+│   ├── absorbitron.py         intake note names, template, attachment writes
 │   ├── config.py              ~/.aibrain/config.json, and first-run discovery
 │   ├── corpus.py              the only thing that talks to aibrain-core, over HTTP
 │   ├── jobs.py                running scripts, streaming their output
@@ -297,6 +375,7 @@ aibrain-kernel/
 │   ├── universe.js            the three.js visualisation
 │   ├── edges.js               edge brightness math, testable without a GPU
 │   ├── app.js                 panels, search, chat, the control drawer
+│   ├── absorbitron.js         the Absorbitron sticky editor
 │   └── vendor/three.module.js three.js r160, vendored so it works offline
 ├── scripts/                   one folder per source system
 │   └── macwhisper/            MacWhisper transcript exporter
@@ -354,6 +433,8 @@ does to the MacWhisper database.
 | Scroll | zoom |
 | Click a star | open that note |
 | Double-click a star | open it and fly to it |
+| Click a yellow cube | reopen that Absorbitron sticky |
+| + (top left) | new Absorbitron sticky |
 | Double-click an agent | chat with it |
 | Drag an agent | move it; the position is saved |
 | `/` | search |
@@ -429,6 +510,9 @@ Thin proxies over the Rust routes above, plus what only Python knows about
 | GET | `/api/recent` | Rust's `/notes/recent`, decorated the same way. |
 | GET | `/api/note/<nid>` | Rust's `/note/:id`, decorated. |
 | GET | `/api/node/<gid>` | Universe node id → note id, for a click in 3D. |
+| GET | `/api/absorbitron` | `{folder, brainId, brainName, maxAttachmentBytes}` — where intake notes go; `brainId` is null with no meeting target. |
+| POST | `/api/absorbitron/create` | `{title, text}` — a new timestamped intake note; `{nid, brainId, name, relPath}`. 409 with no target. |
+| POST | `/api/absorbitron/attach` | `?nid=&name=`, raw file bytes as the body — copied into `Absorbitron/Attachments/`; `{path, name, size}`. Linking it in the note is the client's job. |
 | GET/POST | `/api/todos` | Proxy to Rust's `/todos`. |
 | GET | `/api/todos/history` | Proxy to Rust's `/todos/history`. |
 | PATCH | `/api/todos/<tid>` | Proxy to Rust's `PATCH /todos/:id`. |

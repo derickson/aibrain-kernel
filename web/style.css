@@ -1081,6 +1081,36 @@ body.resizing .canvas { pointer-events: none; }
 .absorb-new:hover { transform: scale(1.08); box-shadow: 0 0 0 1px #ffe27a, 0 0 26px rgba(255, 200, 58, .85); }
 .absorb-new:active { transform: scale(.96); }
 
+/* ☰ beside the +: every sticky by title, the other way to reach them. */
+.absorb-list-wrap { position: relative; display: flex; }
+.burger, .burger::before, .burger::after {
+  display: block; width: 14px; height: 2px; border-radius: 1px; background: #2b2208;
+}
+.burger { position: relative; }
+.burger::before, .burger::after { content: ''; position: absolute; left: 0; }
+.burger::before { top: -5px; }
+.burger::after { top: 5px; }
+.absorb-menu {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 1000;
+  min-width: 240px; max-width: min(360px, calc(100vw - 32px)); max-height: min(60vh, 460px);
+  overflow-y: auto; padding: 6px;
+  background: var(--panel); border-radius: 10px;
+  box-shadow: 0 0 0 1px rgba(255, 214, 90, .45), 0 0 22px rgba(255, 200, 58, .25),
+              0 14px 32px rgba(0, 0, 0, .6);
+}
+.absorb-menu-head {
+  padding: 6px 10px 8px; font-size: 10px; letter-spacing: .18em; font-weight: 600; color: #ffe08a;
+}
+.absorb-menu-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%;
+  padding: 7px 10px; border-radius: 6px; text-align: left;
+  color: #e6ecf3; font: 500 13px Manrope, system-ui, sans-serif;
+}
+.absorb-menu-item:hover, .absorb-menu-item:focus-visible { background: rgba(255, 200, 58, .14); color: #fff; outline: none; }
+.absorb-menu-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.absorb-menu-brain { flex: none; font-size: 11px; color: var(--fg-mute, #8a96a6); }
+.absorb-menu-empty { padding: 8px 10px 10px; font-size: 12.5px; color: var(--fg-mute, #8a96a6); }
+
 /* A sticky: yellow paper glowing over the universe. The app is dark, so the
    editor's colours are re-pointed at ink for everything inside it. */
 .sticky {
