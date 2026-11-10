@@ -148,8 +148,9 @@ export function createAbsorbitron({ api, toast, el, host, confirm, onOpenUrl, on
     const ai = el('div', { class: 'sticky-ai mono', title: 'Filled in by the AI research step (coming later)' },
       'AI NOTES · PENDING');
     const foot = el('footer', { class: 'sticky-foot' }, glyphs, attachBtn);
+    const grip = el('div', { class: 'sticky-grip', title: 'Drag to resize', 'aria-hidden': 'true' });
     const root = el('section', { class: 'sticky', role: 'dialog', 'aria-label': 'Absorbitron note' },
-      head, title, banner, body, drop, ai, foot, fileInput);
+      head, title, banner, body, drop, ai, foot, fileInput, grip);
 
     const editor = createEditor(body, {
       onChange: () => { renderGlyphs(); schedule(); },
@@ -453,6 +454,29 @@ export function createAbsorbitron({ api, toast, el, host, confirm, onOpenUrl, on
       };
       head.addEventListener('pointermove', move);
       head.addEventListener('pointerup', up);
+    });
+
+    // Resize from the bottom-right corner, kept inside the universe pane.
+    grip.addEventListener('pointerdown', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const box = root.getBoundingClientRect(), frame = host.getBoundingClientRect();
+      const sx = event.clientX, sy = event.clientY;
+      grip.setPointerCapture(event.pointerId);
+      const move = e => {
+        const w = Math.min(Math.max(320, box.width + e.clientX - sx), frame.right - box.left);
+        const h = Math.min(Math.max(220, box.height + e.clientY - sy), frame.bottom - box.top);
+        root.style.width = `${w}px`;
+        root.style.height = `${h}px`;
+      };
+      const up = () => {
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', up);
+        grip.removeEventListener('pointercancel', up);
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', up);
+      grip.addEventListener('pointercancel', up);
     });
 
     Object.assign(st, { root, title, editor, save, adopt, setIdentity, renderGlyphs, renderState,

@@ -1118,6 +1118,7 @@ body.resizing .canvas { pointer-events: none; }
   --accent: #9a5d00; --line: rgba(90, 70, 10, .14); --line-mid: rgba(90, 70, 10, .25);
   --line-strong: rgba(90, 70, 10, .5);
   position: absolute; width: min(360px, calc(100% - 32px));
+  height: min(400px, calc(100% - 96px)); min-width: 320px; min-height: 220px;
   display: flex; flex-direction: column;
   color: var(--fg);
   background: linear-gradient(175deg, #fff4a8 0%, #fde98a 55%, #f9df72 100%);
@@ -1140,7 +1141,7 @@ body.resizing .canvas { pointer-events: none; }
   background: #f2b52a; box-shadow: 0 0 6px rgba(242, 181, 42, .9);
 }
 .sticky-label { font-size: 10px; letter-spacing: .18em; color: #7a5a00; font-weight: 600; }
-.sticky-when { font-size: 10px; letter-spacing: .06em; color: var(--fg-mute); }
+.sticky-when { font-size: 10px; letter-spacing: .06em; color: var(--fg-mute); white-space: nowrap; }
 .sticky-spacer { flex: 1; }
 .sticky-state { font-size: 9.5px; letter-spacing: .14em; color: var(--fg-mute); }
 .sticky-state[data-kind="conflict"], .sticky-state[data-kind="moved"] { color: #b3261e; }
@@ -1164,10 +1165,13 @@ body.resizing .canvas { pointer-events: none; }
   background: rgba(179, 38, 30, .1); color: #6e1a14;
 }
 .sticky-link { color: #7a3b00; font-weight: 700; text-decoration: underline; font-size: 12px; }
-.sticky-body { padding: 4px 12px 0; min-height: 110px; max-height: 46vh; overflow: auto; cursor: text; }
+/* The sticky keeps the size it was given; the body takes what is left and
+   scrolls, rather than the sticky growing as you type. */
+.sticky > * { flex: none; }
+.sticky > .sticky-body { flex: 1 1 auto; min-height: 48px; overflow: auto; padding: 4px 12px 0; cursor: text; }
 .sticky-body .cm-editor { color: var(--fg) !important; font-size: 13.5px; }
 .sticky-body .cm-scroller { overflow: visible !important; line-height: 1.6 !important; }
-.sticky-body .cm-content { padding: 4px 0 14px !important; caret-color: #2b2410 !important; min-height: 100px; }
+.sticky-body .cm-content { padding: 4px 0 14px !important; caret-color: #2b2410 !important; min-height: 60px; }
 .sticky-body .cm-cursor { border-left-color: #2b2410 !important; }
 .sticky-body .cm-selectionBackground, .sticky-body ::selection { background: rgba(214, 140, 0, .28) !important; }
 .sticky-body .cm-h, .sticky-body .cm-strong { color: #1d1706; }
@@ -1197,8 +1201,18 @@ body.resizing .canvas { pointer-events: none; }
   font-size: 9.5px; letter-spacing: .16em; color: var(--fg-mute);
 }
 .sticky-foot {
-  display: flex; align-items: center; gap: 8px; padding: 7px 10px 9px 12px; min-height: 40px;
+  display: flex; align-items: center; gap: 8px; padding: 7px 22px 9px 12px; min-height: 40px;
 }
+/* Bottom-right grip: drag to resize the sticky. */
+.sticky > .sticky-grip {
+  position: absolute; right: 0; bottom: 0; width: 18px; height: 18px;
+  cursor: nwse-resize; touch-action: none; border-radius: 0 0 14px 0;
+  background:
+    linear-gradient(135deg, transparent 52%, rgba(120, 90, 10, .45) 52%, rgba(120, 90, 10, .45) 60%,
+                    transparent 60%, transparent 70%, rgba(120, 90, 10, .45) 70%, rgba(120, 90, 10, .45) 78%,
+                    transparent 78%);
+}
+.sticky > .sticky-grip:hover { background-color: rgba(120, 90, 10, .1); }
 .sticky-glyphs { flex: 1; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; min-width: 0; }
 .sticky-empty { font-size: 9.5px; letter-spacing: .14em; color: rgba(80, 64, 20, .45); }
 .glyph { width: 22px; height: 22px; display: inline-grid; place-items: center; border-radius: 5px; }
