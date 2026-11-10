@@ -218,6 +218,45 @@ pub fn confine_new(root: &Path, title: &str) -> Result<PathBuf, Refusal> {
     Ok(target)
 }
 
+/// A folder a new note may be created in: vault-relative, `/`-separated, each
+/// component held to the same rules as a title, so it cannot climb out of the
+/// vault or hide itself. Empty means the vault root.
+pub fn validate_folder(raw: &str) -> Result<Vec<String>, Refusal> {
+    let raw = raw.trim().trim_matches('/');
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        let part = validate_title(part)
+            .map_err(|_| Refusal::BadRequest("that folder is not a plain path inside the vault"))?;
+        parts.push(part);
+    }
+    if parts.len() > 8 {
+        return Err(Refusal::BadRequest("that folder is nested too deeply"));
+    }
+    Ok(parts)
+}
+
+/// [`confine_new`], but inside `folder` (created if missing). The folder is
+/// canonicalised after it exists, so a symlinked folder pointing out of the
+/// vault is refused rather than written through.
+pub fn confine_new_in(root: &Path, folder: &[String], title: &str) -> Result<PathBuf, Refusal> {
+    if folder.is_empty() {
+        return confine_new(root, title);
+    }
+    let root = std::fs::canonicalize(root)
+        .map_err(|_| Refusal::Forbidden("that vault is not reachable"))?;
+    let dir = folder.iter().fold(root.clone(), |acc, part| acc.join(part));
+    std::fs::create_dir_all(&dir).map_err(|_| Refusal::Forbidden("that folder could not be created"))?;
+    let real = std::fs::canonicalize(&dir)
+        .map_err(|_| Refusal::Forbidden("that folder is not reachable"))?;
+    if !real.starts_with(&root) || real == root {
+        return Err(Refusal::Forbidden("that folder resolves outside its vault"));
+    }
+    confine_new(&real, title)
+}
+
 /// A save in two steps, so the note itself is updated in place.
 ///
 /// Replacing the file by rename (the usual atomic write) gives the note a new
@@ -453,6 +492,12 @@ async fn save_source(
 struct CreateBody {
     brain: String,
     title: String,
+    /// Vault-relative folder to create the note in; the root when absent.
+    #[serde(default)]
+    folder: String,
+    /// What the new file starts with; empty when absent.
+    #[serde(default)]
+    text: String,
 }
 
 async fn create_note(State(ctx): State<Shared>, Json(body): Json<CreateBody>) -> ApiResult<Response> {
@@ -467,17 +512,33 @@ async fn create_note(State(ctx): State<Shared>, Json(body): Json<CreateBody>) ->
         Ok(spec) => spec,
         Err(resp) => return Ok(resp),
     };
-    let rel = format!("{title}.md");
+    let folder = match validate_folder(&body.folder) {
+        Ok(f) => f,
+        Err(refusal) => return Ok(refusal.into_response()),
+    };
+    if body.text.len() > MAX_NOTE_BYTES {
+        return Ok(error(StatusCode::PAYLOAD_TOO_LARGE, "that note is too large to save here"));
+    }
+    let rel = if folder.is_empty() {
+        format!("{title}.md")
+    } else {
+        format!("{}/{title}.md", folder.join("/"))
+    };
     {
         let _guard = WRITE_LOCK.lock().await;
-        let target = match confine_new(Path::new(&db_root), &title) {
+        let root = PathBuf::from(&db_root);
+        let target = match tokio::task::spawn_blocking(move || confine_new_in(&root, &folder, &title)).await? {
             Ok(t) => t,
             Err(refusal) => return Ok(refusal.into_response()),
         };
         // `create_new` is O_EXCL: it refuses an existing file and will not
         // follow a symlink planted at the name between the check and here.
+        let text = body.text.into_bytes();
         let made = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new().write(true).create_new(true).open(&target).map(drop)
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+            file.write_all(&text)?;
+            file.sync_all()
         })
         .await?;
         match made {
@@ -563,6 +624,34 @@ mod tests {
             assert!(validate_title(bad).is_err(), "{bad:?} should be refused");
         }
         assert!(validate_title(&"x".repeat(MAX_TITLE_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn folders_are_plain_downward_paths() {
+        assert_eq!(validate_folder("").unwrap(), Vec::<String>::new());
+        assert_eq!(validate_folder("Absorbitron").unwrap(), vec!["Absorbitron"]);
+        assert_eq!(validate_folder("/Tech/Products/").unwrap(), vec!["Tech", "Products"]);
+        for bad in ["..", "a/../b", ".hidden", "a/.git", "a\\b", "a//b"] {
+            assert!(validate_folder(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_new_note_in_a_folder_lands_there_and_never_leaves_the_vault() {
+        let dir = tempdir("folder");
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let target = confine_new_in(&vault, &["Absorbitron".into()], "2026-11-10 1432 Idea").unwrap();
+        assert_eq!(
+            target,
+            std::fs::canonicalize(&vault).unwrap().join("Absorbitron/2026-11-10 1432 Idea.md")
+        );
+        // A folder that is a symlink out of the vault is refused.
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("Out")).unwrap();
+        assert!(confine_new_in(&vault, &["Out".into()], "x").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

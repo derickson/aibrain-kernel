@@ -20,7 +20,19 @@ pub const OTHER_LABEL: &str = "Other";
 /// Bumped whenever the same notes would land differently or take different
 /// colors. It is part of the cache signature and the ETag, so a new build
 /// never serves a layout the old code produced.
-pub const LAYOUT_VERSION: u32 = 2;
+pub const LAYOUT_VERSION: u32 = 3;
+
+/// The intake folder. Notes under it are not stars in their brain's galaxy:
+/// the universe draws them as satellites orbiting it instead, until they are
+/// filed somewhere else in the vault. Search and agents see them as usual.
+pub const ABSORBITRON_FOLDER: &str = "Absorbitron";
+
+/// Is this vault-relative path an Absorbitron intake note?
+pub fn is_absorbitron(rel_path: &str) -> bool {
+    rel_path
+        .strip_prefix(ABSORBITRON_FOLDER)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
 
 pub const SOURCE_COLORS: [&str; 10] = [
     "#4db3f0", "#f06aa6", "#f0c030", "#3ecf9a", "#9b7cf0",
@@ -437,6 +449,15 @@ mod tests {
             source: source.to_string(),
             degree,
         }
+    }
+
+    #[test]
+    fn only_notes_inside_the_intake_folder_are_absorbitron() {
+        assert!(is_absorbitron("Absorbitron/2026-11-10 1432 Idea.md"));
+        assert!(is_absorbitron("Absorbitron/Attachments/x.md"));
+        assert!(!is_absorbitron("Absorbitron.md"));
+        assert!(!is_absorbitron("AbsorbitronOld/x.md"));
+        assert!(!is_absorbitron("Tech/Absorbitron/x.md"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 import { createUniverse } from './universe.js';
 import { createWorkspace } from './workspace.js';
+import { createAbsorbitron } from './absorbitron.js';
 
 // ───────────────────────────── helpers ──────────────────────────────────
 
@@ -116,6 +117,25 @@ const WS = createWorkspace({
   brainName: id => S.data?.brains?.find(b => b.id === id)?.name || '',
 });
 $('#ws-strip').append(WS.strip);
+
+// The Absorbitron's sticky notes float over the universe.
+const openExternal = href => { if (/^(https?|mailto|obsidian):/i.test(href || '')) window.open(href, '_blank', 'noopener'); };
+const AB = createAbsorbitron({
+  api, toast, el, host: $('.center'), confirm: appConfirm,
+  onOpenUrl: openExternal,
+  // A [[link]] clicked in a sticky, or its ⤢ button: open in the notes panel.
+  onOpenNote: async (target, brainId, nid) => {
+    if (nid == null) {
+      const name = String(target || '').split('#')[0].trim();
+      if (!name) return;
+      try {
+        nid = (await api(`/api/resolve?brain=${encodeURIComponent(brainId || '')}&title=${encodeURIComponent(name)}`)).nid;
+      } catch { toast(`“${name}” is not in the index`); return; }
+    }
+    openNote(nid, null);
+  },
+});
+window.addEventListener('beforeunload', () => AB.saveAll());
 $('#note-editor').append(WS.nav, WS.banner, WS.title, WS.host, WS.fallback);
 
 // ───────────────────────────── boot ─────────────────────────────────────
@@ -203,6 +223,11 @@ async function loadUniverse(rebuild = false) {
     onAgentHover: agent => { S.agentHover = agent; renderStatus(); },
     onNodeClick: node => openNote(node.nid, null),
     onNodeOpen: node => { openNote(node.nid, null); S.universe.flyTo(node.gid); },
+    onSatelliteClick: sat => AB.open(sat.nid),
+    onSatelliteHover: sat => {
+      S.statusText = sat ? `${sat.name} · Absorbitron · click to open the sticky` : null;
+      renderStatus();
+    },
     onAgentOpen: agent => openChat(agent.id),
     onAgentClick: agent => {
       S.statusText = `${agent.name} · double-click to chat, drag to move`;
@@ -307,6 +332,7 @@ async function refreshUniverse(event) {
   // An edit on disk (Obsidian, an agent, our own save) reaches the open tab
   // without clobbering anything typed here; the workspace decides.
   if (event?.note_id != null && WS.hasNid(event.note_id)) WS.externalChange(event.note_id);
+  if (event?.note_id != null && AB.isOpen(event.note_id)) AB.externalChange(event.note_id);
   if (S.note && event?.note_id === S.note.nid) onTabActivated(WS.activeTab);
   pulseStatus(event);
 }
@@ -1167,11 +1193,12 @@ function renderBrainsPanel() {
                 toast(event.target.checked
                   ? `${brain.name} is now the meeting recording target`
                   : `${brain.name} is no longer the meeting recording target`);
+                AB.refreshInfo();
                 renderDrawer();
               } catch (err) { toast(String(err.message || err), true); }
             },
           }),
-          el('span', {}, 'Meeting recording target'))),
+          el('span', {}, 'Meeting recording target · Absorbitron intake'))),
       brain.meetingTarget ? el('div', { class: 'field' },
         el('label', {}, 'RAW TRANSCRIPTS FOLDER'),
         el('input', {
@@ -1730,6 +1757,7 @@ async function saveView(patch) {
 // ───────────────────────────── wiring ───────────────────────────────────
 
 function wireStaticHandlers() {
+  $('#absorb-new').onclick = () => AB.create();
   $('#chat-close').onclick = closeChat;
   $('#chat-clear').onclick = async () => {
     if (!S.agentId) return;

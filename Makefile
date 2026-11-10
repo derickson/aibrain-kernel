@@ -1,6 +1,7 @@
 # Operating aibrain-kernel.
 #
 #   make dev              postgres + aibrain-core + the UI, in this terminal
+#   make remotedev        same, with the UI on this machine's LAN address (REMOTE_HOST=... to pick)
 #   make stop             stop aibrain-core, the UI, and the postgres container
 #   make docker-up        start the containers (PROFILE=full adds the watcher)
 #   make docker-down      stop and remove the containers; the data volume stays
@@ -15,13 +16,17 @@ PROFILE ?=
 COMPOSE_FLAGS := $(if $(PROFILE),--profile $(PROFILE),)
 
 .DEFAULT_GOAL := help
-.PHONY: help dev stop docker-up docker-down docker-redeploy test
+.PHONY: help dev remotedev stop docker-up docker-down docker-redeploy test
 
 help:
-	@sed -n '3,8p' $(MAKEFILE_LIST) | sed 's/^#   //'
+	@sed -n '3,9p' $(MAKEFILE_LIST) | sed 's/^#   //'
 
 dev:
 	./dev.sh
+
+# The only way the UI is reachable off this machine; see dev.sh.
+remotedev:
+	AIBRAIN_REMOTEDEV=1 REMOTE_HOST=$(REMOTE_HOST) ./dev.sh
 
 stop:
 	@pkill -f 'aibrain-core serve' && echo "stopped aibrain-core" || echo "aibrain-core was not running"

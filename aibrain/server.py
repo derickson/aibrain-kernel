@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import mimetypes
+import os
 import re
 import shutil
 import sqlite3
@@ -28,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from . import absorbitron
 from .agents import Registry
 from .config import (AGENT_COLORS, DEFAULT_CONFIG_DIR, REPO_ROOT, VAULT_LINK_DIR,
                      Config, ScriptConfig, AgentConfig, BrainConfig,
@@ -145,6 +147,14 @@ mimetypes.add_type("font/woff2", ".woff2")
 # Neither header can be forged by a page, and neither is sent by a non-browser
 # client such as curl or urllib, so the checks cost the CLI nothing.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+# Opt-in only: extra names this server may be reached at, comma-separated —
+# e.g. `AIBRAIN_ALLOWED_HOSTS=192.168.0.228` to open the UI from another
+# machine on the LAN. Anyone who can reach the port can then edit notes and
+# configure agents (which run commands), so only name hosts on a network you
+# trust. Unset, the server answers on loopback names alone.
+EXTRA_HOSTS = frozenset(
+    h.strip().lower() for h in os.environ.get("AIBRAIN_ALLOWED_HOSTS", "").split(",") if h.strip()
+)
 
 # Nothing this API accepts is large: the biggest body is a to-do with a handful
 # of note references. A cap stops an unbounded read into memory.
@@ -520,7 +530,8 @@ class Handler(BaseHTTPRequestHandler):
         host = self.headers.get("Host")
         if host is None:      # HTTP/1.0; no browser sends a request without one
             return True
-        return _hostname(host) in LOOPBACK_HOSTS
+        name = _hostname(host)
+        return name in LOOPBACK_HOSTS or name in EXTRA_HOSTS
 
     def origin_is_same(self) -> bool:
         """Same-origin, for anything that changes state or starts work.
@@ -847,6 +858,96 @@ def build_router(state: State) -> Router:
             raise BadRequest("title is required")
         status, out = state.corpus.resolve(q.get("brain", "")[:256], title[:1024])
         relay(h, status, out)
+
+    # ---- the Absorbitron -------------------------------------------------
+    # Intake notes go to the brain that catches meeting transcripts, in its
+    # Absorbitron/ folder; see absorbitron.py for the file's shape.
+    def absorbitron_target():
+        return next((b for b in state.cfg.brains if b.meeting_target and b.enabled), None)
+
+    def absorbitron_info(h: Handler) -> None:
+        target = absorbitron_target()
+        h.json({
+            "folder": absorbitron.FOLDER,
+            "brainId": target.id if target else None,
+            "brainName": target.name if target else None,
+            "maxAttachmentBytes": absorbitron.MAX_ATTACHMENT_BYTES,
+        })
+
+    def absorbitron_create(h: Handler) -> None:
+        payload = h.body(limit=MAX_NOTE_BODY_BYTES)
+        title = absorbitron.clean_title(str(payload.get("title") or ""))
+        text = payload.get("text") or ""
+        if not title:
+            raise BadRequest("give the note a title first")
+        if not isinstance(text, str):
+            raise BadRequest("text must be a string")
+        if len(text.encode("utf-8", "surrogatepass")) > MAX_NOTE_BYTES - 4096:
+            h.fail("that note is too large to save here", 413)
+            return
+        target = absorbitron_target()
+        if target is None:
+            h.fail("no brain is set as the transcript target — pick one in ☰ → Brains", 409)
+            return
+        now = datetime.now()
+        status, out = 0, {}
+        # Two notes in the same minute with the same title: the second gets
+        # seconds on its timestamp rather than a refusal.
+        for seconds in (False, True):
+            name = absorbitron.note_name(title, now, seconds=seconds)
+            status, out = state.corpus.create_note(
+                target.id, name, folder=absorbitron.FOLDER, text=absorbitron.template(text))
+            if status != 409:
+                break
+        if status != 200:
+            relay(h, status, out)
+            return
+        h.json({
+            "nid": out.get("nid"), "brainId": target.id, "name": name,
+            "relPath": f"{absorbitron.FOLDER}/{name}.md",
+        })
+
+    def absorbitron_attach(h: Handler) -> None:
+        """Raw file bytes in the body; `?nid=` the note, `?name=` the file name.
+
+        The file is copied into Absorbitron/Attachments/ of the note's brain.
+        The note itself is not touched here — the sticky adds the link to its
+        `# Attachments` section and saves, so its text has one writer.
+        """
+        q = h.query()
+        try:
+            length = int(h.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length <= 0 or length > absorbitron.MAX_ATTACHMENT_BYTES:
+            # Unread bytes would corrupt the next request on this connection.
+            h.close_connection = True
+            if length > absorbitron.MAX_ATTACHMENT_BYTES:
+                h.fail("that file is too large to attach", 413)
+            else:
+                raise BadRequest("an attachment needs a body")
+            return
+        try:
+            note_id = _int_id(q.get("nid", ""), "note id")
+        except BadRequest:
+            h.close_connection = True
+            raise
+        name = q.get("name", "")[:512]
+        status, src = state.corpus.note_source(note_id)
+        brain = state.cfg.brain(src.get("brainId", "")) if status == 200 else None
+        if brain is None or not brain.enabled:
+            h.close_connection = True
+            h.fail("that note is not in an enabled brain", 404 if status != 200 else 403)
+            return
+        data = h.rfile.read(length)
+        if len(data) != length:
+            raise BadRequest("the upload was cut short")
+        try:
+            rel = absorbitron.write_attachment(brain.resolved_path(), name, data)
+        except PermissionError as exc:
+            h.fail(str(exc), 403)
+            return
+        h.json({"path": rel, "name": rel.rsplit("/", 1)[-1], "size": length})
 
     def node(h: Handler, gid: str) -> None:
         """Universe node id → note id, so a click in 3D opens the right note."""
@@ -1440,6 +1541,9 @@ def build_router(state: State) -> Router:
     router.get("/api/note/<nid>/source", note_source)
     router.post("/api/note/<nid>/source", save_note_source)
     router.post("/api/note/create", create_note)
+    router.get("/api/absorbitron", absorbitron_info)
+    router.post("/api/absorbitron/create", absorbitron_create)
+    router.post("/api/absorbitron/attach", absorbitron_attach)
     router.get("/api/resolve", resolve)
     router.get("/api/node/<gid>", node)
     # The history route is registered before /api/todos/<tid> so "history" is

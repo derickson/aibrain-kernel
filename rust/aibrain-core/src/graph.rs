@@ -383,6 +383,14 @@ pub async fn build(pool: &PgPool, cfg: &Config, revisions: &[(String, i64)]) -> 
             gid_of.insert(*id, note_ids.len());
             note_ids.push(*id);
         }
+        // Not cached with the geometry: it is one indexed query, and it has
+        // to follow the brain's revision exactly, which it does by being read
+        // fresh every time the payload is.
+        let absorbitron: Vec<Value> = db::absorbitron_notes(pool, &spec.id)
+            .await?
+            .into_iter()
+            .map(|(nid, title, rel)| json!({ "nid": nid, "title": title, "relPath": rel }))
+            .collect();
         brains_out.push(json!({
             "id": spec.id,
             "name": spec.name,
@@ -400,6 +408,7 @@ pub async fn build(pool: &PgPool, cfg: &Config, revisions: &[(String, i64)]) -> 
             "degrees": geometry.degrees,
             "names": meta.names,
             "edges": geometry.edges,
+            "absorbitron": absorbitron,
         }));
     }
 

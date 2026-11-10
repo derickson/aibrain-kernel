@@ -707,6 +707,157 @@ export function createUniverse(container, cfg) {
 
   const tv = new THREE.Vector3(), tv2 = new THREE.Vector3(), tmpVec = new THREE.Vector3();
 
+  // ---------- Absorbitron satellites
+  //
+  // Notes in a brain's Absorbitron/ intake folder are not stars in its
+  // galaxy — Rust leaves them out of the layout — but golden cubes orbiting
+  // it, larger than any star, until they are filed somewhere in the vault.
+  // They live in the scene, not the galaxy's group, so the galaxy's spin
+  // does not drag them; each keeps its own tilted orbit, picked from a hash
+  // of the note id so it is the same orbit on every reload.
+  const SAT_GOLD = new THREE.Color('#ffc83a');
+  const satGeo = (() => {
+    // Shade each face a little differently so the cube reads as a solid
+    // without needing a light in the scene.
+    const g = new THREE.BoxGeometry(1, 1, 1);
+    const shade = [1.0, 0.62, 1.0, 0.5, 0.85, 0.72];
+    const colors = new Float32Array(g.attributes.position.count * 3);
+    for (let f = 0; f < 6; f++) {
+      for (let v = 0; v < 4; v++) {
+        const i = (f * 4 + v) * 3;
+        colors[i] = SAT_GOLD.r * shade[f];
+        colors[i + 1] = SAT_GOLD.g * shade[f];
+        colors[i + 2] = SAT_GOLD.b * shade[f];
+      }
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    return g;
+  })();
+  const satEdgeGeo = new THREE.EdgesGeometry(satGeo);
+  const satHash = n => {
+    let x = (Number(n) | 0) ^ 0x9e3779b9;
+    x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+    x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+  };
+  let satellites = [];   // {nid, title, bi, mesh, glowS, r, tilt, yaw, phase, speed, spin, size, hover}
+  let hoverSat = -1;
+  const satLabel = mkLabel("600 13px Manrope, system-ui, sans-serif");
+  satLabel.style.color = '#ffe08a';
+
+  function satTitle(name) {
+    // The file name carries its creation time; the cube's label does not need it.
+    return String(name || '').replace(/^\d{4}-\d{2}-\d{2} \d{4,6}\s*/, '') || 'Untitled';
+  }
+
+  function clearSatellites() {
+    for (const s of satellites) {
+      scene.remove(s.group);
+      s.mesh.material.dispose();
+      s.edges.material.dispose();
+      s.glowS.material.dispose();
+    }
+    satellites = [];
+    hoverSat = -1;
+  }
+
+  function syncSatellites(list) {
+    // Rebuilt from the payload whenever it changes: there are a handful of
+    // these, never thousands, so diffing would buy nothing.
+    const before = new Map(satellites.map(s => [s.nid, s]));
+    clearSatellites();
+    (list || []).forEach((b, bi) => {
+      const brain = brains[bi];
+      if (!brain || brain.cfg.id !== b.id) return;
+      const notes = b.absorbitron || [];
+      notes.forEach((note, k) => {
+        const h1 = satHash(note.nid), h2 = satHash(note.nid * 7 + 3), h3 = satHash(note.nid * 13 + 5);
+        const R = brain.R;
+        const size = clamp(0.9 + R * 0.025, 1.0, 1.8);
+        const group = new THREE.Group();
+        const mesh = new THREE.Mesh(satGeo, new THREE.MeshBasicMaterial({
+          vertexColors: true, transparent: true, opacity: 0.95,
+        }));
+        mesh.scale.setScalar(size);
+        mesh.userData.sat = true;
+        const edges = new THREE.LineSegments(satEdgeGeo, new THREE.LineBasicMaterial({
+          color: 0xfff1b8, transparent: true, opacity: 0.9,
+        }));
+        mesh.add(edges);
+        const glowS = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: glow, color: SAT_GOLD, transparent: true, opacity: 0.75,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        }));
+        glowS.scale.setScalar(size * 4.2);
+        group.add(glowS, mesh);
+        scene.add(group);
+        const prev = before.get(note.nid);
+        satellites.push({
+          nid: note.nid, title: note.title, relPath: note.relPath, brainId: b.id, bi,
+          group, mesh, edges, glowS, size,
+          r: R * (1.32 + h1 * 0.3),
+          tilt: (h2 - 0.5) * 1.3,
+          yaw: h3 * Math.PI * 2,
+          // Spread evenly round the orbit, then nudged, so a crowd of new
+          // notes does not start stacked on one spot.
+          phase: prev?.phase ?? ((k / Math.max(1, notes.length)) * Math.PI * 2 + h1),
+          speed: 0.05 + h2 * 0.06,
+          spin: new THREE.Vector3(0.3 + h1, 0.5 + h3, 0.2 + h2).multiplyScalar(0.35),
+          hover: 0,
+        });
+      });
+    });
+  }
+
+  const satAxis = new THREE.Vector3(), satTmp = new THREE.Vector3();
+  function tickSatellites(dt) {
+    for (let i = 0; i < satellites.length; i++) {
+      const s = satellites[i];
+      // A hovered cube holds still, so it can be clicked.
+      if (i !== hoverSat) s.phase += s.speed * dt * (0.4 + opt.rotationSpeed * 1.7);
+      const c = brains[s.bi].group.position;
+      // A circle in the xz-plane, tilted about x, then turned about y.
+      satTmp.set(Math.cos(s.phase) * s.r, 0, Math.sin(s.phase) * s.r);
+      satTmp.applyAxisAngle(satAxis.set(1, 0, 0), s.tilt);
+      satTmp.applyAxisAngle(satAxis.set(0, 1, 0), s.yaw);
+      s.group.position.copy(c).add(satTmp);
+      s.mesh.rotation.x += s.spin.x * dt;
+      s.mesh.rotation.y += s.spin.y * dt;
+      s.mesh.rotation.z += s.spin.z * dt;
+      s.hover += ((i === hoverSat ? 1 : 0) - s.hover) * 0.15;
+      const pulse = 1 + 0.08 * Math.sin(time * 1.6 + s.yaw * 4);
+      s.mesh.scale.setScalar(s.size * (1 + s.hover * 0.25));
+      s.glowS.scale.setScalar(s.size * 4.2 * pulse * (1 + s.hover * 0.5));
+      s.glowS.material.opacity = 0.6 + 0.2 * pulse + s.hover * 0.3;
+    }
+  }
+
+  const satAt = () => {
+    if (!satellites.length) return -1;
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObjects(satellites.map(s => s.mesh), false);
+    if (!hits.length) return -1;
+    return satellites.findIndex(s => s.mesh === hits[0].object);
+  };
+
+  function setHoverSat(i) {
+    if (i === hoverSat) return;
+    hoverSat = i;
+    cfg.onSatelliteHover?.(i >= 0 ? satInfo(satellites[i]) : null);
+  }
+  const satInfo = s => ({
+    nid: s.nid, title: s.title, name: satTitle(s.title), relPath: s.relPath,
+    brainId: s.brainId, brain: brains[s.bi]?.cfg.name,
+  });
+
+  function placeSatLabel(w, h) {
+    if (hoverSat < 0 || !satellites[hoverSat]) { satLabel.style.opacity = '0'; return; }
+    const s = satellites[hoverSat];
+    satLabel.textContent = trim(satTitle(s.title), 40);
+    tv.copy(s.group.position); tv.y += s.size * 1.4;
+    placeWorld(satLabel, w, h, '1', -100, false);
+  }
+
   // Labels are placed in priority order and anything that would land on top of
   // one already placed is dropped for this frame. Without it, dense galaxies
   // stack three note titles into the same few pixels and none of them read.
@@ -885,6 +1036,7 @@ export function createUniverse(container, cfg) {
   const onUp = e => {
     if (dragging && !moved && e.target === el) {
       if (dragAgent >= 0) cfg.onAgentClick?.(agents[dragAgent].cfg);
+      else if (hoverSat >= 0 && satellites[hoverSat]) cfg.onSatelliteClick?.(satInfo(satellites[hoverSat]));
       else if (hover >= 0) cfg.onNodeClick?.(info(hover));
       else cfg.onEmptyClick?.();
     }
@@ -892,7 +1044,7 @@ export function createUniverse(container, cfg) {
       cfg.onAgentMove?.(agents[dragAgent].cfg, agents[dragAgent].group.position.toArray());
     }
     dragging = false; dragAgent = -1;
-    el.style.cursor = hover >= 0 || hoverAgent >= 0 ? 'pointer' : 'grab';
+    el.style.cursor = hover >= 0 || hoverAgent >= 0 || hoverSat >= 0 ? 'pointer' : 'grab';
   };
   const panRight = new THREE.Vector3(), panUp = new THREE.Vector3(), panFwd = new THREE.Vector3();
   const onMove = e => {
@@ -930,7 +1082,7 @@ export function createUniverse(container, cfg) {
     }
     pendingHover = true;
   };
-  const onLeave = () => { setHover(-1); setHoverAgent(-1); };
+  const onLeave = () => { setHover(-1); setHoverAgent(-1); setHoverSat(-1); };
   const onWheel = e => {
     e.preventDefault();
     cam.zoom = clamp(cam.zoom * (1 + e.deltaY * 0.001), 0.25, 2.2);
@@ -1074,14 +1226,18 @@ export function createUniverse(container, cfg) {
     for (const [g, until] of signalSet) if (time > until) { signalSet.delete(g); expired = true; }
     if (expired) recomputeTargets();
 
+    tickSatellites(dt);
     if (pendingHover) {
       pendingHover = false;
       const ai = agentAt();
       setHoverAgent(ai);
-      setHover(ai >= 0 ? -1 : nodeAt());
-      if (!dragging) el.style.cursor = hover >= 0 || ai >= 0 ? 'pointer' : 'grab';
+      const si = ai >= 0 ? -1 : satAt();
+      setHoverSat(si);
+      setHover(ai >= 0 || si >= 0 ? -1 : nodeAt());
+      if (!dragging) el.style.cursor = hover >= 0 || ai >= 0 || si >= 0 ? 'pointer' : 'grab';
     }
     updateLabels();
+    placeSatLabel(W(), H());
     renderer.render(scene, camera);
   }
 
@@ -1097,6 +1253,7 @@ export function createUniverse(container, cfg) {
   ro.observe(container);
   resize();
   cam.dist = cam.base;
+  syncSatellites(cfg.brains);
   recomputeTargets();
   tick();
 
@@ -1133,6 +1290,7 @@ export function createUniverse(container, cfg) {
         if ((nb.revision ?? 0) !== (b.cfg.revision ?? 0)) moved.push(i);
       }
       if (!moved.length) return true;
+      syncSatellites(incoming);
 
       const noteIds = next.noteIds || [];
       for (const i of moved) brains[i].repack(incoming[i], noteIds);
@@ -1230,8 +1388,14 @@ export function createUniverse(container, cfg) {
       recomputeTargets();
     },
 
+    /** The open intake notes, for the sticky layer to cross-check. */
+    satellites: () => satellites.map(satInfo),
+
     dispose() {
       cancelAnimationFrame(raf);
+      clearSatellites();
+      satGeo.dispose();
+      satEdgeGeo.dispose();
       ro.disconnect();
       el.removeEventListener('pointerdown', onDown);
       window.removeEventListener('pointerup', onUp);

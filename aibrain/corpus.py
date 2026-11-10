@@ -297,9 +297,14 @@ class Corpus:
         return self._request_status(f"/note/{note_id}/source",
                                     body={"text": text, "baseHash": base_hash})
 
-    def create_note(self, brain_id: str, title: str) -> tuple[int, dict]:
-        return self._request_status("/notes/create",
-                                    body={"brain": brain_id, "title": title})
+    def create_note(self, brain_id: str, title: str, folder: str = "",
+                    text: str = "") -> tuple[int, dict]:
+        body = {"brain": brain_id, "title": title}
+        if folder:
+            body["folder"] = folder
+        if text:
+            body["text"] = text
+        return self._request_status("/notes/create", body=body)
 
     def resolve(self, brain_id: str, title: str) -> tuple[int, dict]:
         return self._request_status("/resolve",

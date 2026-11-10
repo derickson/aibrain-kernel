@@ -445,6 +445,26 @@ pub async fn notes_for_layout(pool: &PgPool, brain_id: &str) -> Result<Vec<crate
             source: r.get("source"),
             degree: r.get("degree"),
         })
+        // Intake notes orbit the galaxy rather than sit in it.
+        .filter(|n| !crate::layout::is_absorbitron(&n.rel_path))
+        .collect())
+}
+
+/// A brain's Absorbitron intake notes, oldest first: `(id, title, rel_path)`.
+pub async fn absorbitron_notes(pool: &PgPool, brain_id: &str) -> Result<Vec<(i64, String, String)>> {
+    let pattern = format!("{}/%", crate::layout::ABSORBITRON_FOLDER);
+    let rows = sqlx::query(
+        "SELECT id, title, rel_path FROM note
+          WHERE brain_id = $1 AND rel_path LIKE $2 ORDER BY rel_path, id",
+    )
+    .bind(brain_id)
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("id"), r.get("title"), r.get("rel_path")))
+        .filter(|(_, _, rel): &(i64, String, String)| crate::layout::is_absorbitron(rel))
         .collect())
 }
 

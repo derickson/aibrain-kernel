@@ -966,6 +966,160 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(status, 400)
 
 
+class AbsorbitronHelperTests(unittest.TestCase):
+    """The file names and the note shape, without a corpus."""
+
+    def test_names_carry_the_time_then_the_title(self):
+        from datetime import datetime
+        from aibrain import absorbitron as ab
+        now = datetime(2026, 11, 10, 14, 32, 5)
+        self.assertEqual(ab.note_name("Cool link", now), "2026-11-10 1432 Cool link")
+        self.assertEqual(ab.note_name("Cool link", now, seconds=True), "2026-11-10 143205 Cool link")
+        self.assertEqual(ab.attachment_name("deck v2.pdf", now), "2026-11-10 1432 deck v2.pdf")
+        self.assertEqual(ab.attachment_name("../../etc/passwd", now), "2026-11-10 1432 passwd")
+
+    def test_titles_are_tidied_into_safe_link_names(self):
+        from aibrain import absorbitron as ab
+        self.assertEqual(ab.clean_title("  What: is [this]? #1 / 2  "), "What is this 1 2")
+        self.assertEqual(ab.clean_title("...hidden"), "hidden")
+        self.assertEqual(ab.clean_title("a...b"), "a.b")
+        self.assertEqual(ab.clean_title("\x00\n"), "")
+
+    def test_the_template_keeps_the_rule_a_rule(self):
+        from aibrain import absorbitron as ab
+        text = ab.template("Look at https://example.com")
+        self.assertTrue(text.startswith("Look at https://example.com\n\n---\n# AI Notes\n"))
+        self.assertIn("\n# Attachments\n", text)
+        self.assertLess(text.index("# AI Notes"), text.index("# Attachments"))
+        # Empty input must not open the file with `---` (that is frontmatter).
+        self.assertTrue(ab.template("").startswith("\n\n---\n"))
+
+    def test_attachments_never_overwrite(self):
+        from datetime import datetime
+        from aibrain import absorbitron as ab
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp)
+            now = datetime(2026, 11, 10, 14, 32, 5)
+            a = ab.write_attachment(vault, "x.pdf", b"one", now)
+            b = ab.write_attachment(vault, "x.pdf", b"two", now)
+            c = ab.write_attachment(vault, "x.pdf", b"three", now)
+            self.assertEqual(a, "Absorbitron/Attachments/2026-11-10 1432 x.pdf")
+            self.assertEqual(b, "Absorbitron/Attachments/2026-11-10 143205 x.pdf")
+            self.assertEqual(c, "Absorbitron/Attachments/2026-11-10 143205 x 2.pdf")
+            self.assertEqual((vault / a).read_bytes(), b"one")
+            self.assertEqual((vault / c).read_bytes(), b"three")
+
+    def test_a_symlinked_attachments_folder_out_of_the_vault_is_refused(self):
+        from aibrain import absorbitron as ab
+        with tempfile.TemporaryDirectory() as tmp:
+            vault, outside = Path(tmp) / "v", Path(tmp) / "out"
+            (vault / "Absorbitron").mkdir(parents=True)
+            outside.mkdir()
+            (vault / "Absorbitron" / "Attachments").symlink_to(outside)
+            with self.assertRaises(PermissionError):
+                ab.write_attachment(vault, "x.pdf", b"x")
+            self.assertEqual(list(outside.iterdir()), [])
+
+
+class AbsorbitronTests(unittest.TestCase):
+    """Intake notes: created in the transcript brain's Absorbitron/ folder,
+    kept out of the galaxy, listed as satellites, and given attachments."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = start_corpus()
+        cls.addClassCleanup(cls.fixture.stop)
+        cls.fixture.cfg.brains[0].meeting_target = True
+        cls.state = State(cls.fixture.cfg, cls.fixture.corpus)
+        cls.addClassCleanup(cls.state.close)
+        handler = type("H", (Handler,),
+                       {"state": cls.state, "router": build_router(cls.state)})
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.addClassCleanup(cls.httpd.shutdown)
+        cls.httpd.daemon_threads = True
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    def call(self, method, path, body=None, raw=None):
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        req = urllib.request.Request(self.base + path, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type",
+                           "application/octet-stream" if raw is not None else "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read().decode() or "null")
+
+    def test_a_note_is_made_in_the_intake_folder_with_its_sections(self):
+        status, out = self.call("POST", "/api/absorbitron/create",
+                                {"title": "Neat: paper", "text": "From Sam https://example.com/x"})
+        self.assertEqual(status, 200, out)
+        self.assertRegex(out["name"], r"^\d{4}-\d{2}-\d{2} \d{4} Neat paper$")
+        self.assertEqual(out["relPath"], f"Absorbitron/{out['name']}.md")
+        path = self.fixture.vault / out["relPath"]
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("From Sam https://example.com/x\n\n---\n# AI Notes\n"), text)
+        self.assertIn("# Attachments", text)
+
+        # The same title in the same minute gets seconds, not a refusal.
+        status, again = self.call("POST", "/api/absorbitron/create", {"title": "Neat: paper"})
+        self.assertEqual(status, 200, again)
+        self.assertNotEqual(again["name"], out["name"])
+
+        # Searchable like any note, but a satellite, not a star.
+        payload = self.state.universe(rebuild=True)
+        brain = next(b for b in payload["brains"] if b["id"] == self.fixture.brain_id)
+        sats = {s["nid"] for s in brain["absorbitron"]}
+        self.assertIn(out["nid"], sats)
+        self.assertNotIn(out["nid"], payload["noteIds"])
+        self.assertNotIn(out["name"], brain["names"])
+        self.assertEqual(brain["total"], len(brain["names"]))
+
+    def test_a_title_is_required_and_a_target_brain_too(self):
+        status, _ = self.call("POST", "/api/absorbitron/create", {"title": " ? "})
+        self.assertEqual(status, 400)
+        self.fixture.cfg.brains[0].meeting_target = False
+        try:
+            status, info = self.call("GET", "/api/absorbitron")
+            self.assertEqual((status, info["brainId"]), (200, None))
+            status, _ = self.call("POST", "/api/absorbitron/create", {"title": "Nowhere"})
+            self.assertEqual(status, 409)
+        finally:
+            self.fixture.cfg.brains[0].meeting_target = True
+
+    def test_an_attachment_is_copied_with_a_timestamped_name(self):
+        status, out = self.call("POST", "/api/absorbitron/create", {"title": "With a file"})
+        self.assertEqual(status, 200, out)
+        q = urllib.parse.urlencode({"nid": out["nid"], "name": "report [final].pdf"})
+        status, att = self.call("POST", f"/api/absorbitron/attach?{q}", raw=b"%PDF-1.4 hello")
+        self.assertEqual(status, 200, att)
+        self.assertRegex(att["path"], r"^Absorbitron/Attachments/\d{4}-\d{2}-\d{2} \d{4} report final\.pdf$")
+        self.assertEqual((self.fixture.vault / att["path"]).read_bytes(), b"%PDF-1.4 hello")
+        # Not markdown, so never a note.
+        payload = self.state.universe(rebuild=True)
+        brain = next(b for b in payload["brains"] if b["id"] == self.fixture.brain_id)
+        self.assertNotIn("final", json.dumps(brain["absorbitron"]))
+
+        status, _ = self.call("POST", f"/api/absorbitron/attach?nid=999999999&name=x.pdf", raw=b"x")
+        self.assertIn(status, (403, 404))
+
+    def test_a_note_filed_out_of_the_intake_folder_becomes_a_star(self):
+        status, out = self.call("POST", "/api/absorbitron/create", {"title": "To be filed"})
+        self.assertEqual(status, 200, out)
+        src = self.fixture.vault / out["relPath"]
+        dest = self.fixture.vault / "Filed" / src.name
+        dest.parent.mkdir(exist_ok=True)
+        src.rename(dest)
+        self.fixture.reindex()
+        payload = self.state.universe(rebuild=True)
+        brain = next(b for b in payload["brains"] if b["id"] == self.fixture.brain_id)
+        self.assertNotIn(src.stem, json.dumps(brain["absorbitron"]))
+        self.assertIn(src.stem, brain["names"])
+
+
 class CitationTests(unittest.TestCase):
     """A citation must mean the agent used the note. Nothing else earns a pill.
 
