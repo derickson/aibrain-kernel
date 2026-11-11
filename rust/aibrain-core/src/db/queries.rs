@@ -505,6 +505,29 @@ pub async fn edges_within(pool: &PgPool, brain_id: &str) -> Result<Vec<(i64, i64
         .collect())
 }
 
+/// Every resolved link out of a brain's Absorbitron intake notes:
+/// `(src_id, dst_id)`. The intake notes are not in the galaxy's layout, so
+/// these never appear among its edges; the UI draws them from the orbiting
+/// cube to whatever it points at, in this brain or another.
+pub async fn absorbitron_links(pool: &PgPool, brain_id: &str) -> Result<Vec<(i64, i64)>> {
+    let pattern = format!("{}/%", crate::layout::ABSORBITRON_FOLDER);
+    let rows = sqlx::query(
+        "SELECT l.src_id, l.dst_id, s.rel_path FROM link l
+           JOIN note s ON s.id = l.src_id
+          WHERE s.brain_id = $1 AND s.rel_path LIKE $2 AND l.src_id <> l.dst_id
+          ORDER BY l.src_id, l.dst_id",
+    )
+    .bind(brain_id)
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| crate::layout::is_absorbitron(&r.get::<String, _>("rel_path")))
+        .map(|r| (r.get("src_id"), r.get("dst_id")))
+        .collect())
+}
+
 /// Edges whose ends are in different brains — the arcs between galaxies.
 pub async fn edges_across(pool: &PgPool, limit: i64) -> Result<Vec<(i64, i64)>> {
     let rows = sqlx::query(

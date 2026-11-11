@@ -386,10 +386,17 @@ pub async fn build(pool: &PgPool, cfg: &Config, revisions: &[(String, i64)]) -> 
         // Not cached with the geometry: it is one indexed query, and it has
         // to follow the brain's revision exactly, which it does by being read
         // fresh every time the payload is.
+        let mut links_of: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (src, dst) in db::absorbitron_links(pool, &spec.id).await? {
+            links_of.entry(src).or_default().push(dst);
+        }
         let absorbitron: Vec<Value> = db::absorbitron_notes(pool, &spec.id)
             .await?
             .into_iter()
-            .map(|(nid, title, rel)| json!({ "nid": nid, "title": title, "relPath": rel }))
+            .map(|(nid, title, rel)| {
+                let links = links_of.remove(&nid).unwrap_or_default();
+                json!({ "nid": nid, "title": title, "relPath": rel, "links": links })
+            })
             .collect();
         brains_out.push(json!({
             "id": spec.id,

@@ -794,6 +794,7 @@ export function createUniverse(container, cfg) {
         const prev = before.get(note.nid);
         satellites.push({
           nid: note.nid, title: note.title, relPath: note.relPath, brainId: b.id, bi,
+          links: Array.isArray(note.links) ? note.links : [],
           group, mesh, edges, glowS, size,
           r: R * (1.32 + h1 * 0.3),
           tilt: (h2 - 0.5) * 1.3,
@@ -807,6 +808,61 @@ export function createUniverse(container, cfg) {
         });
       });
     });
+  }
+
+  // A sticky's [[links]] to notes in the vault: a line from the cube to each
+  // star it points at (or to another cube), gold at the cube and the target
+  // brain's colour at the far end. Rewritten every frame, because the cube
+  // orbits and the galaxy spins; there are only ever a handful of them.
+  let slPos = new Float32Array(0), slCol = new Float32Array(0);
+  const slGeo = new THREE.BufferGeometry();
+  slGeo.setAttribute('position', new THREE.BufferAttribute(slPos, 3));
+  slGeo.setAttribute('color', new THREE.BufferAttribute(slCol, 3));
+  const slLines = new THREE.LineSegments(slGeo, new THREE.LineBasicMaterial({
+    vertexColors: true, transparent: true, opacity: 0.55,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  slLines.frustumCulled = false;
+  scene.add(slLines);
+  const slColor = new THREE.Color(), slEnd = new THREE.Vector3();
+
+  function drawSatLinks() {
+    let count = 0;
+    for (const s of satellites) count += s.links.length;
+    if (slPos.length < count * 6) {
+      slPos = new Float32Array(count * 6);
+      slCol = new Float32Array(count * 6);
+      slGeo.setAttribute('position', new THREE.BufferAttribute(slPos, 3));
+      slGeo.setAttribute('color', new THREE.BufferAttribute(slCol, 3));
+    }
+    const satByNid = new Map(satellites.map(s => [s.nid, s]));
+    let n = 0;
+    for (let i = 0; i < satellites.length; i++) {
+      const s = satellites[i];
+      // Brighter while either end of the line is the hovered cube.
+      const lit = 0.55 + s.hover * 0.45;
+      for (const nid of s.links) {
+        const gid = nidToGid.get(nid);
+        if (gid != null) {
+          nodeWorld(gid, slEnd);
+          slColor.set(brains[allNodes[gid].bi].cfg.color || '#7fd8e8');
+        } else {
+          const other = satByNid.get(nid);
+          if (!other) continue;              // not indexed, or filtered out
+          slEnd.copy(other.group.position);
+          slColor.copy(SAT_GOLD);
+        }
+        const p = s.group.position, o = n * 6;
+        slPos[o] = p.x; slPos[o + 1] = p.y; slPos[o + 2] = p.z;
+        slPos[o + 3] = slEnd.x; slPos[o + 4] = slEnd.y; slPos[o + 5] = slEnd.z;
+        slCol[o] = SAT_GOLD.r * lit; slCol[o + 1] = SAT_GOLD.g * lit; slCol[o + 2] = SAT_GOLD.b * lit;
+        slCol[o + 3] = slColor.r * lit * 0.8; slCol[o + 4] = slColor.g * lit * 0.8; slCol[o + 5] = slColor.b * lit * 0.8;
+        n++;
+      }
+    }
+    slGeo.setDrawRange(0, n * 2);
+    slGeo.attributes.position.needsUpdate = true;
+    slGeo.attributes.color.needsUpdate = true;
   }
 
   const satAxis = new THREE.Vector3(), satTmp = new THREE.Vector3();
@@ -1227,6 +1283,7 @@ export function createUniverse(container, cfg) {
     if (expired) recomputeTargets();
 
     tickSatellites(dt);
+    drawSatLinks();
     if (pendingHover) {
       pendingHover = false;
       const ai = agentAt();
