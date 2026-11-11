@@ -254,6 +254,9 @@ fn locate<'a>(
                 .collect::<Vec<_>>()
                 .join("/");
             if !rel_path.is_empty() {
+                if crate::vault::scan::is_ignored_rel(&rel_path) {
+                    return None;
+                }
                 return Some((brain, rel_path));
             }
         }

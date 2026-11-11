@@ -14,6 +14,18 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "assets", "scans", "Excalidraw", "node_modules",
 ];
 
+/// Folders that are never part of a vault, whatever the config says: tool and
+/// system folders (graft's index lives in `graft/`, which can sit inside a vault).
+/// Hidden entries (`.claude`, `.env*`, `.DS_Store`, ...) are skipped separately.
+pub const ALWAYS_IGNORED: &[&str] = &["graft", "node_modules"];
+
+/// True when any component of a vault-relative path is hidden or a system folder.
+pub fn is_ignored_rel(rel_path: &str) -> bool {
+    let parts: Vec<&str> = rel_path.split('/').collect();
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    parts.iter().any(|p| p.starts_with('.')) || dirs.iter().any(|d| ALWAYS_IGNORED.contains(d))
+}
+
 /// One markdown file found on disk.
 pub struct Found {
     pub path: PathBuf,
@@ -51,7 +63,8 @@ pub fn walk(root: &Path, excludes: &[String]) -> Vec<Found> {
             if name.starts_with('.') {
                 return false;
             }
-            !(entry.file_type().is_dir() && skip.iter().any(|s| *s == name))
+            !(entry.file_type().is_dir()
+                && (ALWAYS_IGNORED.contains(&&*name) || skip.iter().any(|s| *s == name)))
         })
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file() && is_markdown(entry.path()))
@@ -117,6 +130,22 @@ mod tests {
 
         let found: Vec<String> = walk(&dir, &[]).into_iter().map(|f| f.rel_path).collect();
         assert_eq!(found, ["Keep/y.md"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn graft_and_hidden_paths_are_ignored_even_with_custom_excludes() {
+        let dir = scratch("graft");
+        fs::create_dir_all(dir.join("graft")).unwrap();
+        fs::write(dir.join("graft/INDEX.md"), "x").unwrap();
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+        fs::write(dir.join(".claude/a.md"), "x").unwrap();
+        fs::write(dir.join("Keep.md"), "x").unwrap();
+        let found: Vec<String> =
+            walk(&dir, &["Other".to_string()]).into_iter().map(|f| f.rel_path).collect();
+        assert_eq!(found, ["Keep.md"]);
+        assert!(is_ignored_rel("graft/INDEX.md") && is_ignored_rel("a/.env.md"));
+        assert!(!is_ignored_rel("Notes/graft.md"));
         fs::remove_dir_all(&dir).ok();
     }
 
